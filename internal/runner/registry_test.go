@@ -42,4 +42,7 @@ func TestBuiltinRegistryMatchesSupportedProviderIDs(t *testing.T) {
 	if got, want := BuiltinRegistry().Names(), provider.Names(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("registered providers=%v, configured providers=%v", got, want)
 	}
+	if got, want := provider.Names(), []string{provider.Claude, provider.Codex, provider.Antigravity, provider.Copilot}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider display order=%v want=%v", got, want)
+	}
 }

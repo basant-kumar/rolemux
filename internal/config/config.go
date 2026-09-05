@@ -140,11 +140,12 @@ type CustomModel struct {
 // Config is the merged representation. Raw preserves unknown, unrelated TOML
 // keys during an atomic profile update; it is never sent to a provider.
 type Config struct {
-	Profiles          map[string]Profile                `toml:"profiles" json:"profiles"`
-	Providers         map[string]Provider               `toml:"providers" json:"providers"`
-	Models            map[string]map[string]CustomModel `toml:"models" json:"models"`
-	CatalogTTLSeconds int                               `toml:"catalog_ttl_seconds,omitempty" json:"catalog_ttl_seconds,omitempty"`
-	Raw               map[string]any                    `toml:"-" json:"-"`
+	Profiles                   map[string]Profile                `toml:"profiles" json:"profiles"`
+	Providers                  map[string]Provider               `toml:"providers" json:"providers"`
+	Models                     map[string]map[string]CustomModel `toml:"models" json:"models"`
+	CatalogTTLSeconds          int                               `toml:"catalog_ttl_seconds,omitempty" json:"catalog_ttl_seconds,omitempty"`
+	ProviderTurnTimeoutSeconds int                               `toml:"provider_turn_timeout_seconds,omitempty" json:"provider_turn_timeout_seconds,omitempty"`
+	Raw                        map[string]any                    `toml:"-" json:"-"`
 }
 
 func Default() Config {
@@ -155,7 +156,7 @@ func Default() Config {
 			RoleImplementer: {Provider: "codex"},
 		},
 		Providers: map[string]Provider{}, Models: map[string]map[string]CustomModel{},
-		CatalogTTLSeconds: 86400,
+		CatalogTTLSeconds: 86400, ProviderTurnTimeoutSeconds: 900,
 	}
 }
 
@@ -292,14 +293,8 @@ func (c Config) ResolveProfile(profile Profile) (Profile, Provider) {
 
 func ConfigPaths(repoRoot string, environ []string) (global, project string) {
 	env := envMap(environ)
-	configHome := strings.TrimSpace(env["XDG_CONFIG_HOME"])
-	if configHome == "" {
-		if home := strings.TrimSpace(env["HOME"]); home != "" {
-			configHome = filepath.Join(home, ".config")
-		}
-	}
-	if configHome != "" {
-		global = filepath.Join(configHome, "rolemux", "config.toml")
+	if home := strings.TrimSpace(env["HOME"]); home != "" {
+		global = filepath.Join(home, ".rolemux", "config.toml")
 	}
 	if repoRoot != "" {
 		project = filepath.Join(repoRoot, ".rolemux.toml")
@@ -399,6 +394,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.CatalogTTLSeconds != 0 {
 		dst.CatalogTTLSeconds = src.CatalogTTLSeconds
+	}
+	if src.ProviderTurnTimeoutSeconds != 0 {
+		dst.ProviderTurnTimeoutSeconds = src.ProviderTurnTimeoutSeconds
 	}
 }
 
@@ -568,6 +566,9 @@ func Validate(c Config) error {
 	}
 	if c.CatalogTTLSeconds < 0 {
 		return errors.New("catalog_ttl_seconds must not be negative")
+	}
+	if c.ProviderTurnTimeoutSeconds != 0 && (c.ProviderTurnTimeoutSeconds < 30 || c.ProviderTurnTimeoutSeconds > 7200) {
+		return errors.New("provider_turn_timeout_seconds must be between 30 and 7200")
 	}
 	for name, p := range c.Providers {
 		if !providerNamePattern.MatchString(name) {
@@ -1027,6 +1028,9 @@ func ImportConfigAtomic(name string, data []byte, beforeHash string) error {
 	if _, ok := source["catalog_ttl_seconds"]; ok {
 		destination["catalog_ttl_seconds"] = fragment.CatalogTTLSeconds
 	}
+	if _, ok := source["provider_turn_timeout_seconds"]; ok {
+		destination["provider_turn_timeout_seconds"] = fragment.ProviderTurnTimeoutSeconds
+	}
 	return WriteRawAtomic(name, destination, beforeHash)
 }
 
@@ -1066,6 +1070,9 @@ func WriteConfigAtomic(name string, cfg Config, beforeHash string) error {
 	}
 	if cfg.CatalogTTLSeconds != 0 {
 		raw["catalog_ttl_seconds"] = cfg.CatalogTTLSeconds
+	}
+	if cfg.ProviderTurnTimeoutSeconds != 0 {
+		raw["provider_turn_timeout_seconds"] = cfg.ProviderTurnTimeoutSeconds
 	}
 	return WriteRawAtomic(name, raw, beforeHash)
 }

@@ -6,13 +6,16 @@ package provider
 import "sort"
 
 const (
-	Codex   = "codex"
-	Claude  = "claude"
-	Copilot = "copilot"
+	Codex       = "codex"
+	Claude      = "claude"
+	Copilot     = "copilot"
+	Antigravity = "antigravity"
 )
 
+var preferredOrder = []string{Claude, Codex, Antigravity, Copilot}
+
 var builtins = map[string]struct{}{
-	Codex: {}, Claude: {}, Copilot: {},
+	Codex: {}, Claude: {}, Copilot: {}, Antigravity: {},
 }
 
 // Known reports whether an ID is supported by this build.
@@ -23,10 +26,25 @@ func Known(name string) bool {
 
 // Names returns a stable copy suitable for command output and iteration.
 func Names() []string {
-	names := make([]string, 0, len(builtins))
-	for name := range builtins {
-		names = append(names, name)
+	return append([]string(nil), preferredOrder...)
+}
+
+// SortNames applies the product display order to built-ins and places future
+// extension providers alphabetically after them.
+func SortNames(names []string) {
+	rank := map[string]int{}
+	for index, name := range preferredOrder {
+		rank[name] = index
 	}
-	sort.Strings(names)
-	return names
+	sort.Slice(names, func(i, j int) bool {
+		left, leftKnown := rank[names[i]]
+		right, rightKnown := rank[names[j]]
+		if leftKnown != rightKnown {
+			return leftKnown
+		}
+		if leftKnown {
+			return left < right
+		}
+		return names[i] < names[j]
+	})
 }

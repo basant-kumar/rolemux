@@ -167,6 +167,7 @@ type InFlight struct {
 	Token            string      `json:"token"`
 	Operation        string      `json:"operation"`
 	Role             string      `json:"role"`
+	OwnerPID         int         `json:"owner_pid,omitempty"`
 	StartedAt        time.Time   `json:"started_at"`
 	KnownSession     bool        `json:"known_session"`
 	SessionID        string      `json:"session_id,omitempty"`
@@ -196,16 +197,22 @@ type RetryState struct {
 // State is the durable task record. Scope and its exact baseline are first
 // established atomically by the first implement invocation.
 type State struct {
-	ID                   string `json:"id"`
-	RepoRoot             string `json:"repo_root"`
-	Phase                string `json:"phase"`
-	Round                int    `json:"round"` // compatibility alias; plan/code are authoritative.
-	Task                 string `json:"task,omitempty"`
-	Prompt               string `json:"prompt,omitempty"`
-	Plan                 string `json:"plan,omitempty"`
-	PlanHash             string `json:"plan_hash,omitempty"`
-	ApprovedPlanHash     string `json:"approved_plan_hash,omitempty"`
-	ApprovedManifestHash string `json:"approved_manifest_hash,omitempty"`
+	ID                   string     `json:"id"`
+	RepoRoot             string     `json:"repo_root"`
+	Phase                string     `json:"phase"`
+	Round                int        `json:"round"` // compatibility alias; plan/code are authoritative.
+	Task                 string     `json:"task,omitempty"`
+	Prompt               string     `json:"prompt,omitempty"`
+	Plan                 string     `json:"plan,omitempty"`
+	PlanHash             string     `json:"plan_hash,omitempty"`
+	ApprovedPlanHash     string     `json:"approved_plan_hash,omitempty"`
+	ApprovedManifestHash string     `json:"approved_manifest_hash,omitempty"`
+	ParentTaskID         string     `json:"parent_task_id,omitempty"`
+	WorkUnitID           string     `json:"work_unit_id,omitempty"`
+	PlannedScope         string     `json:"planned_scope,omitempty"`
+	IntegrationReview    bool       `json:"integration_review,omitempty"`
+	WorkGraph            bool       `json:"work_graph,omitempty"`
+	WorkUnits            []WorkUnit `json:"work_units,omitempty"`
 
 	PlannerSessionID      string `json:"planner_session_id,omitempty"`
 	PlanReviewerSessionID string `json:"plan_reviewer_session_id,omitempty"`
@@ -215,30 +222,39 @@ type State struct {
 	LastUsedAt time.Time `json:"last_used_at,omitempty"`
 	UpdatedAt  time.Time `json:"updated_at"`
 
-	Scope                 string                     `json:"scope,omitempty"`
-	ScopeSpecHash         string                     `json:"scope_spec_hash,omitempty"`
-	ScopedBaseline        []FileEntry                `json:"scoped_baseline_manifest,omitempty"`
-	ScopedBaselineHash    string                     `json:"scoped_baseline_manifest_hash,omitempty"`
-	CandidateManifest     []FileEntry                `json:"candidate_manifest,omitempty"`
-	CandidateManifestHash string                     `json:"candidate_manifest_hash,omitempty"`
-	ChangeManifest        []FileEntry                `json:"change_manifest,omitempty"`
-	ProfilesSnapshot      map[string]ProfileSnapshot `json:"profiles_snapshot,omitempty"`
-	RuntimeSnapshot       map[string]RuntimeSnapshot `json:"runtime_snapshot,omitempty"`
-	MaxRounds             int                        `json:"max_rounds,omitempty"`
-	PlanRound             int                        `json:"plan_round,omitempty"`
-	CodeRound             int                        `json:"code_round,omitempty"`
-	PendingQuestion       string                     `json:"pending_question,omitempty"`
-	PendingQuestionSource string                     `json:"pending_question_source,omitempty"`
-	PendingAnswer         string                     `json:"pending_answer,omitempty"`
-	PromptInputs          []string                   `json:"prompt_inputs,omitempty"`
-	ReturnPhase           string                     `json:"return_phase,omitempty"`
-	InterruptedLoop       string                     `json:"interrupted_loop,omitempty"`
-	Findings              []Finding                  `json:"findings,omitempty"`
-	Advisories            []Diagnostic               `json:"advisories,omitempty"`
-	Diagnostics           []string                   `json:"diagnostics,omitempty"`
-	Usage                 map[string]TokenUsage      `json:"usage,omitempty"`
-	InFlight              *InFlight                  `json:"in_flight,omitempty"`
-	Retry                 *RetryState                `json:"retry,omitempty"`
+	Scope                 string      `json:"scope,omitempty"`
+	ScopeSpecHash         string      `json:"scope_spec_hash,omitempty"`
+	ScopedBaseline        []FileEntry `json:"scoped_baseline_manifest,omitempty"`
+	ScopedBaselineHash    string      `json:"scoped_baseline_manifest_hash,omitempty"`
+	CandidateManifest     []FileEntry `json:"candidate_manifest,omitempty"`
+	CandidateManifestHash string      `json:"candidate_manifest_hash,omitempty"`
+	ChangeManifest        []FileEntry `json:"change_manifest,omitempty"`
+	// ReviewCheckpoint is the exact candidate from the last completed
+	// changes-requested verdict. Re-review compares fixes against this point
+	// instead of making the reviewer rediscover the full task delta.
+	ReviewCheckpoint         []FileEntry                `json:"review_checkpoint_manifest,omitempty"`
+	ReviewCheckpointHash     string                     `json:"review_checkpoint_manifest_hash,omitempty"`
+	ReviewCheckpointFindings []Finding                  `json:"review_checkpoint_findings,omitempty"`
+	ProfilesSnapshot         map[string]ProfileSnapshot `json:"profiles_snapshot,omitempty"`
+	RuntimeSnapshot          map[string]RuntimeSnapshot `json:"runtime_snapshot,omitempty"`
+	MaxRounds                int                        `json:"max_rounds,omitempty"`
+	PlanRound                int                        `json:"plan_round,omitempty"`
+	CodeRound                int                        `json:"code_round,omitempty"`
+	PendingQuestion          string                     `json:"pending_question,omitempty"`
+	PendingQuestionSource    string                     `json:"pending_question_source,omitempty"`
+	PendingAnswer            string                     `json:"pending_answer,omitempty"`
+	PromptInputs             []string                   `json:"prompt_inputs,omitempty"`
+	ReturnPhase              string                     `json:"return_phase,omitempty"`
+	InterruptedLoop          string                     `json:"interrupted_loop,omitempty"`
+	Findings                 []Finding                  `json:"findings,omitempty"`
+	Advisories               []Diagnostic               `json:"advisories,omitempty"`
+	Diagnostics              []string                   `json:"diagnostics,omitempty"`
+	Usage                    map[string]TokenUsage      `json:"usage,omitempty"`
+	// ProviderUsageCumulative stores the last raw conversation-wide counters
+	// for providers that report cumulative rather than per-turn usage.
+	ProviderUsageCumulative map[string]TokenUsage `json:"provider_usage_cumulative,omitempty"`
+	InFlight                *InFlight             `json:"in_flight,omitempty"`
+	Retry                   *RetryState           `json:"retry,omitempty"`
 }
 
 func StateFingerprint(st State) string {
@@ -613,7 +629,9 @@ func NewWorktree(root string) *Worktree {
 func (w *Worktree) Head() (string, error) { return gitOutput(w.Root, "rev-parse", "HEAD") }
 
 func (w *Worktree) Paths() ([]string, error) {
-	tracked, err := gitOutputBytes(w.Root, "ls-files", "-co", "--exclude-standard", "-z")
+	// Known compiler/OS caches are not task source. The --exclude flags affect
+	// only untracked files; a deliberately tracked file remains observable.
+	tracked, err := gitOutputBytes(w.Root, "ls-files", "-co", "--exclude-standard", "--exclude=*.tsbuildinfo", "--exclude=.DS_Store", "-z")
 	if err != nil {
 		return nil, err
 	}

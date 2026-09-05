@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/basant-kumar/rolemux/internal/provider"
@@ -52,7 +51,7 @@ func (r *Registry) Names() []string {
 	for name := range r.factories {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	provider.SortNames(names)
 	return names
 }
 
@@ -96,6 +95,13 @@ func BuiltinRegistry() *Registry {
 			if store.Dir != "" {
 				adapter.BaseDirectory = filepath.Join(filepath.Dir(store.Dir), "copilot")
 			}
+		}
+		return adapter, adapter.Path, nil
+	})
+	mustRegister(provider.Antigravity, func(path, _ string) (Adapter, string, error) {
+		adapter, err := NewAntigravity(path)
+		if err != nil {
+			return nil, "", err
 		}
 		return adapter, adapter.Path, nil
 	})

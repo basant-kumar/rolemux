@@ -1,5 +1,5 @@
-// Package catalog implements live-first model discovery with a small,
-// account-and-endpoint-scoped last-good cache.
+// Package catalog implements provider model discovery with a small,
+// account-and-endpoint-scoped last-good cache and non-blocking snapshot reads.
 package catalog
 
 import (
@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/basant-kumar/rolemux/internal/config"
@@ -25,6 +27,8 @@ type Catalog struct {
 	CachePath string
 	Now       func() time.Time
 }
+
+var cachePathLocks sync.Map
 
 type cacheEntry struct {
 	Provider     string             `json:"provider"`
@@ -39,12 +43,36 @@ type cacheFile struct {
 }
 
 func New(adapters map[string]runner.Adapter, cfg config.Config, cachePath string) *Catalog {
-	if cachePath == "" {
-		if home, err := os.UserCacheDir(); err == nil {
-			cachePath = filepath.Join(home, "rolemux", "models.json")
+	return &Catalog{Adapters: adapters, Config: cfg, CachePath: cachePath, Now: time.Now}
+}
+
+// DefaultCachePath derives the platform cache location from the caller's
+// environment. Keeping this explicit prevents embedded callers and tests from
+// accidentally reading or replacing another user's model catalog.
+func DefaultCachePath(environ []string) string {
+	values := map[string]string{}
+	for _, item := range environ {
+		if key, value, ok := strings.Cut(item, "="); ok {
+			values[key] = value
 		}
 	}
-	return &Catalog{Adapters: adapters, Config: cfg, CachePath: cachePath, Now: time.Now}
+	if runtime.GOOS == "windows" {
+		if root := values["LocalAppData"]; filepath.IsAbs(root) {
+			return filepath.Join(root, "rolemux", "models.json")
+		}
+		return ""
+	}
+	home := values["HOME"]
+	if !filepath.IsAbs(home) {
+		return ""
+	}
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(home, "Library", "Caches", "rolemux", "models.json")
+	}
+	if root := values["XDG_CACHE_HOME"]; filepath.IsAbs(root) {
+		return filepath.Join(root, "rolemux", "models.json")
+	}
+	return filepath.Join(home, ".cache", "rolemux", "models.json")
 }
 
 func (c *Catalog) Models(ctx context.Context, provider string, refresh bool, runtime runner.ModelListRequest) ([]runner.ModelInfo, error) {
@@ -57,11 +85,16 @@ func (c *Catalog) Models(ctx context.Context, provider string, refresh bool, run
 		return nil, fmt.Errorf("no adapter for provider %s", provider)
 	}
 	account := ""
-	if auth, authErr := adapter.Auth(ctx); authErr == nil && auth.Authenticated {
-		account = auth.Account
+	// A forced live refresh does not need a separate authentication probe:
+	// ListModels is itself provider/account scoped and returns the account when
+	// the CLI exposes it. This avoids starting the same CLI twice in configure.
+	if !refresh {
+		if auth, authErr := adapter.Auth(ctx); authErr == nil && auth.Authenticated {
+			account = auth.Account
+		}
 	}
 	if !refresh {
-		if models, ok := c.cached(provider, account, runtime, false); ok {
+		if models, ok := c.cached(provider, account, runtime, false, false); ok {
 			return models, nil
 		}
 	}
@@ -70,6 +103,11 @@ func (c *Catalog) Models(ctx context.Context, provider string, refresh bool, run
 		models := normalizeLive(provider, page.Models)
 		models = appendCustom(models, c.Config, provider)
 		if page.Account == "" {
+			if account == "" {
+				if auth, authErr := adapter.Auth(ctx); authErr == nil && auth.Authenticated {
+					account = auth.Account
+				}
+			}
 			page.Account = account
 		}
 		identity := identityHash(provider, page.Account, endpoint(page.Endpoint, runtime.Runtime.Endpoint))
@@ -79,7 +117,12 @@ func (c *Catalog) Models(ctx context.Context, provider string, refresh bool, run
 	if page.Account != "" {
 		account = page.Account
 	}
-	if models, ok := c.cached(provider, account, runtime, true); ok {
+	if refresh && account == "" {
+		if auth, authErr := adapter.Auth(ctx); authErr == nil && auth.Authenticated {
+			account = auth.Account
+		}
+	}
+	if models, ok := c.cached(provider, account, runtime, true, false); ok {
 		return models, nil
 	}
 	custom := appendCustom(nil, c.Config, provider)
@@ -87,6 +130,44 @@ func (c *Catalog) Models(ctx context.Context, provider string, refresh bool, run
 		return custom, nil
 	}
 	return nil, fmt.Errorf("live model discovery failed for %s and no last-good cache is available: %w", provider, err)
+}
+
+// CachedModels returns an account-scoped snapshot without contacting the
+// provider. It preserves the last verified availability so an interactive
+// picker can open immediately; Origin and AgeSeconds still identify stale data.
+func (c *Catalog) CachedModels(provider, account string, runtime runner.ModelListRequest) ([]runner.ModelInfo, bool) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return nil, false
+	}
+	if models, ok := c.cached(provider, account, runtime, true, true); ok {
+		return models, true
+	}
+	if strings.TrimSpace(account) != "" {
+		return nil, false
+	}
+	return c.latestCachedForEndpoint(provider, runtime.Runtime.Endpoint)
+}
+
+func (c *Catalog) latestCachedForEndpoint(provider, endpoint string) ([]runner.ModelInfo, bool) {
+	entries, err := c.readCache()
+	if err != nil {
+		return nil, false
+	}
+	wantedEndpoint := hashString(endpoint)
+	var newest *cacheEntry
+	for index := range entries {
+		entry := &entries[index]
+		if entry.Provider != provider || entry.EndpointHash != wantedEndpoint || newest != nil && !entry.SavedAt.After(newest.SavedAt) {
+			continue
+		}
+		newest = entry
+	}
+	if newest == nil {
+		return nil, false
+	}
+	age := int64(c.now().Sub(newest.SavedAt).Seconds())
+	return markCache(newest.Models, age, true), true
 }
 
 func normalizeLive(provider string, models []runner.ModelInfo) []runner.ModelInfo {
@@ -138,17 +219,19 @@ func appendCustom(models []runner.ModelInfo, cfg config.Config, provider string)
 	return append(models, customModels...)
 }
 
-func markCacheUnknown(models []runner.ModelInfo, age int64) []runner.ModelInfo {
+func markCache(models []runner.ModelInfo, age int64, preserveAvailability bool) []runner.ModelInfo {
 	result := append([]runner.ModelInfo(nil), models...)
 	for i := range result {
 		result[i].Origin = "cache"
-		result[i].Availability = "unknown"
+		if !preserveAvailability {
+			result[i].Availability = "unknown"
+		}
 		result[i].AgeSeconds = age
 	}
 	return result
 }
 
-func (c *Catalog) cached(provider, account string, req runner.ModelListRequest, allowExpired bool) ([]runner.ModelInfo, bool) {
+func (c *Catalog) cached(provider, account string, req runner.ModelListRequest, allowExpired, preserveAvailability bool) ([]runner.ModelInfo, bool) {
 	entries, err := c.readCache()
 	if err != nil {
 		return nil, false
@@ -160,13 +243,20 @@ func (c *Catalog) cached(provider, account string, req runner.ModelListRequest, 
 			if !allowExpired && c.Config.CatalogTTLSeconds > 0 && age > int64(c.Config.CatalogTTLSeconds) {
 				return nil, false
 			}
-			return markCacheUnknown(entry.Models, age), true
+			return markCache(entry.Models, age, preserveAvailability), true
 		}
 	}
 	return nil, false
 }
 
 func (c *Catalog) readCache() ([]cacheEntry, error) {
+	lock := cachePathLock(c.CachePath)
+	lock.Lock()
+	defer lock.Unlock()
+	return c.readCacheUnlocked()
+}
+
+func (c *Catalog) readCacheUnlocked() ([]cacheEntry, error) {
 	if c.CachePath == "" {
 		return nil, errors.New("cache disabled")
 	}
@@ -185,7 +275,10 @@ func (c *Catalog) save(entry cacheEntry) error {
 	if c.CachePath == "" {
 		return nil
 	}
-	entries, _ := c.readCache()
+	lock := cachePathLock(c.CachePath)
+	lock.Lock()
+	defer lock.Unlock()
+	entries, _ := c.readCacheUnlocked()
 	replaced := false
 	for i := range entries {
 		if entries[i].Provider == entry.Provider && entries[i].IdentityHash == entry.IdentityHash {
@@ -230,6 +323,11 @@ func (c *Catalog) save(entry cacheEntry) error {
 		return err
 	}
 	return os.Rename(name, c.CachePath)
+}
+
+func cachePathLock(path string) *sync.Mutex {
+	value, _ := cachePathLocks.LoadOrStore(path, &sync.Mutex{})
+	return value.(*sync.Mutex)
 }
 
 func (c *Catalog) now() time.Time {

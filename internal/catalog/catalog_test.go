@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +18,36 @@ type catalogAdapter struct {
 	page    runner.ModelPage
 	err     error
 	calls   int
+}
+
+func TestDefaultCachePathUsesOnlySuppliedEnvironment(t *testing.T) {
+	home := t.TempDir()
+	path := DefaultCachePath([]string{"HOME=" + home})
+	if path == "" || !strings.HasPrefix(path, home+string(filepath.Separator)) {
+		t.Fatalf("cache path %q escaped supplied home", path)
+	}
+	if got := DefaultCachePath(nil); got != "" {
+		t.Fatalf("empty environment cache path = %q", got)
+	}
+
+	if runtime.GOOS != "darwin" {
+		xdg := filepath.Join(home, "xdg")
+		if got := DefaultCachePath([]string{"HOME=" + home, "XDG_CACHE_HOME=" + xdg}); got != filepath.Join(xdg, "rolemux", "models.json") {
+			t.Fatalf("XDG cache path = %q", got)
+		}
+	}
+}
+
+func TestEmptyCachePathDoesNotWriteProcessUserCache(t *testing.T) {
+	fake := &catalogAdapter{account: "test", page: runner.ModelPage{Models: []runner.ModelInfo{{ID: "fixture"}}}}
+	cat := New(map[string]runner.Adapter{"codex": fake}, config.Default(), "")
+	models, err := cat.Models(context.Background(), "codex", true, runner.ModelListRequest{})
+	if err != nil || len(models) != 1 {
+		t.Fatalf("models=%#v err=%v", models, err)
+	}
+	if cat.CachePath != "" {
+		t.Fatalf("empty cache path changed to %q", cat.CachePath)
+	}
 }
 
 func (f *catalogAdapter) Run(context.Context, runner.Request, runner.Callbacks) (runner.Response, error) {
@@ -50,6 +82,31 @@ func TestCatalogCachesByAccountAndFallsBackAsUnknown(t *testing.T) {
 	fake.account = "bob"
 	if _, err := cat.Models(context.Background(), "codex", true, runner.ModelListRequest{}); err == nil {
 		t.Fatal("cache from another account was reused")
+	}
+}
+
+func TestCachedModelsReturnsImmediatelyWithLastVerifiedAvailability(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	fake := &catalogAdapter{account: "alice", page: runner.ModelPage{Models: []runner.ModelInfo{{ID: "model-a", Origin: "live", Availability: "available"}}}}
+	cat := New(map[string]runner.Adapter{"codex": fake}, config.Default(), filepath.Join(t.TempDir(), "models.json"))
+	cat.Now = func() time.Time { return now }
+	if _, err := cat.Models(context.Background(), "codex", true, runner.ModelListRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(48 * time.Hour)
+	models, ok := cat.CachedModels("codex", "alice", runner.ModelListRequest{})
+	if !ok || len(models) != 1 || models[0].Origin != "cache" || models[0].Availability != "available" || models[0].AgeSeconds != int64((48*time.Hour).Seconds()) {
+		t.Fatalf("models=%#v ok=%t", models, ok)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("cached lookup contacted provider: calls=%d", fake.calls)
+	}
+	models, ok = cat.CachedModels("codex", "", runner.ModelListRequest{})
+	if !ok || models[0].ID != "model-a" {
+		t.Fatalf("provider without account identity could not reuse endpoint cache: models=%#v ok=%t", models, ok)
+	}
+	if _, ok := cat.CachedModels("codex", "bob", runner.ModelListRequest{}); ok {
+		t.Fatal("known account reused another account's cache")
 	}
 }
 

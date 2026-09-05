@@ -112,6 +112,20 @@ func TestAlternateScreenEnterLeaveIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestScreenStatusReplacesAlternateScreen(t *testing.T) {
+	var output bytes.Buffer
+	screen := NewScreen(&output)
+	screen.ShowStatus("Configure RoleMux", "Checking installed providers…")
+	screen.Leave()
+	text := output.String()
+	if !strings.Contains(text, "\x1b[2J\x1b[H") || !strings.Contains(text, "Checking installed providers…") {
+		t.Fatalf("status output=%q", text)
+	}
+	if strings.Count(text, "\x1b[?1049h") != 1 || strings.Count(text, "\x1b[?1049l") != 1 {
+		t.Fatalf("alternate-screen lifecycle=%q", text)
+	}
+}
+
 func TestModelAndEffortOptionsExposeUnknowns(t *testing.T) {
 	model := runner.ModelInfo{ID: "gpt-test", Label: "GPT Test", Description: "Live details", Availability: "unknown", ContextWindowTokens: 272000, MaxContextWindowTokens: 872000, Efforts: []string{"low", "max"}, EffortOptions: []runner.ModelOption{{ID: "low", Description: "Quick"}, {ID: "max", Description: "Deep"}}, DefaultEffort: "max", SpeedOptions: []runner.ModelOption{{ID: "priority", Label: "Fast", Description: "2x speed"}}}
 	if warning := UnknownAvailabilityWarning(model); warning == "" {

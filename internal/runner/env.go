@@ -162,6 +162,67 @@ func PathWithinRepo(repoRoot, candidate string) (string, error) {
 	return resolved, nil
 }
 
+// WritePathWithinRepo validates a file-write target, including a not-yet-created
+// file. Every existing path component is resolved so a symlink cannot redirect
+// the write outside the repository. The returned relative path uses slashes for
+// matching against RoleMux's repository-relative scope syntax.
+func WritePathWithinRepo(repoRoot, candidate string) (string, string, error) {
+	logicalRoot, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return "", "", err
+	}
+	root, err := filepath.EvalSymlinks(logicalRoot)
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(candidate) == "" {
+		return "", "", errors.New("write path is required")
+	}
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(logicalRoot, candidate)
+	}
+	full, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", "", err
+	}
+	rel, err := filepath.Rel(logicalRoot, full)
+	if err != nil || pathEscapesRoot(rel) {
+		// macOS commonly exposes /var and its resolved /private/var path
+		// interchangeably. Accept either spelling of the same repository root.
+		rel, err = filepath.Rel(root, full)
+	}
+	if err != nil || rel == "." || pathEscapesRoot(rel) {
+		return "", "", errors.New("write path escapes repository")
+	}
+	full = filepath.Join(root, rel)
+	probe := full
+	for {
+		if _, statErr := os.Lstat(probe); statErr == nil {
+			break
+		} else if !os.IsNotExist(statErr) {
+			return "", "", statErr
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return "", "", errors.New("write path has no existing parent")
+		}
+		probe = parent
+	}
+	resolved, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return "", "", err
+	}
+	resolvedRel, err := filepath.Rel(root, resolved)
+	if err != nil || resolvedRel == ".." || strings.HasPrefix(resolvedRel, ".."+string(filepath.Separator)) || filepath.IsAbs(resolvedRel) {
+		return "", "", errors.New("write path escapes repository through a symlink")
+	}
+	return full, filepath.ToSlash(rel), nil
+}
+
+func pathEscapesRoot(relative string) bool {
+	return relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative)
+}
+
 func SafeURL(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil || u.User != nil || u.Host == "" {

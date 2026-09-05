@@ -65,6 +65,17 @@ func (s *Screen) Leave() {
 	s.active = false
 }
 
+// ShowStatus replaces the alternate-screen contents while a wizard performs
+// bounded work between interactive screens. This avoids presenting a blank
+// terminal during provider authentication probes or model discovery.
+func (s *Screen) ShowStatus(title, message string) {
+	if s == nil || s.out == nil {
+		return
+	}
+	s.Enter()
+	_, _ = fmt.Fprintf(s.out, "\x1b[?2026h\x1b[2J\x1b[H\r\x1b[2K%s\n\r\x1b[2K\n\r\x1b[2K%s\x1b[?2026l", title, message)
+}
+
 type State struct {
 	Options []Option
 	Query   string

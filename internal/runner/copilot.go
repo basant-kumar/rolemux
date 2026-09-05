@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/basant-kumar/rolemux/internal/task"
 	copilot "github.com/github/copilot-sdk/go"
 	"github.com/github/copilot-sdk/go/rpc"
 )
@@ -25,6 +26,8 @@ type Copilot struct {
 	// pinned SDK's ListModels method.
 	Discover func(context.Context) ([]copilot.ModelInfo, error)
 }
+
+func (c *Copilot) SupportsRole(Role) error { return nil }
 
 func NewCopilot(path string) (*Copilot, error) {
 	var resolved string
@@ -52,19 +55,27 @@ func CopilotReadOnlyTools() []string {
 	return copilot.NewToolSet().AddBuiltIn("view", "grep", "web_fetch").ToSlice()
 }
 
-func CopilotPermissionHandler(repoRoot string) copilot.PermissionHandlerFunc {
+func CopilotTools(role Role) []string {
+	tools := CopilotReadOnlyTools()
+	if role == RoleImplementer {
+		tools = copilot.NewToolSet().AddBuiltIn("view", "grep", "web_fetch", "edit").ToSlice()
+	}
+	return tools
+}
+
+func CopilotPermissionHandler(req Request) copilot.PermissionHandlerFunc {
 	return func(request copilot.PermissionRequest, _ copilot.PermissionInvocation) (rpc.PermissionDecision, error) {
 		reject := func(message string) (rpc.PermissionDecision, error) {
 			return &rpc.PermissionDecisionReject{Feedback: &message}, nil
 		}
 		switch r := request.(type) {
 		case copilot.PermissionRequestRead:
-			return decideCopilotRead(repoRoot, r.Path, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
+			return decideCopilotRead(req.RepoRoot, r.Path, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
 		case *copilot.PermissionRequestRead:
 			if r == nil {
 				return reject("nil read permission request")
 			}
-			return decideCopilotRead(repoRoot, r.Path, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
+			return decideCopilotRead(req.RepoRoot, r.Path, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
 		case copilot.PermissionRequestURL:
 			return decideCopilotURL(r.URL, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
 		case *copilot.PermissionRequestURL:
@@ -72,10 +83,37 @@ func CopilotPermissionHandler(repoRoot string) copilot.PermissionHandlerFunc {
 				return reject("nil URL permission request")
 			}
 			return decideCopilotURL(r.URL, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
+		case copilot.PermissionRequestWrite:
+			return decideCopilotWrite(req, r.FileName, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
+		case *copilot.PermissionRequestWrite:
+			if r == nil {
+				return reject("nil write permission request")
+			}
+			return decideCopilotWrite(req, r.FileName, r.RequiresManagedApproval(), boolValue(r.RequestSandboxBypass), reject)
 		default:
 			return reject("permission request kind is not in RoleMux's allowlist")
 		}
 	}
+}
+
+func decideCopilotWrite(req Request, candidate string, managed, bypass bool, reject func(string) (rpc.PermissionDecision, error)) (rpc.PermissionDecision, error) {
+	if req.Role != RoleImplementer {
+		return reject("file writes are available only to the implementation role")
+	}
+	if managed || bypass {
+		return reject("managed approval or sandbox bypass is not auto-approved")
+	}
+	if strings.TrimSpace(req.Scope) == "" {
+		return reject("implementation write scope is missing")
+	}
+	_, relative, err := WritePathWithinRepo(req.RepoRoot, candidate)
+	if err != nil {
+		return reject(err.Error())
+	}
+	if !task.ScopeMatches(req.Scope, relative) {
+		return reject("write path is outside the declared implementation scope")
+	}
+	return &rpc.PermissionDecisionApproveOnce{}, nil
 }
 
 func decideCopilotRead(repoRoot, candidate string, managed, bypass bool, reject func(string) (rpc.PermissionDecision, error)) (rpc.PermissionDecision, error) {
@@ -118,15 +156,17 @@ func (c *Copilot) clientOptions(req Request) *copilot.ClientOptions {
 }
 
 func (c *Copilot) sessionConfig(req Request) *copilot.SessionConfig {
+	enableSkills := len(req.SkillDirectories) > 0
 	return &copilot.SessionConfig{
 		SessionID:                          req.SessionID,
 		Model:                              req.Model,
 		ReasoningEffort:                    req.Effort,
 		WorkingDirectory:                   req.RepoRoot,
-		AvailableTools:                     CopilotReadOnlyTools(),
-		OnPermissionRequest:                CopilotPermissionHandler(req.RepoRoot),
+		AvailableTools:                     CopilotTools(req.Role),
+		OnPermissionRequest:                CopilotPermissionHandler(req),
 		EnableConfigDiscovery:              copilot.Bool(false),
-		EnableSkills:                       copilot.Bool(false),
+		EnableSkills:                       copilot.Bool(enableSkills),
+		SkillDirectories:                   append([]string(nil), req.SkillDirectories...),
 		EnableFileHooks:                    copilot.Bool(false),
 		EnableOnDemandInstructionDiscovery: copilot.Bool(false),
 		EnableHostGitOperations:            copilot.Bool(false),
@@ -140,14 +180,16 @@ func (c *Copilot) sessionConfig(req Request) *copilot.SessionConfig {
 }
 
 func (c *Copilot) resumeConfig(req Request) *copilot.ResumeSessionConfig {
+	enableSkills := len(req.SkillDirectories) > 0
 	return &copilot.ResumeSessionConfig{
 		Model:                              req.Model,
 		ReasoningEffort:                    req.Effort,
 		WorkingDirectory:                   req.RepoRoot,
-		AvailableTools:                     CopilotReadOnlyTools(),
-		OnPermissionRequest:                CopilotPermissionHandler(req.RepoRoot),
+		AvailableTools:                     CopilotTools(req.Role),
+		OnPermissionRequest:                CopilotPermissionHandler(req),
 		EnableConfigDiscovery:              copilot.Bool(false),
-		EnableSkills:                       copilot.Bool(false),
+		EnableSkills:                       copilot.Bool(enableSkills),
+		SkillDirectories:                   append([]string(nil), req.SkillDirectories...),
 		EnableFileHooks:                    copilot.Bool(false),
 		EnableOnDemandInstructionDiscovery: copilot.Bool(false),
 		EnableHostGitOperations:            copilot.Bool(false),
@@ -233,8 +275,8 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 	if req.Speed != "" && req.Speed != "standard" {
 		return Response{}, providerError("COPILOT_SPEED", fmt.Sprintf("Copilot model %q does not advertise speed modes", req.Model), false, false, req.SessionID, ErrUnsupportedProvider)
 	}
-	if req.Role == RoleImplementer {
-		return Response{}, providerError("UNSUPPORTED_PROVIDER", "Copilot implementation is fail-closed until write isolation is proven", false, false, "", ErrUnsupportedProvider)
+	if err := c.SupportsRole(req.Role); err != nil {
+		return Response{}, err
 	}
 	if c == nil || c.Path == "" {
 		return Response{}, providerError("COPILOT_UNAVAILABLE", "copilot executable is not configured", false, false, "", nil)
@@ -305,6 +347,9 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 	response := Response{SessionID: session.SessionID, Text: data.Content, Envelope: &env, Usage: usageSnapshot()}
 	if data.Model != nil {
 		response.ReportedModel = *data.Model
+	}
+	if selectionErr := VerifyReportedSelection("copilot", req, response); selectionErr != nil {
+		return response, selectionErr
 	}
 	return response, nil
 }

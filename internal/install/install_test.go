@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 )
@@ -39,7 +40,7 @@ func TestInstallGlobalIsIdempotentAndConflictSafe(t *testing.T) {
 		t.Fatalf("idempotent install: %#v, %v", results, err)
 	}
 
-	destination := filepath.Join(home, ".codex", "skills", "rolemux", "SKILL.md")
+	destination := filepath.Join(home, ".agents", "skills", "rolemux", "SKILL.md")
 	if err := os.WriteFile(destination, []byte("user content"), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -65,5 +66,33 @@ func TestInstallGlobalIsIdempotentAndConflictSafe(t *testing.T) {
 func TestParseHostsRejectsUnknown(t *testing.T) {
 	if _, err := ParseHosts("codex,unknown"); err == nil {
 		t.Fatal("expected unknown host error")
+	}
+}
+
+func TestAllHostsIncludesEverySupportedCLI(t *testing.T) {
+	hosts, err := ParseHosts("all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"antigravity", "claude", "codex", "copilot"}
+	if !reflect.DeepEqual(hosts, want) {
+		t.Fatalf("hosts = %#v, want %#v", hosts, want)
+	}
+
+	home := t.TempDir()
+	results, err := InstallGlobal(home, hosts, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != len(want) {
+		t.Fatalf("results = %#v", results)
+	}
+	for index, result := range results {
+		if result.Host != want[index] {
+			t.Fatalf("result %d host = %q, want %q", index, result.Host, want[index])
+		}
+		if _, err := os.Stat(result.Path); err != nil {
+			t.Fatalf("installed skill %q: %v", result.Path, err)
+		}
 	}
 }

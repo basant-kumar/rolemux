@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/basant-kumar/rolemux/internal/capability"
 	"github.com/basant-kumar/rolemux/internal/catalog"
 	"github.com/basant-kumar/rolemux/internal/config"
 	"github.com/basant-kumar/rolemux/internal/install"
@@ -25,37 +26,46 @@ import (
 	"github.com/basant-kumar/rolemux/internal/workflow"
 )
 
-const usageText = `RoleMux — Right model. Right role. Same thread.
+const usageText = `RoleMux — The right mind for every role.
 
 Usage:
+  rolemux help
+  rolemux -h
+  rolemux --help
   rolemux version [--json]
-  rolemux models [--refresh] [--runner codex|claude|copilot] [--json]
+  rolemux models [--refresh] [--runner PROVIDER] [--json]
   rolemux configure [--global|--project] [--from PATH|-]
                     [--role planner|implementer|reviewer|plan-reviewer|code-reviewer]
                     [--runner PROVIDER] [--model MODEL] [--effort EFFORT] [--speed SPEED] [--json]
   rolemux plan start --task TEXT [--id TASK-ID] [--json]
   rolemux plan answer TASK-ID --answer TEXT [--json]
   rolemux plan review TASK-ID [--json]
+  rolemux plan graph TASK-ID [--json]
+  rolemux work start TASK-ID UNIT-ID [--json]
+  rolemux work integrate TASK-ID [--json]
   rolemux implement TASK-ID [--scope PATH[,PATH...]] [--json]
   rolemux implement answer TASK-ID --answer TEXT [--json]
   rolemux code review TASK-ID [--json]
-  rolemux status TASK-ID [--json]
+  rolemux status TASK-ID [--full] [--json]
   rolemux usage TASK-ID [--json]
   rolemux retry TASK-ID [--json]
   rolemux list [--json]
   rolemux doctor [--json]
-  rolemux install --global --hosts all|claude,codex,copilot [--force] [--json]
+  rolemux install --global --hosts all|antigravity,claude,codex,copilot [--force] [--json]
 `
 
+const backgroundModelRefreshTimeout = 30 * time.Second
+
 type app struct {
-	ctx     context.Context
-	in      io.Reader
-	out     io.Writer
-	errOut  io.Writer
-	version string
-	cwd     string
-	environ []string
-	runners *runner.Registry
+	ctx           context.Context
+	in            io.Reader
+	out           io.Writer
+	errOut        io.Writer
+	version       string
+	cwd           string
+	environ       []string
+	runners       *runner.Registry
+	refreshModels func(config.Config, string, string, runner.Adapter, runner.ModelListRequest)
 }
 
 // Run executes one command and returns its documented process exit code.
@@ -90,6 +100,8 @@ func (a *app) run(args []string) int {
 		return a.runConfigure(args[1:])
 	case "plan":
 		return a.runPlan(args[1:])
+	case "work":
+		return a.runWork(args[1:])
 	case "implement":
 		return a.runImplement(args[1:])
 	case "code":
@@ -148,7 +160,7 @@ func (a *app) runModels(args []string) int {
 	if provider != "" {
 		providers = []string{provider}
 	}
-	cat := catalog.New(adapters, cfg, "")
+	cat := catalog.New(adapters, cfg, catalog.DefaultCachePath(a.environ))
 	models := []runner.ModelInfo{}
 	advisories := []task.Diagnostic{}
 	for _, name := range providers {
@@ -260,12 +272,39 @@ func (a *app) runConfigure(args []string) int {
 			return a.fail("configure", roleErr, opts.json(), workflow.Result{})
 		}
 		profile := config.Profile{Provider: strings.ToLower(opts.value("--runner")), Model: opts.value("--model"), Effort: opts.value("--effort"), Speed: opts.value("--speed")}
+		cfg, loadErr := config.LoadWithEnv(root, a.environ)
+		if loadErr != nil {
+			return a.fail("configure", configProblem(loadErr), opts.json(), workflow.Result{})
+		}
+		if selectionErr := a.validateProfileSelection(root, cfg, role, profile); selectionErr != nil {
+			return a.fail("configure", configProblem(selectionErr), opts.json(), workflow.Result{})
+		}
 		if err := config.ConfigureProfile(target, role, profile, before); err != nil {
 			return a.fail("configure", configProblem(err), opts.json(), workflow.Result{})
 		}
 		return a.configureSuccess(target, "updated", opts.json())
 	}
 	return a.fail("configure", usage("configuration mode is required"), false, workflow.Result{})
+}
+
+func (a *app) validateProfileSelection(root string, cfg config.Config, role string, profile config.Profile) error {
+	if err := config.ValidateProfile(profile); err != nil {
+		return err
+	}
+	cfg, adapters, adapterErrors := prepareAdapters(cfg, root, a.runnerRegistry())
+	if err := adapterErrors[profile.Provider]; err != nil {
+		return err
+	}
+	adapter := adapters[profile.Provider]
+	if adapter == nil {
+		return fmt.Errorf("provider %s is unavailable", profile.Provider)
+	}
+	runtime := workflow.RuntimeSnapshot(profile.Provider, cfg.Provider(profile.Provider))
+	models, err := catalog.New(adapters, cfg, catalog.DefaultCachePath(a.environ)).Models(a.ctx, profile.Provider, true, runner.ModelListRequest{Refresh: true, Runtime: runtime})
+	if err != nil {
+		return err
+	}
+	return runner.ValidateSelection(runner.Role(role), profile.Model, profile.Effort, profile.Speed, models, adapter)
 }
 
 func (a *app) configureSuccess(path, status string, jsonMode bool) int {
@@ -312,7 +351,8 @@ func (a *app) pickInteractiveConfiguration(root string, global, project bool) (s
 type wizardScreenKind int
 
 const (
-	wizardProvider wizardScreenKind = iota
+	wizardRole wizardScreenKind = iota
+	wizardProvider
 	wizardModel
 	wizardVerifyModel
 	wizardEffort
@@ -336,8 +376,10 @@ type profileDraft struct {
 
 type providerReadiness struct {
 	adapter       runner.Adapter
+	checked       bool
 	authenticated bool
 	externalAuth  bool
+	account       string
 	status        string
 	message       string
 }
@@ -348,13 +390,14 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 		return nil, configProblem(err)
 	}
 	cfg, adapters, adapterErrors := prepareAdapters(cfg, root, a.runnerRegistry())
-	cat := catalog.New(adapters, cfg, "")
-	readiness := a.inspectProviders(cfg, adapters, adapterErrors)
+	cat := catalog.New(adapters, cfg, catalog.DefaultCachePath(a.environ))
+	var readiness map[string]providerReadiness
 	drafts := map[string]*profileDraft{}
 	modelsByProvider := map[string][]runner.ModelInfo{}
 	separate := map[string]bool{}
 	history := []wizardScreen{}
-	current := wizardScreen{kind: wizardProvider, role: config.RolePlanner}
+	current := wizardScreen{kind: wizardRole}
+	selection := "all"
 	notice := ""
 
 	goBack := func() bool {
@@ -377,6 +420,8 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 		view.InitialID = wizardInitialID(current, cfg, drafts)
 		var options []picker.Option
 		switch current.kind {
+		case wizardRole:
+			options = wizardRoleOptions()
 		case wizardProvider:
 			options = providerWizardOptions(a.runnerRegistry().Names(), readiness)
 		case wizardModel:
@@ -405,6 +450,17 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 		}
 
 		switch current.kind {
+		case wizardRole:
+			selection = choice.ID
+			role := choice.ID
+			if selection == "all" {
+				role = config.RolePlanner
+			}
+			if readiness == nil {
+				readiness = a.installedProviders(cfg, adapters, adapterErrors)
+			}
+			advance(wizardScreen{kind: wizardProvider, role: role})
+
 		case wizardProvider:
 			ready := readiness[choice.ID]
 			if ready.adapter == nil {
@@ -419,13 +475,24 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 				provider.CLIPath = resolved
 				cfg.Providers[choice.ID] = provider
 				adapters[choice.ID] = adapter
-				cat.Config = cfg
-				ready = a.inspectProvider(choice.ID, cfg, adapter, nil)
+				cat = catalog.New(adapters, cfg, catalog.DefaultCachePath(a.environ))
+				ready = providerReadiness{adapter: adapter, status: "installed"}
+				readiness[choice.ID] = ready
+			}
+			if !ready.checked {
+				terminal.ShowStatus("Configure RoleMux", "Checking "+providerDisplayName(choice.ID)+" sign-in…")
+				ready = a.inspectProvider(choice.ID, cfg, ready.adapter, nil)
 				readiness[choice.ID] = ready
 			}
 			if ready.externalAuth && !ready.authenticated {
 				notice = ready.message
 				continue
+			}
+			if supporter, ok := ready.adapter.(runner.RoleSupporter); ok {
+				if supportErr := supporter.SupportsRole(runner.Role(current.role)); supportErr != nil {
+					notice = supportErr.Error()
+					continue
+				}
 			}
 			if !ready.authenticated && !ready.externalAuth {
 				loginErr := a.loginProvider(choice.ID, ready.adapter, root, terminal)
@@ -446,17 +513,24 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 					notice = ready.message
 					continue
 				}
-				ready.authenticated, ready.status, ready.message = true, "signed in", ""
+				ready.authenticated, ready.account, ready.status, ready.message = true, auth.Account, "signed in", ""
 				readiness[choice.ID] = ready
 			}
 			models := modelsByProvider[choice.ID]
 			if models == nil {
 				runtime := workflow.RuntimeSnapshot(choice.ID, cfg.Provider(choice.ID))
-				var modelErr error
-				models, modelErr = cat.Models(a.ctx, choice.ID, true, runner.ModelListRequest{Refresh: true, Runtime: runtime})
-				if modelErr != nil {
-					notice = "Model discovery failed: " + modelErr.Error()
-					continue
+				request := runner.ModelListRequest{Refresh: true, Runtime: runtime}
+				if cached, ok := cat.CachedModels(choice.ID, ready.account, request); ok {
+					models = cached
+					a.refreshModelCatalog(cfg, cat.CachePath, choice.ID, ready.adapter, request)
+				} else {
+					terminal.ShowStatus("Configure RoleMux", "Discovering "+providerDisplayName(choice.ID)+" models for the first time…")
+					var modelErr error
+					models, modelErr = cat.Models(a.ctx, choice.ID, true, request)
+					if modelErr != nil {
+						notice = "Model discovery failed: " + modelErr.Error()
+						continue
+					}
 				}
 				modelsByProvider[choice.ID] = models
 			}
@@ -472,8 +546,8 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 				advance(wizardScreen{kind: wizardEffort, role: current.role})
 			} else if len(draft.model.SpeedOptions) > 0 {
 				advance(wizardScreen{kind: wizardSpeed, role: current.role})
-			} else if next, done := nextProfileScreen(current.role); done {
-				return buildProfiles(drafts, separate), nil
+			} else if next, done := selectedNextProfileScreen(selection, current.role); done {
+				return selectedProfiles(selection, drafts, separate), nil
 			} else {
 				advance(next)
 			}
@@ -488,8 +562,8 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 				advance(wizardScreen{kind: wizardEffort, role: current.role})
 			} else if len(draft.model.SpeedOptions) > 0 {
 				advance(wizardScreen{kind: wizardSpeed, role: current.role})
-			} else if next, done := nextProfileScreen(current.role); done {
-				return buildProfiles(drafts, separate), nil
+			} else if next, done := selectedNextProfileScreen(selection, current.role); done {
+				return selectedProfiles(selection, drafts, separate), nil
 			} else {
 				advance(next)
 			}
@@ -498,16 +572,16 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			drafts[current.role].effort = choice.ID
 			if len(drafts[current.role].model.SpeedOptions) > 0 {
 				advance(wizardScreen{kind: wizardSpeed, role: current.role})
-			} else if next, done := nextProfileScreen(current.role); done {
-				return buildProfiles(drafts, separate), nil
+			} else if next, done := selectedNextProfileScreen(selection, current.role); done {
+				return selectedProfiles(selection, drafts, separate), nil
 			} else {
 				advance(next)
 			}
 
 		case wizardSpeed:
 			drafts[current.role].speed = choice.ID
-			if next, done := nextProfileScreen(current.role); done {
-				return buildProfiles(drafts, separate), nil
+			if next, done := selectedNextProfileScreen(selection, current.role); done {
+				return selectedProfiles(selection, drafts, separate), nil
 			} else {
 				advance(next)
 			}
@@ -525,7 +599,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			if choice.ID == "yes" {
 				advance(wizardScreen{kind: wizardProvider, role: config.RoleCodeReviewer})
 			} else {
-				return buildProfiles(drafts, separate), nil
+				return selectedProfiles(selection, drafts, separate), nil
 			}
 		}
 	}
@@ -538,6 +612,8 @@ func wizardInitialID(screen wizardScreen, cfg config.Config, drafts map[string]*
 		profile = cfg.Profiles[config.RoleReviewer]
 	}
 	switch screen.kind {
+	case wizardRole:
+		return "all"
 	case wizardProvider:
 		if draft != nil && draft.provider != "" {
 			return draft.provider
@@ -606,34 +682,71 @@ func modelSelectorMatches(model runner.ModelInfo, selector string) bool {
 	return false
 }
 
-func (a *app) inspectProviders(cfg config.Config, adapters map[string]runner.Adapter, adapterErrors map[string]error) map[string]providerReadiness {
+func (a *app) installedProviders(cfg config.Config, adapters map[string]runner.Adapter, adapterErrors map[string]error) map[string]providerReadiness {
 	result := map[string]providerReadiness{}
 	for _, name := range a.runnerRegistry().Names() {
-		result[name] = a.inspectProvider(name, cfg, adapters[name], adapterErrors[name])
+		if adapters[name] == nil {
+			result[name] = providerReadiness{checked: true, status: "not installed", message: providerInstallMessage(name, adapterErrors[name])}
+			continue
+		}
+		provider := cfg.Provider(name)
+		runtime := workflow.RuntimeSnapshot(name, provider)
+		if len(runtime.AuthEnvRefs) > 0 && !provider.RequiresOpenAIAuth {
+			missing := missingEnvironment(runtime.AuthEnvRefs, a.environ)
+			if len(missing) > 0 {
+				result[name] = providerReadiness{adapter: adapters[name], checked: true, externalAuth: true, status: "credentials required", message: "Set required credential environment: " + strings.Join(missing, ", ")}
+			} else {
+				result[name] = providerReadiness{adapter: adapters[name], checked: true, authenticated: true, externalAuth: true, status: "configured credentials"}
+			}
+			continue
+		}
+		result[name] = providerReadiness{adapter: adapters[name], status: "installed"}
 	}
 	return result
 }
 
 func (a *app) inspectProvider(name string, cfg config.Config, adapter runner.Adapter, adapterErr error) providerReadiness {
 	if adapter == nil {
-		return providerReadiness{status: "not installed", message: providerInstallMessage(name, adapterErr)}
+		return providerReadiness{checked: true, status: "not installed", message: providerInstallMessage(name, adapterErr)}
 	}
 	provider := cfg.Provider(name)
 	runtime := workflow.RuntimeSnapshot(name, provider)
 	if len(runtime.AuthEnvRefs) > 0 && !provider.RequiresOpenAIAuth {
 		missing := missingEnvironment(runtime.AuthEnvRefs, a.environ)
 		if len(missing) > 0 {
-			return providerReadiness{adapter: adapter, externalAuth: true, status: "credentials required", message: "Set required credential environment: " + strings.Join(missing, ", ")}
+			return providerReadiness{adapter: adapter, checked: true, externalAuth: true, status: "credentials required", message: "Set required credential environment: " + strings.Join(missing, ", ")}
 		}
-		return providerReadiness{adapter: adapter, authenticated: true, externalAuth: true, status: "configured credentials"}
+		return providerReadiness{adapter: adapter, checked: true, authenticated: true, externalAuth: true, status: "configured credentials"}
+	}
+	if hinter, ok := adapter.(runner.LocalAuthHinter); ok {
+		auth := hinter.LocalAuthHint()
+		if auth.Authenticated {
+			return providerReadiness{adapter: adapter, checked: true, authenticated: true, account: auth.Account, status: "credentials found", message: auth.Message}
+		}
+		return providerReadiness{adapter: adapter, checked: true, status: "login required", message: loginRequiredMessage(name, auth, nil)}
 	}
 	probeCtx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
 	auth, authErr := adapter.Auth(probeCtx)
 	cancel()
 	if authErr == nil && auth.Authenticated {
-		return providerReadiness{adapter: adapter, authenticated: true, status: "signed in"}
+		return providerReadiness{adapter: adapter, checked: true, authenticated: true, account: auth.Account, status: "signed in"}
 	}
-	return providerReadiness{adapter: adapter, status: "login required", message: loginRequiredMessage(name, auth, authErr)}
+	return providerReadiness{adapter: adapter, checked: true, status: "login required", message: loginRequiredMessage(name, auth, authErr)}
+}
+
+func (a *app) refreshModelCatalog(cfg config.Config, cachePath, provider string, adapter runner.Adapter, request runner.ModelListRequest) {
+	if a.refreshModels != nil {
+		a.refreshModels(cfg, cachePath, provider, adapter, request)
+		return
+	}
+	// Use a provider-only adapter map so later wizard changes cannot race this
+	// refresh. Cache writes for the same path are serialized by catalog.
+	adapters := map[string]runner.Adapter{provider: adapter}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), backgroundModelRefreshTimeout)
+		defer cancel()
+		_, _ = catalog.New(adapters, cfg, cachePath).Models(ctx, provider, true, request)
+	}()
 }
 
 func (a *app) loginProvider(name string, adapter runner.Adapter, root string, terminal *picker.Screen) error {
@@ -652,6 +765,8 @@ func wizardView(screen wizardScreen, canBack bool, notice string, drafts map[str
 	view := picker.View{Title: "Configure RoleMux", CanBack: canBack, FullScreen: true}
 	role := roleDisplayName(screen.role)
 	switch screen.kind {
+	case wizardRole:
+		view.Subtitle = "Choose which role to configure"
 	case wizardProvider:
 		view.Subtitle, view.Search = role+" · Select provider", true
 	case wizardModel:
@@ -671,6 +786,35 @@ func wizardView(screen wizardScreen, canBack bool, notice string, drafts map[str
 		view.Subtitle = notice
 	}
 	return view
+}
+
+func wizardRoleOptions() []picker.Option {
+	return []picker.Option{
+		{ID: "all", Label: "All roles", Description: "Configure the complete planning, implementation, and review pipeline"},
+		{ID: config.RolePlanner, Label: "Planner"},
+		{ID: config.RoleImplementer, Label: "Implementer"},
+		{ID: config.RoleReviewer, Label: "Shared reviewer", Description: "Default for both plan and code review"},
+		{ID: config.RolePlanReviewer, Label: "Plan reviewer"},
+		{ID: config.RoleCodeReviewer, Label: "Code reviewer"},
+	}
+}
+
+func selectedNextProfileScreen(selection, role string) (wizardScreen, bool) {
+	if selection != "all" {
+		return wizardScreen{}, true
+	}
+	return nextProfileScreen(role)
+}
+
+func selectedProfiles(selection string, drafts map[string]*profileDraft, separate map[string]bool) map[string]config.Profile {
+	if selection == "all" {
+		return buildProfiles(drafts, separate)
+	}
+	draft := drafts[selection]
+	if draft == nil {
+		return nil
+	}
+	return map[string]config.Profile{selection: {Provider: draft.provider, Model: draft.model.ID, Effort: draft.effort, Speed: draft.speed}}
 }
 
 func nextProfileScreen(role string) (wizardScreen, bool) {
@@ -730,7 +874,7 @@ func providerWizardOptions(names []string, readiness map[string]providerReadines
 }
 
 func providerDisplayName(name string) string {
-	labels := map[string]string{"codex": "Codex", "claude": "Claude Code", "copilot": "GitHub Copilot"}
+	labels := map[string]string{"codex": "Codex", "claude": "Claude Code", "copilot": "GitHub Copilot", "antigravity": "Google Antigravity"}
 	if label := labels[name]; label != "" {
 		return label
 	}
@@ -746,7 +890,7 @@ func roleDisplayName(role string) string {
 }
 
 func providerLoginCommand(name string) string {
-	if command := map[string]string{"codex": "codex login", "claude": "claude auth login", "copilot": "copilot login"}[name]; command != "" {
+	if command := map[string]string{"codex": "codex login", "claude": "claude auth login", "copilot": "copilot login", "antigravity": "agy"}[name]; command != "" {
 		return command
 	}
 	return name + " login"
@@ -766,6 +910,9 @@ func loginRequiredMessage(name string, auth runner.AuthStatus, err error) string
 func providerInstallMessage(name string, err error) string {
 	if name == "copilot" {
 		return "GitHub Copilot CLI is not installed; run `brew install copilot-cli`, then select it again"
+	}
+	if name == "antigravity" {
+		return "Google Antigravity CLI is not installed; install it from `antigravity.google/docs/cli/install`, then select it again"
 	}
 	message := providerDisplayName(name) + " CLI is not installed"
 	if err != nil {
@@ -839,8 +986,68 @@ func (a *app) runPlan(args []string) int {
 		}
 		result, callErr := service.ReviewPlan(a.ctx, opts.positionals[0])
 		return a.workflowResult("plan-review", result, callErr, opts.json())
+	case "graph":
+		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		if err != nil || len(opts.positionals) != 1 {
+			if err == nil {
+				err = usage("plan graph requires TASK-ID")
+			}
+			return a.fail("plan-graph", err, opts.json(), workflow.Result{})
+		}
+		service, err := a.workflowService()
+		if err != nil {
+			return a.fail("plan-graph", err, opts.json(), workflow.Result{})
+		}
+		graph, graphErr := service.Graph(opts.positionals[0])
+		if graphErr != nil {
+			return a.fail("plan-graph", graphErr, opts.json(), workflow.Result{})
+		}
+		if opts.json() {
+			return a.success("plan-graph", graph, nil, nil, true)
+		}
+		printWorkGraph(a.out, graph)
+		return workflow.ExitOK
 	default:
 		return a.fail("plan", usage("unknown plan command %q", args[0]), jsonMode, workflow.Result{})
+	}
+}
+
+func (a *app) runWork(args []string) int {
+	jsonMode := containsFlag(args, "--json")
+	if len(args) == 0 {
+		return a.fail("work", usage("work requires start or integrate"), jsonMode, workflow.Result{})
+	}
+	switch args[0] {
+	case "start":
+		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		if err != nil || len(opts.positionals) != 2 {
+			if err == nil {
+				err = usage("work start requires TASK-ID and UNIT-ID")
+			}
+			return a.fail("work-start", err, opts.json(), workflow.Result{})
+		}
+		service, err := a.workflowService()
+		if err != nil {
+			return a.fail("work-start", err, opts.json(), workflow.Result{})
+		}
+		result, callErr := service.StartWork(opts.positionals[0], opts.positionals[1])
+		return a.workflowResult("work-start", result, callErr, opts.json())
+	case "integrate":
+		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		if err != nil || len(opts.positionals) != 1 {
+			if err == nil {
+				err = usage("work integrate requires TASK-ID")
+			}
+			return a.fail("work-integrate", err, opts.json(), workflow.Result{})
+		}
+		service, err := a.workflowService()
+		if err != nil {
+			return a.fail("work-integrate", err, opts.json(), workflow.Result{})
+		}
+		result, callErr := service.ReviewIntegration(a.ctx, opts.positionals[0])
+		return a.workflowResult("work-integrate", result, callErr, opts.json())
+	default:
+		return a.fail("work", usage("unknown work command %q", args[0]), jsonMode, workflow.Result{})
 	}
 }
 
@@ -896,7 +1103,7 @@ func (a *app) runCode(args []string) int {
 }
 
 func (a *app) runStatus(args []string) int {
-	opts, err := parse(args, map[string]bool{"--json": false})
+	opts, err := parse(args, map[string]bool{"--json": false, "--full": false})
 	if err != nil || len(opts.positionals) != 1 {
 		if err == nil {
 			err = usage("status requires TASK-ID")
@@ -912,7 +1119,11 @@ func (a *app) runStatus(args []string) int {
 		return a.fail("status", loadErr, opts.json(), workflow.Result{})
 	}
 	if opts.json() {
-		return a.success("status", state, &state, state.Advisories, true)
+		result := any(compactStatus(state))
+		if opts.bool("--full") {
+			result = state
+		}
+		return a.success("status", result, &state, state.Advisories, true)
 	}
 	printState(a.out, state)
 	return workflow.ExitOK
@@ -975,7 +1186,11 @@ func (a *app) runList(args []string) int {
 		return a.fail("list", listErr, opts.json(), workflow.Result{})
 	}
 	if opts.json() {
-		return a.success("list", map[string]any{"tasks": states}, nil, nil, true)
+		tasks := make([]statusSummary, 0, len(states))
+		for _, state := range states {
+			tasks = append(tasks, compactStatus(state))
+		}
+		return a.success("list", map[string]any{"tasks": tasks}, nil, nil, true)
 	}
 	for _, state := range states {
 		fmt.Fprintf(a.out, "%s\t%s\tplan:%d code:%d\n", state.ID, state.Phase, state.PlanRound, state.CodeRound)
@@ -1056,6 +1271,43 @@ func (a *app) runDoctor(args []string) int {
 			ready = false
 		}
 	}
+	if profileErr == nil {
+		cat := catalog.New(adapters, cfg, catalog.DefaultCachePath(a.environ))
+		modelsByProvider := map[string][]runner.ModelInfo{}
+		for _, role := range []string{config.RolePlanner, config.RolePlanReviewer, config.RoleImplementer, config.RoleCodeReviewer} {
+			profile, providerConfig := cfg.ResolveProfile(effective[role])
+			adapter := adapters[profile.Provider]
+			selectionErr := error(nil)
+			if adapter == nil {
+				selectionErr = fmt.Errorf("provider %s is unavailable", profile.Provider)
+			} else {
+				models := modelsByProvider[profile.Provider]
+				if models == nil {
+					probeCtx, cancel := context.WithTimeout(a.ctx, 20*time.Second)
+					models, selectionErr = cat.Models(probeCtx, profile.Provider, true, runner.ModelListRequest{Refresh: true, Runtime: workflow.RuntimeSnapshot(profile.Provider, providerConfig)})
+					cancel()
+					if selectionErr == nil {
+						modelsByProvider[profile.Provider] = models
+					}
+				}
+				if selectionErr == nil {
+					selectionErr = runner.ValidateSelection(runner.Role(role), profile.Model, profile.Effort, profile.Speed, models, adapter)
+				}
+			}
+			message := fmt.Sprintf("%s / %s", profile.Provider, profile.Model)
+			if profile.Effort != "" {
+				message += " / effort=" + profile.Effort
+			}
+			if profile.Speed != "" {
+				message += " / speed=" + profile.Speed
+			}
+			if selectionErr != nil {
+				message = selectionErr.Error()
+				ready = false
+			}
+			checks = append(checks, doctorCheck{Name: "selection_" + role, OK: selectionErr == nil, Required: true, Message: message})
+		}
+	}
 	if root != "" {
 		store := task.NewStore(root)
 		_, stateErr := store.List()
@@ -1064,12 +1316,26 @@ func (a *app) runDoctor(args []string) int {
 			ready = false
 		}
 	}
+	pxpipe := capability.Discover(capability.Options{Provider: "claude", RepoRoot: root, Environ: a.environ}).Helpers
+	if len(pxpipe) > 0 {
+		checks = append(checks, doctorCheck{Name: "helper_pxpipe", OK: true, Path: pxpipe[0].Path, Message: "optional; RoleMux starts a private per-turn server (no daemon required), prints its dashboard URL, and wraps Codex only after verified ChatGPT authentication/route; inspect events with pxpipe stats --file"})
+	} else {
+		checks = append(checks, doctorCheck{Name: "helper_pxpipe", OK: false, Required: false, Message: "optional; without pxpipe Claude/Codex task turns remain direct; install it for private Claude wrapping or verified ChatGPT Codex wrapping"})
+	}
 	home, homeErr := os.UserHomeDir()
 	if homeErr == nil {
-		for _, name := range []string{"claude", "codex", "copilot"} {
-			path := filepath.Join(home, "."+name, "skills", "rolemux", "SKILL.md")
+		for _, host := range []struct {
+			name  string
+			parts []string
+		}{
+			{"antigravity", []string{".gemini", "antigravity-cli", "skills", "rolemux", "SKILL.md"}},
+			{"claude", []string{".claude", "skills", "rolemux", "SKILL.md"}},
+			{"codex", []string{".agents", "skills", "rolemux", "SKILL.md"}},
+			{"copilot", []string{".copilot", "skills", "rolemux", "SKILL.md"}},
+		} {
+			path := filepath.Join(append([]string{home}, host.parts...)...)
 			data, readErr := os.ReadFile(path)
-			checks = append(checks, doctorCheck{Name: "skill_" + name, OK: readErr == nil && bytes.Equal(data, install.Content()), Required: false, Path: path, Message: skillMessage(readErr, data)})
+			checks = append(checks, doctorCheck{Name: "skill_" + host.name, OK: readErr == nil && bytes.Equal(data, install.Content()), Required: false, Path: path, Message: skillMessage(readErr, data)})
 		}
 	}
 	exit := workflow.ExitOK
@@ -1122,7 +1388,15 @@ func (a *app) workflowService() (*workflow.Service, error) {
 		return nil, configProblem(err)
 	}
 	cfg, adapters, _ := prepareAdapters(cfg, root, a.runnerRegistry())
-	return workflow.New(root, cfg, adapters), nil
+	service := workflow.New(root, cfg, adapters)
+	service.ModelCachePath = catalog.DefaultCachePath(a.environ)
+	service.Diagnostic = func(message string) { fmt.Fprintf(a.errOut, "rolemux: %s\n", message) }
+	environ := append([]string(nil), a.environ...)
+	service.Capabilities = func(provider string, role runner.Role, taskText string) workflow.CapabilityContext {
+		inventory := capability.Discover(capability.Options{Provider: provider, Role: string(role), Task: taskText, RepoRoot: root, CodexAdminSkills: "/etc/codex/skills", Environ: environ})
+		return workflow.CapabilityContext{Note: inventory.Note(string(role)), SkillDirectories: inventory.SkillDirectories}
+	}
+	return service, nil
 }
 
 func prepareAdapters(cfg config.Config, root string, registry *runner.Registry) (config.Config, map[string]runner.Adapter, map[string]error) {
@@ -1233,6 +1507,57 @@ type taskSummary struct {
 	Scope                 string `json:"scope,omitempty"`
 	PendingQuestion       string `json:"pending_question,omitempty"`
 	PendingQuestionSource string `json:"pending_question_source,omitempty"`
+	ParentTaskID          string `json:"parent_task_id,omitempty"`
+	WorkUnitID            string `json:"work_unit_id,omitempty"`
+	IntegrationReview     bool   `json:"integration_review,omitempty"`
+	WorkGraph             bool   `json:"work_graph,omitempty"`
+}
+
+type operationSummary struct {
+	Operation    string    `json:"operation"`
+	Role         string    `json:"role"`
+	OwnerPID     int       `json:"owner_pid,omitempty"`
+	StartedAt    time.Time `json:"started_at,omitempty"`
+	KnownSession bool      `json:"known_session"`
+	SessionID    string    `json:"session_id,omitempty"`
+	Loop         string    `json:"loop,omitempty"`
+}
+
+type statusSummary struct {
+	ID                    string                          `json:"id"`
+	Phase                 string                          `json:"phase"`
+	PlanRound             int                             `json:"plan_round,omitempty"`
+	CodeRound             int                             `json:"code_round,omitempty"`
+	MaxRounds             int                             `json:"max_rounds,omitempty"`
+	Scope                 string                          `json:"scope,omitempty"`
+	PendingQuestion       string                          `json:"pending_question,omitempty"`
+	PendingQuestionSource string                          `json:"pending_question_source,omitempty"`
+	Findings              []task.Finding                  `json:"findings,omitempty"`
+	Profiles              map[string]task.ProfileSnapshot `json:"profiles,omitempty"`
+	Usage                 map[string]task.TokenUsage      `json:"usage,omitempty"`
+	InFlight              *operationSummary               `json:"in_flight,omitempty"`
+	Retry                 *operationSummary               `json:"retry,omitempty"`
+	UpdatedAt             time.Time                       `json:"updated_at"`
+	ParentTaskID          string                          `json:"parent_task_id,omitempty"`
+	WorkUnitID            string                          `json:"work_unit_id,omitempty"`
+	IntegrationReview     bool                            `json:"integration_review,omitempty"`
+	WorkGraph             bool                            `json:"work_graph,omitempty"`
+}
+
+func compactStatus(st task.State) statusSummary {
+	result := statusSummary{
+		ID: st.ID, Phase: st.Phase, PlanRound: st.PlanRound, CodeRound: st.CodeRound, MaxRounds: st.MaxRounds,
+		Scope: st.Scope, PendingQuestion: st.PendingQuestion, PendingQuestionSource: st.PendingQuestionSource,
+		Findings: st.Findings, Profiles: st.ProfilesSnapshot, Usage: st.Usage, UpdatedAt: st.UpdatedAt,
+		ParentTaskID: st.ParentTaskID, WorkUnitID: st.WorkUnitID, IntegrationReview: st.IntegrationReview, WorkGraph: st.WorkGraph,
+	}
+	if st.InFlight != nil {
+		result.InFlight = &operationSummary{Operation: st.InFlight.Operation, Role: st.InFlight.Role, OwnerPID: st.InFlight.OwnerPID, StartedAt: st.InFlight.StartedAt, KnownSession: st.InFlight.KnownSession, SessionID: st.InFlight.SessionID, Loop: st.InFlight.Loop}
+	}
+	if st.Retry != nil {
+		result.Retry = &operationSummary{Operation: st.Retry.Operation, Role: st.Retry.Role, StartedAt: st.Retry.CreatedAt, KnownSession: st.Retry.KnownSession, SessionID: st.Retry.SessionID, Loop: st.Retry.Loop}
+	}
+	return result
 }
 
 type usageNumbers struct {
@@ -1270,18 +1595,29 @@ func summarizeUsage(st task.State) usageSummary {
 		profile := st.ProfilesSnapshot[role]
 		summary.Roles = append(summary.Roles, roleUsage{
 			Role: role, Provider: profile.Provider, Model: profile.Model, Effort: profile.Effort, Speed: profile.Speed,
-			usageNumbers: usageNumbersFor(u),
+			usageNumbers: usageNumbersFor(u, profile.Provider),
 		})
 		totals.Add(u)
 	}
-	summary.Totals = usageNumbersFor(totals)
+	// Mixed providers can use different cache accounting. Sum the already
+	// normalized per-role uncached values rather than guessing from totals.
+	summary.Totals = usageNumbersFor(totals, "")
+	summary.Totals.UncachedInputTokens = 0
+	for _, role := range summary.Roles {
+		summary.Totals.UncachedInputTokens += role.UncachedInputTokens
+	}
 	return summary
 }
 
-func usageNumbersFor(u task.TokenUsage) usageNumbers {
-	uncached := u.InputTokens - u.CachedInputTokens
-	if uncached < 0 {
-		uncached = 0
+func usageNumbersFor(u task.TokenUsage, provider string) usageNumbers {
+	uncached := u.InputTokens
+	// OpenAI/Copilot report cached input as a subset of input. Claude and
+	// Antigravity report cache reads as a separate counter.
+	if provider != "claude" && provider != "antigravity" {
+		uncached -= u.CachedInputTokens
+		if uncached < 0 {
+			uncached = 0
+		}
 	}
 	return usageNumbers{TokenUsage: u, UncachedInputTokens: uncached}
 }
@@ -1306,7 +1642,7 @@ func summarize(st task.State) *taskSummary {
 	if st.ID == "" {
 		return nil
 	}
-	return &taskSummary{ID: st.ID, Phase: st.Phase, Round: st.Round, PlanRound: st.PlanRound, CodeRound: st.CodeRound, Scope: st.Scope, PendingQuestion: st.PendingQuestion, PendingQuestionSource: st.PendingQuestionSource}
+	return &taskSummary{ID: st.ID, Phase: st.Phase, Round: st.Round, PlanRound: st.PlanRound, CodeRound: st.CodeRound, Scope: st.Scope, PendingQuestion: st.PendingQuestion, PendingQuestionSource: st.PendingQuestionSource, ParentTaskID: st.ParentTaskID, WorkUnitID: st.WorkUnitID, IntegrationReview: st.IntegrationReview, WorkGraph: st.WorkGraph}
 }
 
 func (a *app) workflowResult(command string, result workflow.Result, err error, jsonMode bool) int {
@@ -1391,11 +1727,27 @@ func encodeOne(out io.Writer, value any) error {
 
 func printState(out io.Writer, st task.State) {
 	fmt.Fprintf(out, "task: %s\nphase: %s\nplan rounds: %d/%d\ncode rounds: %d/%d\n", st.ID, st.Phase, st.PlanRound, st.MaxRounds, st.CodeRound, st.MaxRounds)
+	if st.ParentTaskID != "" {
+		fmt.Fprintf(out, "parent: %s\n", st.ParentTaskID)
+	}
+	if st.WorkUnitID != "" {
+		fmt.Fprintf(out, "work unit: %s\n", st.WorkUnitID)
+	}
+	if st.IntegrationReview {
+		fmt.Fprintln(out, "integration review: true")
+	}
 	if st.Scope != "" {
 		fmt.Fprintf(out, "scope: %s\n", st.Scope)
 	}
 	if st.PendingQuestion != "" {
 		fmt.Fprintf(out, "question (%s): %s\n", st.PendingQuestionSource, st.PendingQuestion)
+	}
+	if st.InFlight != nil {
+		fmt.Fprintf(out, "in flight: %s (%s)", st.InFlight.Operation, st.InFlight.Role)
+		if st.InFlight.OwnerPID > 0 {
+			fmt.Fprintf(out, " owner_pid=%d", st.InFlight.OwnerPID)
+		}
+		fmt.Fprintln(out)
 	}
 	if st.Retry != nil {
 		fmt.Fprintf(out, "retry: %s (%s)\n", st.Retry.Operation, st.Retry.Role)
@@ -1408,6 +1760,20 @@ func printState(out io.Writer, st task.State) {
 	for _, role := range roles {
 		u := st.Usage[role]
 		fmt.Fprintf(out, "usage %s: requests=%d prompt_bytes=%d input=%d cached=%d cache_write=%d output=%d reasoning=%d total=%d\n", role, u.Requests, u.PromptBytes, u.InputTokens, u.CachedInputTokens, u.CacheWriteTokens, u.OutputTokens, u.ReasoningTokens, u.TotalTokens)
+	}
+}
+
+func printWorkGraph(out io.Writer, graph workflow.WorkGraph) {
+	fmt.Fprintf(out, "task: %s\nphase: %s\n", graph.TaskID, graph.Phase)
+	for index, wave := range graph.Waves {
+		fmt.Fprintf(out, "wave %d: %s\n", index+1, strings.Join(wave, ", "))
+	}
+	for _, node := range graph.Nodes {
+		fmt.Fprintf(out, "%s\t%s\t%s\tscope=%s", node.ID, node.Status, node.TaskID, node.Scope)
+		if len(node.BlockedBy) > 0 {
+			fmt.Fprintf(out, "\tblocked_by=%s", strings.Join(node.BlockedBy, ","))
+		}
+		fmt.Fprintln(out)
 	}
 }
 
@@ -1447,7 +1813,7 @@ func configTarget(root string, global, project bool, environ []string) (string, 
 	globalPath, projectPath := config.ConfigPaths(root, environ)
 	if global {
 		if globalPath == "" {
-			return "", errors.New("global configuration path is unavailable; HOME or XDG_CONFIG_HOME is required")
+			return "", errors.New("global configuration path is unavailable; HOME is required")
 		}
 		return globalPath, nil
 	}

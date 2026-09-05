@@ -346,3 +346,26 @@ func TestWritePlanRejectsPathTraversalAndWritesAtomically(t *testing.T) {
 		t.Fatalf("traversal: %v", err)
 	}
 }
+
+func TestWorktreeIgnoresUntrackedCompilerCacheButKeepsTrackedOne(t *testing.T) {
+	root := testRepo(t)
+	cache := filepath.Join(root, "tsconfig.tsbuildinfo")
+	if err := os.WriteFile(cache, []byte("generated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := NewWorktree(root).Paths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsString(paths, "tsconfig.tsbuildinfo") {
+		t.Fatalf("untracked compiler cache was observed: %#v", paths)
+	}
+	cmd := exec.Command("git", "-C", root, "add", "tsconfig.tsbuildinfo")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, output)
+	}
+	paths, err = NewWorktree(root).Paths()
+	if err != nil || !containsString(paths, "tsconfig.tsbuildinfo") {
+		t.Fatalf("tracked compiler cache must remain observable: paths=%#v err=%v", paths, err)
+	}
+}

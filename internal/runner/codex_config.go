@@ -108,7 +108,7 @@ func isSafeCodexKey(key string) bool {
 
 func safeProviderField(value string) bool {
 	switch value {
-	case "name", "base_url", "wire_api", "env_key", "env_http_headers", "query_params", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms", "supports_standalone_web_search", "requires_openai_auth":
+	case "name", "base_url", "wire_api", "env_key", "env_http_headers", "query_params", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms", "supports_standalone_web_search", "requires_openai_auth", "supports_websockets":
 		return true
 	default:
 		return false
@@ -137,6 +137,16 @@ func codexRoutingKey(providerID, key string) (string, error) {
 func validateCodexField(key string, value any) error {
 	leaf := key[strings.LastIndex(key, ".")+1:]
 	switch leaf {
+	case "supports_standalone_web_search", "requires_openai_auth", "supports_websockets":
+		if _, ok := value.(bool); !ok {
+			return errors.New("field must be a boolean")
+		}
+	case "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms":
+		switch value.(type) {
+		case int, int64, float64, json.Number:
+		default:
+			return errors.New("field must be numeric")
+		}
 	case "env_key":
 		name, ok := value.(string)
 		if !ok || !codexEnvName.MatchString(name) {

@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on macOS
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Race test
+        run: go test -race -count=1 ./...
+
+  release-snapshot:
+    name: Validate release snapshot
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_OWNER: ${{ github.repository_owner }}
+      HOMEBREW_TAP_REPOSITORY: homebrew-tap
+      ROLEMUX_REPOSITORY_NAME: ${{ github.event.repository.name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: v2.18.0
+          install-only: true
+
+      - name: Validate GoReleaser configuration
+        run: goreleaser check
+
+      - name: Lint GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+
+      - name: Build snapshot
+        run: goreleaser release --snapshot --clean --skip=publish
+
+      - name: Verify snapshot artifacts
+        run: |
+          cd dist
+          sha256sum --check checksums.txt
+          test -f homebrew/Casks/rolemux.rb

@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/goreleaser/goreleaser/v2.18.0/www/static/schema.json
+version: 2
+
+project_name: rolemux
+
+builds:
+  - id: rolemux
+    main: ./cmd/rolemux
+    binary: rolemux
+    env:
+      - CGO_ENABLED=0
+    targets:
+      - darwin_amd64_v1
+      - darwin_arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: rolemux
+    ids:
+      - rolemux
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - id: archives
+    artifacts: archive
+
+changelog:
+  use: github-native
+
+release:
+  draft: false
+  prerelease: auto
+  make_latest: true
+
+homebrew_casks:
+  - name: rolemux
+    ids:
+      - rolemux
+    binaries:
+      - rolemux
+    repository:
+      owner: "{{ .Env.HOMEBREW_TAP_OWNER }}"
+      name: "{{ .Env.HOMEBREW_TAP_REPOSITORY }}"
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/{{ .Env.HOMEBREW_TAP_OWNER }}/{{ .Env.ROLEMUX_REPOSITORY_NAME }}"
+    description: Use the right AI model for planning, implementation, and review
+    license: Apache-2.0
+    skip_upload: auto
+    caveats: Run `rolemux install --global --hosts all` and `rolemux doctor --json` after installation.

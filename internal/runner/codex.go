@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/basant-kumar/rolemux/internal/task"
 )
@@ -17,6 +18,12 @@ type Codex struct {
 	Process            ProcessFunc
 	InteractiveProcess InteractiveProcessFunc
 	Env                []string
+	// PXPipePath is discovered once for the adapter, then checked again at
+	// launch time so installing/removing the optional helper between turns is
+	// safe. TaskLauncher is an injectable lifecycle boundary for tests.
+	PXPipePath   string
+	TaskLauncher CodexTaskLauncher
+	AuthProbe    CodexAuthProbe
 	// ModelPages is a deterministic seam for discovery tests. Production uses
 	// the app-server model/list protocol when it is nil.
 	ModelPages func(context.Context, task.RuntimeSnapshot) ([]ModelInfo, string, string, error)
@@ -33,7 +40,8 @@ func NewCodex(path string) (*Codex, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Codex{Path: resolved, Process: RunProcess, InteractiveProcess: RunInteractiveProcess, Env: SanitizedEnv(os.Environ())}, nil
+	env := SanitizedEnv(os.Environ())
+	return &Codex{Path: resolved, Process: RunProcess, InteractiveProcess: RunInteractiveProcess, Env: env, PXPipePath: DetectPXPipePath(env)}, nil
 }
 
 func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Response, error) {
@@ -53,6 +61,9 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 	if req.Resume && req.SessionID == "" {
 		return Response{}, providerError("CODEX_SESSION", "resume requires a session ID", false, false, "", ErrMissingSession)
 	}
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
 	_, schemaName, err := createSchemaFile(NativeSchema(req.Role))
 	if err != nil {
 		return Response{}, providerError("CODEX_SCHEMA", "cannot create output schema", false, false, "", err)
@@ -66,8 +77,39 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 	if envErr != nil {
 		return Response{}, providerError("CODEX_AUTH", envErr.Error(), false, false, "", envErr)
 	}
-	result, processErr := c.Process(ctx, ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes})
-	threadID, text, reportedModel, reportedEffort, parseErr := parseCodexOutput(result.Stdout, req.Role, callbacks)
+	var callbackMu sync.Mutex
+	persistedSession := ""
+	notifySession := func(id string) error {
+		callbackMu.Lock()
+		defer callbackMu.Unlock()
+		if id == "" || id == persistedSession {
+			return nil
+		}
+		if persistedSession != "" && persistedSession != id {
+			return errors.New("codex emitted conflicting thread IDs")
+		}
+		if callbacks.SessionStarted != nil {
+			if err := callbacks.SessionStarted(id); err != nil {
+				return err
+			}
+		}
+		persistedSession = id
+		return nil
+	}
+	providerSpec := ProcessSpec{
+		Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes,
+		StdoutLine: func(line []byte) error {
+			id, err := codexSessionFromLine(line)
+			if err != nil || id == "" {
+				return err
+			}
+			return notifySession(id)
+		},
+	}
+	result, processErr := c.runCodexTask(ctx, req, providerSpec, callbacks, schemaName)
+	parseCallbacks := callbacks
+	parseCallbacks.SessionStarted = notifySession
+	threadID, text, reportedModel, reportedEffort, parseErr := parseCodexOutput(result.Stdout, req.Role, parseCallbacks)
 	usage := usageFromJSONLines(result.Stdout, true)
 	response := Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort, Usage: usage}
 	known := threadID != ""
@@ -91,11 +133,8 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 	if strings.TrimSpace(text) == "" {
 		return response, providerError("CODEX_NO_ENVELOPE", "codex produced no structured response", known, known, threadID, ErrInvalidEnvelope)
 	}
-	if reportedModel != "" && reportedModel != req.Model {
-		return response, providerError("CODEX_MODEL_MISMATCH", "codex reported a different model than requested", false, known, threadID, nil)
-	}
-	if req.Effort != "" && reportedEffort != "" && reportedEffort != req.Effort {
-		return response, providerError("CODEX_EFFORT_MISMATCH", "codex reported a different reasoning effort than requested", false, known, threadID, nil)
+	if selectionErr := VerifyReportedSelection("codex", req, response); selectionErr != nil {
+		return response, selectionErr
 	}
 	envelope, err := DecodeEnvelope([]byte(text), req.Role)
 	if err != nil {
@@ -103,6 +142,155 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 	}
 	response.Envelope, response.Raw = &envelope, result.Stdout
 	return response, nil
+}
+
+func codexSessionFromLine(line []byte) (string, error) {
+	if len(strings.TrimSpace(string(line))) == 0 {
+		return "", nil
+	}
+	var event struct {
+		Type          string `json:"type"`
+		ThreadID      string `json:"thread_id"`
+		ThreadIDCamel string `json:"threadId"`
+	}
+	if err := json.Unmarshal(line, &event); err != nil {
+		return "", nil // the full parser reports malformed provider output
+	}
+	if event.Type != "thread.started" {
+		return "", nil
+	}
+	if event.ThreadID != "" {
+		return strings.TrimSpace(event.ThreadID), nil
+	}
+	return strings.TrimSpace(event.ThreadIDCamel), nil
+}
+
+func (c *Codex) runCodexTask(ctx context.Context, req Request, providerSpec ProcessSpec, callbacks Callbacks, schemaPath string) (ProcessResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ProcessResult{}, err
+	}
+	launcher := c.codexTaskLauncher(providerSpec.Env)
+	if launcher == nil {
+		if callbacks.Diagnostic != nil && !req.Resume {
+			callbacks.Diagnostic(missingPXPipeDiagnostic("Codex"))
+		}
+		return c.Process(ctx, providerSpec)
+	}
+	evidence, probeErr := c.codexAuthProbe(ctx, providerSpec.Path, providerSpec.Env)
+	if err := ctx.Err(); err != nil {
+		return ProcessResult{}, err
+	}
+	if probeErr != nil || evidence.Mode != CodexAuthChatGPT {
+		reason := evidence.Reason
+		if reason == "" {
+			reason = codexLaunchReason(evidence, false)
+		}
+		callbacks.Diagnostic = notifyDiagnostic(callbacks.Diagnostic, "pxpipe: "+reason+"; running Codex directly")
+		return c.Process(ctx, providerSpec)
+	}
+	if !CodexChatGPTRouteSupported(req.Runtime, providerSpec.Env) {
+		reason := codexLaunchReason(evidence, false)
+		if reason == "" {
+			reason = "Codex route is not the supported ChatGPT route"
+		}
+		callbacks.Diagnostic = notifyDiagnostic(callbacks.Diagnostic, "pxpipe: "+reason+"; running Codex directly")
+		return c.Process(ctx, providerSpec)
+	}
+	overlayRequest := req
+	overlayRequest.Runtime = CodexChatGPTRuntimeOverlay(req.Runtime)
+	overlayArgs, err := BuildCodexArgs(overlayRequest, schemaPath)
+	if err != nil {
+		callbacks.Diagnostic = notifyDiagnostic(callbacks.Diagnostic, "pxpipe: transport overlay unavailable; running Codex directly")
+		return c.Process(ctx, providerSpec)
+	}
+	wrappedSpec := providerSpec
+	wrappedSpec.Args = overlayArgs
+	launchSpec := PXPipeLaunchSpec{
+		PXPipePath:   c.pxpipePath(providerSpec.Env),
+		Provider:     wrappedSpec,
+		ProviderName: "Codex",
+		ServerEnv:    PXPipeServerEnvironment(providerSpec.Env),
+		EventsFile:   pxpipeEventsFile(providerSpec.Env),
+		RoutePrefix:  pxpipeRoutePattern,
+		Diagnostic:   callbacks.Diagnostic,
+	}
+	result, launchErr := launcher.Launch(ctx, launchSpec)
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	var helperErr *PXPipeLaunchError
+	if errors.As(launchErr, &helperErr) && helperErr.BeforeTask {
+		callbacks.Diagnostic = notifyDiagnostic(callbacks.Diagnostic, "pxpipe: private helper launch failed before a durable Codex thread ("+boundedDiagnostic(helperErr.Error())+"); running Codex directly")
+		return c.Process(ctx, providerSpec)
+	}
+	return result, launchErr
+}
+
+func boundedDiagnostic(message string) string {
+	message = strings.Join(strings.Fields(message), " ")
+	if message == "" {
+		return "unknown error"
+	}
+	// pxpipe prints route/CA setup before the actionable child-process error,
+	// so retain both ends instead of truncating away the cause.
+	const head, tail = 120, 600
+	if len(message) > head+tail {
+		return message[:head] + "... " + message[len(message)-tail:]
+	}
+	return message
+}
+
+func notifyDiagnostic(callback func(string), message string) func(string) {
+	if callback != nil {
+		callback(message)
+	}
+	return callback
+}
+
+func (c *Codex) codexTaskLauncher(env []string) CodexTaskLauncher {
+	if c == nil {
+		return nil
+	}
+	if c.TaskLauncher != nil {
+		if launcher, ok := c.TaskLauncher.(*PXPipeTaskLauncher); ok {
+			if launcher.Path == "" {
+				copy := *launcher
+				copy.Path = c.pxpipePath(env)
+				if copy.Path == "" && copy.ServerFactory == nil {
+					return nil
+				}
+				if copy.ServerFactory == nil && !executableFile(copy.Path) {
+					return nil
+				}
+				return &copy
+			}
+			if launcher.ServerFactory == nil && !executableFile(launcher.Path) {
+				return nil
+			}
+		}
+		return c.TaskLauncher
+	}
+	path := c.pxpipePath(env)
+	if path == "" || !executableFile(path) {
+		return nil
+	}
+	return &PXPipeTaskLauncher{Path: path, Process: c.Process}
+}
+
+func (c *Codex) pxpipePath(env []string) string {
+	if c != nil && strings.TrimSpace(c.PXPipePath) != "" {
+		if executableFile(c.PXPipePath) {
+			return c.PXPipePath
+		}
+	}
+	return DetectPXPipePath(env)
+}
+
+func (c *Codex) codexAuthProbe(ctx context.Context, path string, env []string) (CodexAuthEvidence, error) {
+	if c != nil && c.AuthProbe != nil {
+		return c.AuthProbe(ctx, path, append([]string(nil), env...))
+	}
+	return c.codexAuthEvidence(ctx, path, env)
 }
 
 func (c *Codex) childEnv(req Request) []string {
@@ -273,21 +461,19 @@ func (c *Codex) Auth(ctx context.Context) (AuthStatus, error) {
 		return AuthStatus{}, err
 	}
 	result, statusErr := c.Process(ctx, ProcessSpec{Path: c.Path, Args: []string{"login", "status"}, Env: c.Env, MaxOutputBytes: 256 << 10})
-	message := strings.TrimSpace(string(result.Stdout))
-	if message == "" {
-		message = strings.TrimSpace(string(result.Stderr))
-	}
-	lower := strings.ToLower(message)
-	if strings.Contains(lower, "not logged in") || strings.Contains(lower, "not authenticated") {
-		return AuthStatus{Version: version, Authenticated: false, Message: "run codex login"}, nil
+	status := append(append([]byte(nil), result.Stdout...), '\n')
+	status = append(status, result.Stderr...)
+	authenticated, message, parseErr := ParseCodexLoginStatus(status)
+	if parseErr == nil {
+		if authenticated && statusErr != nil {
+			return AuthStatus{Version: version, Message: "Codex authentication status is unavailable"}, providerError("CODEX_AUTH", "Codex authentication status is unavailable", false, false, "", statusErr)
+		}
+		return AuthStatus{Version: version, Authenticated: authenticated, Message: message}, nil
 	}
 	if statusErr != nil {
 		return AuthStatus{Version: version, Authenticated: false, Message: "run codex login"}, providerError("CODEX_AUTH", "Codex authentication status is unavailable", false, false, "", statusErr)
 	}
-	if !strings.Contains(lower, "logged in") {
-		return AuthStatus{Version: version, Authenticated: false, Message: "unrecognized codex login status"}, providerError("CODEX_AUTH", "Codex returned an unrecognized login status", false, false, "", nil)
-	}
-	return AuthStatus{Version: version, Authenticated: true}, nil
+	return AuthStatus{Version: version, Authenticated: false, Message: "unrecognized codex login status"}, providerError("CODEX_AUTH", "Codex returned an unrecognized login status", false, false, "", parseErr)
 }
 
 func (c *Codex) Login(ctx context.Context, req LoginRequest) error {

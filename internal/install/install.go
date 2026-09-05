@@ -25,9 +25,10 @@ type Result struct {
 }
 
 var destinations = map[string][]string{
-	"claude":  {".claude", "skills", "rolemux", "SKILL.md"},
-	"codex":   {".codex", "skills", "rolemux", "SKILL.md"},
-	"copilot": {".copilot", "skills", "rolemux", "SKILL.md"},
+	"claude":      {".claude", "skills", "rolemux", "SKILL.md"},
+	"codex":       {".agents", "skills", "rolemux", "SKILL.md"},
+	"copilot":     {".copilot", "skills", "rolemux", "SKILL.md"},
+	"antigravity": {".gemini", "antigravity-cli", "skills", "rolemux", "SKILL.md"},
 }
 
 func Content() []byte { return append([]byte(nil), skill...) }
@@ -35,7 +36,12 @@ func Content() []byte { return append([]byte(nil), skill...) }
 func ParseHosts(raw string) ([]string, error) {
 	raw = strings.TrimSpace(strings.ToLower(raw))
 	if raw == "all" {
-		return []string{"claude", "codex", "copilot"}, nil
+		hosts := make([]string, 0, len(destinations))
+		for host := range destinations {
+			hosts = append(hosts, host)
+		}
+		sort.Strings(hosts)
+		return hosts, nil
 	}
 	seen := map[string]bool{}
 	for _, item := range strings.Split(raw, ",") {

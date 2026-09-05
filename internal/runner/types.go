@@ -34,10 +34,14 @@ type Request struct {
 	Speed     string
 	RepoRoot  string
 	Scope     string
-	SessionID string
-	Resume    bool
-	Sandbox   string
-	Runtime   task.RuntimeSnapshot
+	// SkillDirectories are provider-native roots selected by RoleMux. Adapters
+	// that expose an explicit skill-loading API may use them; others rely on
+	// their native discovery while receiving the same bounded metadata note.
+	SkillDirectories []string
+	SessionID        string
+	Resume           bool
+	Sandbox          string
+	Runtime          task.RuntimeSnapshot
 
 	// MaxOutputBytes is a hard process-output bound. Zero uses a safe default.
 	MaxOutputBytes int64
@@ -57,6 +61,9 @@ type Callbacks struct {
 	// its durable session/thread event.
 	SessionStarted func(string) error
 	Event          func(Event) error
+	// Diagnostic receives concise, non-secret launch diagnostics. Adapters do
+	// not persist these messages and callers may leave it nil.
+	Diagnostic func(string)
 }
 
 type Event struct {
@@ -75,6 +82,9 @@ type Response struct {
 	Envelope       *Envelope       `json:"envelope,omitempty"`
 	Raw            json.RawMessage `json:"raw,omitempty"`
 	Usage          task.TokenUsage `json:"usage,omitempty"`
+	// UsageCumulative means token counters cover the whole resumed provider
+	// conversation rather than only this invocation.
+	UsageCumulative bool `json:"usage_cumulative,omitempty"`
 }
 
 // UsageFromMap normalizes snake_case and camelCase usage payloads. For OpenAI
@@ -206,11 +216,90 @@ type Authenticator interface {
 	Login(context.Context, LoginRequest) error
 }
 
+// LocalAuthHinter lets an adapter report credential presence without starting
+// the provider. Configure may use this to stay responsive; doctor and task
+// execution still use the adapter's authoritative live checks.
+type LocalAuthHinter interface {
+	LocalAuthHint() AuthStatus
+}
+
+// RoleSupporter lets an adapter fail before model selection when it cannot
+// safely perform a role. Adapters that omit it are assumed to support all
+// roles.
+type RoleSupporter interface {
+	SupportsRole(Role) error
+}
+
 type Adapter interface {
 	Run(context.Context, Request, Callbacks) (Response, error)
 	ListModels(context.Context, ModelListRequest) (ModelPage, error)
 	Version(context.Context) (string, error)
 	Auth(context.Context) (AuthStatus, error)
+}
+
+// ValidateSelection checks a provider-advertised model/effort/speed tuple.
+// Empty effort and standard speed are valid defaults; every non-default value
+// must be explicitly advertised by the selected model.
+func ValidateSelection(role Role, model, effort, speed string, models []ModelInfo, adapter Adapter) error {
+	if supporter, ok := adapter.(RoleSupporter); ok {
+		if err := supporter.SupportsRole(role); err != nil {
+			return err
+		}
+	}
+	var selected *ModelInfo
+	for i := range models {
+		if models[i].ID == model {
+			selected = &models[i]
+		} else {
+			for _, alias := range models[i].Aliases {
+				if alias == model {
+					selected = &models[i]
+					break
+				}
+			}
+		}
+		if selected != nil {
+			break
+		}
+	}
+	if selected == nil {
+		return providerError("MODEL_UNAVAILABLE", fmt.Sprintf("model %q is not in the provider catalog", model), false, false, "", nil)
+	}
+	if selected.Availability == "unavailable" {
+		return providerError("MODEL_UNAVAILABLE", fmt.Sprintf("model %q is unavailable", model), false, false, "", nil)
+	}
+	if effort != "" && !modelOptionContains(selected.EffortOptions, selected.Efforts, effort) {
+		return fmt.Errorf("model %q does not advertise effort %q", model, effort)
+	}
+	if speed != "" && speed != "standard" && !modelOptionContains(selected.SpeedOptions, nil, speed) {
+		return fmt.Errorf("model %q does not advertise speed %q", model, speed)
+	}
+	return nil
+}
+
+func modelOptionContains(options []ModelOption, legacy []string, want string) bool {
+	for _, option := range options {
+		if option.ID == want {
+			return true
+		}
+	}
+	for _, value := range legacy {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func VerifyReportedSelection(provider string, req Request, response Response) error {
+	known := response.SessionID != ""
+	if response.ReportedModel != "" && response.ReportedModel != req.Model {
+		return providerError(strings.ToUpper(provider)+"_MODEL_MISMATCH", provider+" reported a different model than requested", false, known, response.SessionID, nil)
+	}
+	if req.Effort != "" && response.ReportedEffort != "" && response.ReportedEffort != req.Effort {
+		return providerError(strings.ToUpper(provider)+"_EFFORT_MISMATCH", provider+" reported a different reasoning effort than requested", false, known, response.SessionID, nil)
+	}
+	return nil
 }
 
 var (
@@ -251,7 +340,7 @@ func providerError(code, message string, retryable, known bool, session string, 
 }
 
 func providerProcessError(provider string, cause error, known bool, session string) error {
-	label := map[string]string{"codex": "Codex", "claude": "Claude", "copilot": "Copilot"}[strings.ToLower(provider)]
+	label := map[string]string{"codex": "Codex", "claude": "Claude", "copilot": "Copilot", "antigravity": "Antigravity"}[strings.ToLower(provider)]
 	if label == "" {
 		label = "Provider"
 	}

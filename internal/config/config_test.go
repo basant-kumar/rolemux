@@ -8,10 +8,25 @@ import (
 	"testing"
 )
 
+func TestConfigPathsUseRoleMuxHomeDirectory(t *testing.T) {
+	home := t.TempDir()
+	root := t.TempDir()
+	global, project := ConfigPaths(root, []string{
+		"HOME=" + home,
+		"XDG_CONFIG_HOME=" + filepath.Join(t.TempDir(), "xdg"),
+	})
+	if want := filepath.Join(home, ".rolemux", "config.toml"); global != want {
+		t.Fatalf("global config path = %q, want %q", global, want)
+	}
+	if want := filepath.Join(root, ".rolemux.toml"); project != want {
+		t.Fatalf("project config path = %q, want %q", project, want)
+	}
+}
+
 func TestLoadLayersAndSharedReviewerExpansion(t *testing.T) {
 	root := t.TempDir()
 	globalHome := t.TempDir()
-	global := filepath.Join(globalHome, ".config", "rolemux", "config.toml")
+	global := filepath.Join(globalHome, ".rolemux", "config.toml")
 	if err := os.MkdirAll(filepath.Dir(global), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -37,9 +52,29 @@ func TestLoadLayersAndSharedReviewerExpansion(t *testing.T) {
 	}
 }
 
+func TestProviderTurnTimeoutDefaultsAndValidates(t *testing.T) {
+	if got := Default().ProviderTurnTimeoutSeconds; got != 900 {
+		t.Fatalf("default provider timeout = %d", got)
+	}
+	for _, seconds := range []int{29, 7201} {
+		cfg := Default()
+		cfg.ProviderTurnTimeoutSeconds = seconds
+		if err := Validate(cfg); err == nil {
+			t.Fatalf("timeout %d was accepted", seconds)
+		}
+	}
+	for _, seconds := range []int{0, 30, 900, 7200} {
+		cfg := Default()
+		cfg.ProviderTurnTimeoutSeconds = seconds
+		if err := Validate(cfg); err != nil {
+			t.Fatalf("timeout %d rejected: %v", seconds, err)
+		}
+	}
+}
+
 func TestExplicitConfigReplacesGlobalAndProject(t *testing.T) {
 	root, home, explicit := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "explicit.toml")
-	global := filepath.Join(home, ".config", "rolemux", "config.toml")
+	global := filepath.Join(home, ".rolemux", "config.toml")
 	if err := os.MkdirAll(filepath.Dir(global), 0o700); err != nil {
 		t.Fatal(err)
 	}

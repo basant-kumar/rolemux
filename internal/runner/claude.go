@@ -6,15 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/basant-kumar/rolemux/internal/task"
 	"github.com/google/uuid"
 )
 
-var claudeReadTools = []string{"Read", "Glob", "Grep", "WebSearch", "WebFetch"}
+var claudeReadTools = []string{"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"}
+
+const (
+	claudeAPIHost    = "api.anthropic.com"
+	claudeAPIBaseURL = "https://" + claudeAPIHost
+)
 
 type Claude struct {
 	Path               string
@@ -22,6 +29,8 @@ type Claude struct {
 	InteractiveProcess InteractiveProcessFunc
 	Env                []string
 	Custom             []ModelInfo
+	PXPipePath         string
+	TaskLauncher       PXPipeLauncher
 }
 
 func NewClaude(path string) (*Claude, error) {
@@ -35,7 +44,8 @@ func NewClaude(path string) (*Claude, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Claude{Path: resolved, Process: RunProcess, InteractiveProcess: RunInteractiveProcess, Env: SanitizedEnv(os.Environ())}, nil
+	env := SanitizedEnv(os.Environ())
+	return &Claude{Path: resolved, Process: RunProcess, InteractiveProcess: RunInteractiveProcess, Env: env, PXPipePath: DetectPXPipePath(env)}, nil
 }
 
 func (c *Claude) Run(ctx context.Context, req Request, callbacks Callbacks) (Response, error) {
@@ -70,11 +80,15 @@ func (c *Claude) Run(ctx context.Context, req Request, callbacks Callbacks) (Res
 	if envErr != nil {
 		return Response{}, providerError("CLAUDE_AUTH", envErr.Error(), false, false, req.SessionID, envErr)
 	}
-	result, processErr := c.Process(ctx, ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes})
+	spec := ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes}
+	result, processErr := c.runClaudeTask(ctx, req, spec, callbacks)
 	outerID, nested, model, effort, parseErr := parseClaudeResult(result.Stdout, req.SessionID, req.Role)
 	usage := usageFromJSONDocument(result.Stdout, false)
 	response := Response{SessionID: outerID, Text: string(nested), ReportedModel: model, ReportedEffort: effort, Usage: usage}
-	known := req.Resume || outerID != ""
+	// A fresh Claude session ID is assigned and persisted before launch. Once
+	// the OS accepts the task process, an error must retry that exact ID rather
+	// than risk replaying the turn in a new conversation.
+	known := req.Resume || outerID != "" || result.ProcessStarted
 	if processErr != nil {
 		return response, providerProcessError("claude", processErr, known, outerIDOr(outerID, req.SessionID))
 	}
@@ -84,8 +98,130 @@ func (c *Claude) Run(ctx context.Context, req Request, callbacks Callbacks) (Res
 	if outerID == "" || outerID != req.SessionID {
 		return response, providerError("CLAUDE_SESSION_MISMATCH", "claude result session_id did not match requested session", false, known, outerID, nil)
 	}
+	if selectionErr := VerifyReportedSelection("claude", req, response); selectionErr != nil {
+		return response, selectionErr
+	}
 	response.Raw, response.Envelope = result.Stdout, envelopePtr(nested, req.Role)
 	return response, nil
+}
+
+func (c *Claude) runClaudeTask(ctx context.Context, req Request, providerSpec ProcessSpec, callbacks Callbacks) (ProcessResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ProcessResult{}, err
+	}
+	launcher := c.claudeTaskLauncher(providerSpec.Env)
+	if launcher == nil {
+		if callbacks.Diagnostic != nil && !req.Resume {
+			callbacks.Diagnostic(missingPXPipeDiagnostic("Claude"))
+		}
+		return c.Process(ctx, providerSpec)
+	}
+	if !ClaudeFirstPartyRouteSupported(req.Runtime, providerSpec.Env) {
+		callbacks.Diagnostic = notifyDiagnostic(callbacks.Diagnostic, "pxpipe: Claude route is not the supported first-party Anthropic route; running Claude directly")
+		return c.Process(ctx, providerSpec)
+	}
+	launchSpec := PXPipeLaunchSpec{
+		PXPipePath:         c.pxpipePath(providerSpec.Env),
+		Provider:           providerSpec,
+		ProviderName:       "Claude",
+		ServerEnv:          ClaudePXPipeServerEnvironment(providerSpec.Env),
+		EventsFile:         pxpipeEventsFile(providerSpec.Env),
+		RoutePrefix:        pxpipeClaudeRoutePattern,
+		TaskStartsOnLaunch: true,
+		Diagnostic:         callbacks.Diagnostic,
+	}
+	result, launchErr := launcher.Launch(ctx, launchSpec)
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	var helperErr *PXPipeLaunchError
+	if errors.As(launchErr, &helperErr) && helperErr.BeforeTask {
+		callbacks.Diagnostic = notifyDiagnostic(callbacks.Diagnostic, "pxpipe: private helper launch failed before Claude started ("+boundedDiagnostic(helperErr.Error())+"); running Claude directly")
+		return c.Process(ctx, providerSpec)
+	}
+	return result, launchErr
+}
+
+func (c *Claude) claudeTaskLauncher(env []string) PXPipeLauncher {
+	if c == nil {
+		return nil
+	}
+	if c.TaskLauncher != nil {
+		if launcher, ok := c.TaskLauncher.(*PXPipeTaskLauncher); ok {
+			if launcher.Path == "" {
+				copy := *launcher
+				copy.Path = c.pxpipePath(env)
+				if copy.Path == "" && copy.ServerFactory == nil {
+					return nil
+				}
+				if copy.ServerFactory == nil && !executableFile(copy.Path) {
+					return nil
+				}
+				return &copy
+			}
+			if launcher.ServerFactory == nil && !executableFile(launcher.Path) {
+				return nil
+			}
+		}
+		return c.TaskLauncher
+	}
+	path := c.pxpipePath(env)
+	if path == "" || !executableFile(path) {
+		return nil
+	}
+	return &PXPipeTaskLauncher{Path: path, Process: c.Process}
+}
+
+func (c *Claude) pxpipePath(env []string) string {
+	if c != nil && strings.TrimSpace(c.PXPipePath) != "" && executableFile(c.PXPipePath) {
+		return c.PXPipePath
+	}
+	return DetectPXPipePath(env)
+}
+
+// ClaudeFirstPartyRouteSupported prevents pxpipe from silently replacing a
+// configured gateway, Bedrock, Vertex, or Foundry transport.
+func ClaudeFirstPartyRouteSupported(runtime task.RuntimeSnapshot, environ []string) bool {
+	if runtime.ProviderType != "" && !strings.EqualFold(runtime.ProviderType, "claude") {
+		return false
+	}
+	if runtime.Endpoint != "" && !equivalentAnthropicRoute(runtime.Endpoint) {
+		return false
+	}
+	if runtime.ProviderID != "" || runtime.WireAPI != "" || len(runtime.Auth) > 0 {
+		return false
+	}
+	for target := range stringMapSetting(runtime.SDKSettings, "env_map") {
+		switch strings.ToUpper(target) {
+		case "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "CLOUD_ML_PROJECT_ID", "CLOUD_ML_REGION", "FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY":
+			return false
+		}
+	}
+	for _, key := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"} {
+		value, set, conflict := environmentRouteValue(environ, key)
+		if conflict || set && value != "" && !equivalentAnthropicRoute(value) {
+			return false
+		}
+	}
+	for _, key := range []string{"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"} {
+		if enabledEnvironmentFlag(environ, key) {
+			return false
+		}
+	}
+	return true
+}
+
+func equivalentAnthropicRoute(value string) bool {
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || u.Scheme != "https" || !strings.EqualFold(u.Hostname(), claudeAPIHost) || u.Port() != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	return strings.TrimRight(u.EscapedPath(), "/") == ""
+}
+
+func enabledEnvironmentFlag(environ []string, wanted string) bool {
+	value := strings.ToLower(strings.TrimSpace(environmentValue(environ, wanted)))
+	return value != "" && value != "0" && value != "false" && value != "no" && value != "off"
 }
 
 func envelopePtr(nested []byte, role Role) *Envelope {
@@ -111,7 +247,7 @@ func BuildClaudeArgs(req Request) ([]string, error) {
 		tools = append(tools, "Edit", "Write")
 	}
 	toolList := strings.Join(tools, ",")
-	args := []string{"--print", "--output-format", "json", "--input-format", "text", "--safe-mode", "--restricted", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--tools", toolList, "--allowed-tools", toolList, "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`}
+	args := []string{"--print", "--output-format", "json", "--input-format", "text", "--restricted", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--tools", toolList, "--allowed-tools", toolList, "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`}
 	if req.Speed == "fast" {
 		args = append(args, "--settings", `{"fastMode":true}`)
 	} else if req.Speed == "standard" {

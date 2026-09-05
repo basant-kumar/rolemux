@@ -14,17 +14,18 @@ import (
 // intentionally small: natural-language prose cannot substitute for status or
 // verdict, and strict decoding rejects additions that could be misinterpreted.
 type Envelope struct {
-	Role     string         `json:"role"`
-	Status   string         `json:"status,omitempty"`
-	Verdict  string         `json:"verdict,omitempty"`
-	Plan     string         `json:"plan,omitempty"`
-	Question string         `json:"question,omitempty"`
-	Findings []task.Finding `json:"findings,omitempty"`
+	Role      string          `json:"role"`
+	Status    string          `json:"status,omitempty"`
+	Verdict   string          `json:"verdict,omitempty"`
+	Plan      string          `json:"plan,omitempty"`
+	Question  string          `json:"question,omitempty"`
+	WorkUnits []task.WorkUnit `json:"work_units,omitempty"`
+	Findings  []task.Finding  `json:"findings,omitempty"`
 }
 
 func DecodeEnvelope(data []byte, expected Role) (Envelope, error) {
 	data = bytes.TrimSpace(data)
-	if len(data) == 0 || bytes.Contains(data, []byte("```")) {
+	if len(data) == 0 || bytes.HasPrefix(data, []byte("```")) {
 		return Envelope{}, fmt.Errorf("%w: empty/prose/fenced response", ErrInvalidEnvelope)
 	}
 	var env Envelope
@@ -48,7 +49,7 @@ func DecodeEnvelope(data []byte, expected Role) (Envelope, error) {
 
 func ValidateEnvelope(env Envelope, expected Role) error {
 	if strings.TrimSpace(env.Role) == "" || env.Role != string(expected) {
-		return fmt.Errorf("%w: expected role %q", ErrInvalidEnvelope, expected)
+		return fmt.Errorf("%w: expected role %q, got %q", ErrInvalidEnvelope, expected, env.Role)
 	}
 	switch expected {
 	case RolePlanner, RoleImplementer:
@@ -66,6 +67,11 @@ func ValidateEnvelope(env Envelope, expected Role) error {
 		}
 		if env.Status == "needs_input" && strings.TrimSpace(env.Question) == "" {
 			return fmt.Errorf("%w: question is empty", ErrInvalidEnvelope)
+		}
+		if expected == RolePlanner && env.Status == "ready" && len(env.WorkUnits) > 0 {
+			if _, err := task.NormalizeWorkUnits(env.WorkUnits, env.Plan); err != nil {
+				return fmt.Errorf("%w: %v", ErrInvalidEnvelope, err)
+			}
 		}
 	case RolePlanReviewer, RoleCodeReviewer:
 		if env.Status != "" || env.Plan != "" || env.Question != "" {
@@ -101,13 +107,18 @@ func ValidateEnvelope(env Envelope, expected Role) error {
 // schema is deliberately generated locally and contains no provider data.
 func NativeSchema(role Role) string {
 	var required []string
-	properties := `"role":{"type":"string"}`
+	roleValue, _ := json.Marshal(string(role))
+	properties := fmt.Sprintf(`"role":{"type":"string","enum":[%s]}`, roleValue)
 	if role == RolePlanner || role == RoleImplementer {
 		// Strict structured-output APIs require every declared property to be
 		// listed in required. Unused plan/question values are empty strings and
 		// semantic validation below still enforces the role/status combination.
 		required = []string{"role", "status", "plan", "question"}
 		properties += `,"status":{"type":"string","enum":["ready","needs_input"]},"plan":{"type":"string"},"question":{"type":"string"}`
+		if role == RolePlanner {
+			required = append(required, "work_units")
+			properties += `,"work_units":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","objective","scope","depends_on","execution_packet","acceptance_criteria","validation_commands"],"properties":{"id":{"type":"string"},"objective":{"type":"string"},"scope":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"execution_packet":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"validation_commands":{"type":"array","items":{"type":"string"}}}}}`
+		}
 	} else {
 		required = []string{"role", "verdict", "findings"}
 		properties += `,"verdict":{"type":"string","enum":["approved","changes_requested"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","path","line","message"],"properties":{"severity":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"message":{"type":"string"}}}}`

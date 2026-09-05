@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -58,7 +59,7 @@ func (f *scriptedAdapter) Run(_ context.Context, req runner.Request, callbacks r
 }
 
 func (f *scriptedAdapter) ListModels(context.Context, runner.ModelListRequest) (runner.ModelPage, error) {
-	return runner.ModelPage{}, nil
+	return workflowTestModels(), nil
 }
 func (f *scriptedAdapter) Version(context.Context) (string, error) { return "test", nil }
 func (f *scriptedAdapter) Auth(context.Context) (runner.AuthStatus, error) {
@@ -94,10 +95,124 @@ func workflowConfig() config.Config {
 	return cfg
 }
 
+func workflowTestModels() runner.ModelPage {
+	models := []runner.ModelInfo{}
+	for _, id := range []string{"planner-model", "implementer-model", "reviewer-model"} {
+		models = append(models, runner.ModelInfo{
+			ID: id, Availability: "available",
+			Efforts:       []string{"max", "xhigh"},
+			EffortOptions: []runner.ModelOption{{ID: "max"}, {ID: "xhigh"}},
+			SpeedOptions:  []runner.ModelOption{{ID: "priority"}},
+		})
+	}
+	return runner.ModelPage{Models: models}
+}
+
 func TestRuntimeSnapshotUsesCopilotGateway(t *testing.T) {
 	snapshot := RuntimeSnapshot("copilot", config.Provider{GatewayURL: "https://gateway.example.invalid", BearerTokenEnv: "COPILOT_TOKEN"})
 	if snapshot.Endpoint != "https://gateway.example.invalid" || snapshot.SDKSettings["base_url"] != snapshot.Endpoint || snapshot.SDKSettings["bearer_token_env"] != "COPILOT_TOKEN" {
 		t.Fatalf("snapshot=%#v", snapshot)
+	}
+}
+
+func TestWorkGraphStartsOnlyReadyIndependentUnits(t *testing.T) {
+	root := workflowRepo(t)
+	service := New(root, workflowConfig(), nil)
+	units, err := task.NormalizeWorkUnits([]task.WorkUnit{
+		{ID: "T1", Objective: "one", Scope: "one.go", ExecutionPacket: "one packet", AcceptanceCriteria: []string{"one"}, ValidationCommands: []string{"test one"}},
+		{ID: "T2", Objective: "two", Scope: "two.go", ExecutionPacket: "two packet", AcceptanceCriteria: []string{"two"}, ValidationCommands: []string{"test two"}},
+		{ID: "T3", Objective: "three", Scope: "three.go", DependsOn: []string{"T1", "T2"}, ExecutionPacket: "three packet", AcceptanceCriteria: []string{"three"}, ValidationCommands: []string{"test three"}},
+	}, "plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := task.State{ID: "dag", RepoRoot: root, Phase: task.PhasePlanApproved, Task: "dag", Plan: "plan", PlanHash: hash("plan"), ApprovedPlanHash: hash("plan"), WorkUnits: units, ProfilesSnapshot: map[string]task.ProfileSnapshot{}, RuntimeSnapshot: map[string]task.RuntimeSnapshot{}, MaxRounds: MaxRounds}
+	if err := service.Store.Create(parent); err != nil {
+		t.Fatal(err)
+	}
+	graph, err := service.Graph("dag")
+	if err != nil || strings.Join(graph.Ready, ",") != "T1,T2" {
+		t.Fatalf("graph=%#v err=%v", graph, err)
+	}
+	if _, err := service.StartWork("dag", "T3"); err == nil || ExitCode(err) != ExitUsage {
+		t.Fatalf("blocked T3 started: %v", err)
+	}
+	for _, id := range []string{"T1", "T2"} {
+		result, startErr := service.StartWork("dag", id)
+		wantScope := map[string]string{"T1": "one.go", "T2": "two.go"}[id]
+		if startErr != nil || result.State.ParentTaskID != "dag" || result.State.PlannedScope != wantScope {
+			t.Fatalf("start %s: %#v err=%v", id, result.State, startErr)
+		}
+		if _, updateErr := service.Store.Update(result.State.ID, func(st *task.State) error { st.Phase = task.PhaseApproved; return nil }); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	}
+	graph, err = service.Graph("dag")
+	if err != nil || strings.Join(graph.Ready, ",") != "T3" {
+		t.Fatalf("graph after dependencies=%#v err=%v", graph, err)
+	}
+}
+
+func TestIntegrationReviewUsesFreshFixerThenResumesReviewer(t *testing.T) {
+	root := workflowRepo(t)
+	fake := &scriptedAdapter{sessions: map[runner.Role]string{}, responses: map[runner.Role][]runner.Envelope{
+		runner.RoleCodeReviewer: {
+			{Role: string(runner.RoleCodeReviewer), Verdict: "changes_requested", Findings: []task.Finding{{Path: "app.go", Message: "align cross-unit contract"}}},
+			{Role: string(runner.RoleCodeReviewer), Verdict: "approved", Findings: []task.Finding{}},
+		},
+		runner.RoleImplementer: {{Role: string(runner.RoleImplementer), Status: "ready"}},
+	}}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	profiles, runtimes, err := service.snapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	units, err := task.NormalizeWorkUnits([]task.WorkUnit{{ID: "T1", Objective: "change app", Scope: "app.go", ExecutionPacket: "change app", AcceptanceCriteria: []string{"works"}, ValidationCommands: []string{"go test ./..."}}}, "plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := task.State{ID: "integration-parent", RepoRoot: root, Phase: task.PhasePlanApproved, Task: "change app", Plan: "approved plan", PlanHash: hash("approved plan"), ApprovedPlanHash: hash("approved plan"), WorkUnits: units, ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: MaxRounds}
+	if err := service.Store.Create(parent); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := service.Observe("app.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err = service.Capture(baseline, "unit-baseline", task.WorkTaskID(parent.ID, "T1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "app.go"), []byte("package app\n\nconst integrated = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	child := task.State{ID: task.WorkTaskID(parent.ID, "T1"), RepoRoot: root, Phase: task.PhaseApproved, ParentTaskID: parent.ID, WorkUnitID: "T1", Scope: "app.go", ScopedBaseline: baseline, ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: MaxRounds}
+	if err := service.Store.Create(child); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ReviewIntegration(context.Background(), parent.ID)
+	if err != nil || result.State.Phase != task.PhaseApproved || !result.State.IntegrationReview || result.State.ParentTaskID != parent.ID {
+		t.Fatalf("integration=%#v err=%v", result.State, err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.requests) != 3 || fake.requests[0].Role != runner.RoleCodeReviewer || fake.requests[1].Role != runner.RoleImplementer || fake.requests[1].Resume || fake.requests[2].Role != runner.RoleCodeReviewer || !fake.requests[2].Resume {
+		t.Fatalf("integration requests=%#v", fake.requests)
+	}
+	if !strings.Contains(fake.requests[0].Prompt, "Deep integration-review boundary") || !strings.Contains(fake.requests[1].Prompt, "fresh integration-fix session") {
+		t.Fatalf("integration prompts reviewer=%q implementer=%q", fake.requests[0].Prompt, fake.requests[1].Prompt)
+	}
+}
+
+func TestCumulativeUsageDeltaHandlesGrowthAndProcessReset(t *testing.T) {
+	if got := tokenDelta(140, 100); got != 40 {
+		t.Fatalf("growth delta=%d", got)
+	}
+	if got := tokenDelta(30, 100); got != 30 {
+		t.Fatalf("reset delta=%d", got)
+	}
+	if got := tokenDelta(100, 100); got != 0 {
+		t.Fatalf("unchanged delta=%d", got)
 	}
 }
 
@@ -125,6 +240,12 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 		},
 	}
 	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	service.Capabilities = func(provider string, role runner.Role, taskText string) CapabilityContext {
+		if provider != "codex" || taskText != "change app" {
+			t.Fatalf("capability inputs provider=%q role=%q task=%q", provider, role, taskText)
+		}
+		return CapabilityContext{Note: "CAPABILITY-NOTE-" + string(role), SkillDirectories: []string{"/skills/" + string(role)}}
+	}
 	planned, err := service.StartPlan(context.Background(), "change app", "loop")
 	if err != nil || planned.State.Phase != task.PhasePlanned {
 		t.Fatalf("start: phase=%s err=%v", planned.State.Phase, err)
@@ -145,8 +266,10 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	counts := map[runner.Role]int{}
+	promptBytes := map[runner.Role]int64{}
 	for _, request := range fake.requests {
 		counts[request.Role]++
+		promptBytes[request.Role] += int64(len(request.Prompt))
 		if request.Role == runner.RolePlanner && request.Speed != "priority" {
 			t.Fatalf("planner speed=%q", request.Speed)
 		}
@@ -161,6 +284,16 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 		}
 		if counts[request.Role] == 1 && !strings.Contains(request.Prompt, tokenDiscipline) {
 			t.Fatalf("initial %s prompt omitted token discipline", request.Role)
+		}
+		capabilityNote := "CAPABILITY-NOTE-" + string(request.Role)
+		if counts[request.Role] == 1 && !strings.Contains(request.Prompt, capabilityNote) {
+			t.Fatalf("initial %s prompt omitted capability note", request.Role)
+		}
+		if counts[request.Role] > 1 && strings.Contains(request.Prompt, capabilityNote) {
+			t.Fatalf("resumed %s prompt repeated capability note", request.Role)
+		}
+		if !reflect.DeepEqual(request.SkillDirectories, []string{"/skills/" + string(request.Role)}) {
+			t.Fatalf("%s skill directories = %#v", request.Role, request.SkillDirectories)
 		}
 		if counts[request.Role] > 1 && strings.Contains(request.Prompt, tokenDiscipline) {
 			t.Fatalf("resumed %s prompt repeated initial guidance", request.Role)
@@ -177,7 +310,7 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 			t.Fatalf("role %s calls=%d, want 2", role, counts[role])
 		}
 		usage := approvedCode.State.Usage[string(role)]
-		if usage.Requests != 2 || usage.PromptBytes == 0 {
+		if usage.Requests != 2 || usage.PromptBytes != promptBytes[role] {
 			t.Fatalf("role %s usage=%#v", role, usage)
 		}
 	}
@@ -287,6 +420,155 @@ type failOnceAdapter struct {
 	requests []runner.Request
 }
 
+type interruptOnceAdapter struct {
+	requests []runner.Request
+}
+
+func (adapter *interruptOnceAdapter) Run(ctx context.Context, req runner.Request, callbacks runner.Callbacks) (runner.Response, error) {
+	adapter.requests = append(adapter.requests, req)
+	if len(adapter.requests) == 1 {
+		if err := callbacks.SessionStarted("interrupt-session"); err != nil {
+			return runner.Response{}, err
+		}
+		<-ctx.Done()
+		return runner.Response{SessionID: "interrupt-session"}, &runner.ProviderError{Code: "INTERRUPTED", Message: "provider interrupted", Retryable: true, KnownSession: true, SessionID: "interrupt-session", Cause: ctx.Err()}
+	}
+	return runner.Response{SessionID: "interrupt-session", Envelope: &runner.Envelope{Role: string(runner.RolePlanner), Status: "ready", Plan: "recovered"}}, nil
+}
+
+func (adapter *interruptOnceAdapter) ListModels(context.Context, runner.ModelListRequest) (runner.ModelPage, error) {
+	return workflowTestModels(), nil
+}
+func (adapter *interruptOnceAdapter) Version(context.Context) (string, error) { return "test", nil }
+func (adapter *interruptOnceAdapter) Auth(context.Context) (runner.AuthStatus, error) {
+	return runner.AuthStatus{Authenticated: true}, nil
+}
+
+func TestCanceledProviderTurnBecomesSameSessionRetry(t *testing.T) {
+	root := workflowRepo(t)
+	adapter := &interruptOnceAdapter{}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": adapter})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := service.StartPlan(ctx, "recover interrupt", "interrupt-retry")
+	if ExitCode(err) != ExitAction {
+		t.Fatalf("cancel error=%v exit=%d", err, ExitCode(err))
+	}
+	state, err := service.Status("interrupt-retry")
+	if err != nil || state.InFlight != nil || state.Retry == nil || !state.Retry.KnownSession || state.Retry.SessionID != "interrupt-session" {
+		t.Fatalf("state=%#v err=%v", state, err)
+	}
+	result, err := service.Retry(context.Background(), "interrupt-retry")
+	if err != nil || result.State.Plan != "recovered" || len(adapter.requests) != 2 || !adapter.requests[1].Resume || adapter.requests[1].SessionID != "interrupt-session" {
+		t.Fatalf("result=%#v requests=%#v err=%v", result, adapter.requests, err)
+	}
+}
+
+func abandonedPlannerState(root, id, session string, ownerPID int, startedAt time.Time) task.State {
+	return task.State{
+		ID: id, RepoRoot: root, Phase: task.PhasePlanned, Task: "recover abandoned turn", MaxRounds: MaxRounds,
+		ProfilesSnapshot: map[string]task.ProfileSnapshot{
+			string(runner.RolePlanner): {Provider: "codex", Model: "planner-model", Effort: "max"},
+		},
+		PlannerSessionID: session,
+		InFlight: &task.InFlight{
+			Token: "abandoned-token", Operation: "plan_start", Role: string(runner.RolePlanner), OwnerPID: ownerPID,
+			StartedAt: startedAt, KnownSession: session != "", SessionID: session, PreviousPhase: task.PhasePlanned,
+			Prompt: "continue the interrupted plan", Loop: "plan_initial",
+		},
+	}
+}
+
+func TestRetryRecoversAbandonedOwnerInSameSession(t *testing.T) {
+	root := workflowRepo(t)
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	fake := &scriptedAdapter{
+		sessions: map[runner.Role]string{runner.RolePlanner: "durable-session"},
+		responses: map[runner.Role][]runner.Envelope{
+			runner.RolePlanner: {{Role: string(runner.RolePlanner), Status: "ready", Plan: "recovered abandoned plan"}},
+		},
+	}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	service.Now = func() time.Time { return now }
+	service.ProcessID = func() int { return 9002 }
+	service.ProcessAlive = func(pid int) bool { return pid != 9001 }
+	if err := service.Store.Create(abandonedPlannerState(root, "abandoned", "durable-session", 9001, now.Add(-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.Retry(context.Background(), "abandoned")
+	if err != nil || result.State.Plan != "recovered abandoned plan" || len(fake.requests) != 1 {
+		t.Fatalf("result=%#v requests=%#v err=%v", result, fake.requests, err)
+	}
+	request := fake.requests[0]
+	if !request.Resume || request.SessionID != "durable-session" || request.Prompt != "continue the interrupted plan" {
+		t.Fatalf("abandoned retry changed provider continuity: %#v", request)
+	}
+}
+
+func TestRetryDoesNotStealLiveOwnedOperation(t *testing.T) {
+	root := workflowRepo(t)
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	service := New(root, workflowConfig(), nil)
+	service.Now = func() time.Time { return now }
+	service.ProcessAlive = func(int) bool { return true }
+	if err := service.Store.Create(abandonedPlannerState(root, "live-owner", "durable-session", 9001, now.Add(-time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := service.Retry(context.Background(), "live-owner")
+	if ExitCode(err) != ExitInFlight {
+		t.Fatalf("live owner error=%v exit=%d", err, ExitCode(err))
+	}
+	state, loadErr := service.Status("live-owner")
+	if loadErr != nil || state.InFlight == nil || state.Retry != nil {
+		t.Fatalf("live state=%#v err=%v", state, loadErr)
+	}
+}
+
+func TestRetryRecoversExpiredLegacyOperationWithoutOwnerPID(t *testing.T) {
+	root := workflowRepo(t)
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	fake := &scriptedAdapter{
+		sessions: map[runner.Role]string{runner.RolePlanner: "legacy-session"},
+		responses: map[runner.Role][]runner.Envelope{
+			runner.RolePlanner: {{Role: string(runner.RolePlanner), Status: "ready", Plan: "legacy recovered"}},
+		},
+	}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	service.Now = func() time.Time { return now }
+	legacy := abandonedPlannerState(root, "legacy-owner", "legacy-session", 0, now.Add(-20*time.Minute))
+	if err := service.Store.Create(legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.Retry(context.Background(), "legacy-owner")
+	if err != nil || result.State.Plan != "legacy recovered" || len(fake.requests) != 1 || !fake.requests[0].Resume {
+		t.Fatalf("legacy result=%#v requests=%#v err=%v", result, fake.requests, err)
+	}
+}
+
+func TestRetryRefusesFreshSessionForAbandonedOperation(t *testing.T) {
+	root := workflowRepo(t)
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	service := New(root, workflowConfig(), nil)
+	service.Now = func() time.Time { return now }
+	service.ProcessAlive = func(int) bool { return false }
+	if err := service.Store.Create(abandonedPlannerState(root, "no-session", "", 9001, now.Add(-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := service.Retry(context.Background(), "no-session")
+	var workflowErr *Error
+	if !errors.As(err, &workflowErr) || workflowErr.Code != "INTERRUPTED_UNRECOVERABLE" || workflowErr.Retryable {
+		t.Fatalf("unrecoverable error=%#v", err)
+	}
+	state, loadErr := service.Status("no-session")
+	if loadErr != nil || state.Phase != task.PhaseFailed || state.InFlight != nil || state.Retry != nil {
+		t.Fatalf("unrecoverable state=%#v err=%v", state, loadErr)
+	}
+}
+
 func (f *failOnceAdapter) Run(_ context.Context, req runner.Request, callbacks runner.Callbacks) (runner.Response, error) {
 	f.requests = append(f.requests, req)
 	if len(f.requests) == 1 {
@@ -299,7 +581,7 @@ func (f *failOnceAdapter) Run(_ context.Context, req runner.Request, callbacks r
 	return runner.Response{SessionID: "durable-planner", Envelope: &envelope}, nil
 }
 func (f *failOnceAdapter) ListModels(context.Context, runner.ModelListRequest) (runner.ModelPage, error) {
-	return runner.ModelPage{}, nil
+	return workflowTestModels(), nil
 }
 func (f *failOnceAdapter) Version(context.Context) (string, error) { return "test", nil }
 func (f *failOnceAdapter) Auth(context.Context) (runner.AuthStatus, error) {
@@ -319,7 +601,7 @@ func (f *blockingAdapter) Run(_ context.Context, req runner.Request, callbacks r
 	return runner.Response{SessionID: session, Envelope: &envelope}, nil
 }
 func (f *blockingAdapter) ListModels(context.Context, runner.ModelListRequest) (runner.ModelPage, error) {
-	return runner.ModelPage{}, nil
+	return workflowTestModels(), nil
 }
 func (f *blockingAdapter) Version(context.Context) (string, error) { return "test", nil }
 func (f *blockingAdapter) Auth(context.Context) (runner.AuthStatus, error) {
@@ -430,6 +712,51 @@ func TestScopedMutationDuringReviewConsumesNoRoundAndRetryResumesReviewer(t *tes
 	}
 }
 
+func TestCodeReviewRefreshesCandidateChangedBeforeReviewStarts(t *testing.T) {
+	root := workflowRepo(t)
+	fake := &scriptedAdapter{
+		sessions: map[runner.Role]string{},
+		responses: map[runner.Role][]runner.Envelope{
+			runner.RolePlanner:      {{Role: string(runner.RolePlanner), Status: "ready", Plan: "plan"}},
+			runner.RolePlanReviewer: {{Role: string(runner.RolePlanReviewer), Verdict: "approved", Findings: []task.Finding{}}},
+			runner.RoleImplementer:  {{Role: string(runner.RoleImplementer), Status: "ready"}},
+			runner.RoleCodeReviewer: {{Role: string(runner.RoleCodeReviewer), Verdict: "approved", Findings: []task.Finding{}}},
+		},
+	}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	if _, err := service.StartPlan(context.Background(), "change app", "pre-review-refresh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ReviewPlan(context.Background(), "pre-review-refresh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Implement(context.Background(), "pre-review-refresh", "app.go"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "app.go"), []byte("package app\n// changed before review\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.ReviewCode(context.Background(), "pre-review-refresh")
+	if err != nil || result.State.Phase != task.PhaseApproved {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	var prompt string
+	for _, request := range fake.requests {
+		if request.Role == runner.RoleCodeReviewer {
+			prompt = request.Prompt
+		}
+	}
+	if !strings.Contains(prompt, `"changed"`) || !strings.Contains(prompt, `"path":"app.go"`) {
+		t.Fatalf("review prompt used stale candidate: %s", prompt)
+	}
+	manifest, err := service.Observe("app.go")
+	if err != nil || result.State.ApprovedManifestHash != task.HashManifest(manifest) {
+		t.Fatalf("approval did not bind refreshed candidate: err=%v", err)
+	}
+}
+
 func TestKnownSessionProviderFailureRetriesExactTurn(t *testing.T) {
 	root := workflowRepo(t)
 	fake := &failOnceAdapter{}
@@ -448,5 +775,87 @@ func TestKnownSessionProviderFailureRetriesExactTurn(t *testing.T) {
 	}
 	if !fake.requests[1].Resume || fake.requests[1].SessionID != "durable-planner" || fake.requests[1].Prompt != fake.requests[0].Prompt {
 		t.Fatalf("retry changed the provider turn: %#v", fake.requests)
+	}
+}
+
+func TestCodeReviewerRetryWithUnchangedCandidateContinuesWithoutRepeatingEvidence(t *testing.T) {
+	root := workflowRepo(t)
+	fake := &scriptedAdapter{
+		sessions: map[runner.Role]string{runner.RoleCodeReviewer: "durable-reviewer"},
+		responses: map[runner.Role][]runner.Envelope{
+			runner.RoleCodeReviewer: {{Role: string(runner.RoleCodeReviewer), Verdict: "approved", Findings: []task.Finding{}}},
+		},
+	}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	candidate, err := service.Observe("app.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := task.State{
+		ID: "review-retry", RepoRoot: root, Phase: task.PhaseFailed, Task: "change app", Plan: "full approved plan",
+		Scope: "app.go", CandidateManifest: candidate, CandidateManifestHash: task.HashManifest(candidate), MaxRounds: MaxRounds,
+		CodeReviewerSessionID: "durable-reviewer",
+		ProfilesSnapshot: map[string]task.ProfileSnapshot{
+			string(runner.RoleCodeReviewer): {Provider: "codex", Model: "reviewer-model", Effort: "xhigh"},
+		},
+		Retry: &task.RetryState{
+			Operation: "code_review", Role: string(runner.RoleCodeReviewer), PreviousPhase: task.PhaseImplementationReady,
+			Prompt: "the original large review prompt", KnownSession: true, SessionID: "durable-reviewer",
+			SnapshotManifest: candidate, Scope: "app.go", Loop: "code_review",
+		},
+	}
+	if err := service.Store.Create(state); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Retry(context.Background(), state.ID)
+	if err != nil || result.State.Phase != task.PhaseApproved {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("requests=%#v", fake.requests)
+	}
+	prompt := fake.requests[0].Prompt
+	if !strings.Contains(prompt, "candidate is unchanged") || !strings.Contains(prompt, "do not reread files") {
+		t.Fatalf("retry prompt did not continue existing review: %q", prompt)
+	}
+	if strings.Contains(prompt, state.Plan) || strings.Contains(prompt, "original large review prompt") {
+		t.Fatalf("retry repeated unchanged evidence: %q", prompt)
+	}
+}
+
+func TestCodeReviewRevisionPromptUsesOnlyFixCheckpointDelta(t *testing.T) {
+	entry := func(hash string) task.FileEntry {
+		return task.FileEntry{Path: "app.go", Kind: "file", Worktree: task.ContentState{Present: true, Hash: hash}}
+	}
+	state := task.State{
+		Task: "large unchanged task", Plan: "large unchanged plan", Scope: "app.go",
+		ScopedBaseline:           []task.FileEntry{entry("baseline")},
+		CandidateManifest:        []task.FileEntry{entry("fixed")},
+		ReviewCheckpoint:         []task.FileEntry{entry("reviewed")},
+		ReviewCheckpointFindings: []task.Finding{{Path: "app.go", Line: 7, Message: "handle the edge case"}},
+	}
+	prompt := codeReviewPrompt(state, true)
+	for _, required := range []string{"Fix delta since the previous completed review", "handle the edge case", "do not restart the original review"} {
+		if !strings.Contains(strings.ToLower(prompt), strings.ToLower(required)) {
+			t.Fatalf("revision prompt omitted %q: %s", required, prompt)
+		}
+	}
+	if strings.Contains(prompt, state.Task) || strings.Contains(prompt, state.Plan) || strings.Contains(prompt, "baseline") {
+		t.Fatalf("revision prompt repeated full task evidence: %s", prompt)
+	}
+}
+
+func TestPlannerAndImplementerPromptsAssignResearchToPlanner(t *testing.T) {
+	planning := plannerPrompt("change app", nil)
+	implementation := implementPrompt("change app", "packet", "app.go", nil)
+	for _, required := range []string{"primary research and architecture brain", "execution packet", "direct blast radius", "validation commands"} {
+		if !strings.Contains(planning, required) {
+			t.Fatalf("planner prompt omitted %q", required)
+		}
+	}
+	for _, required := range []string{"planner owns architecture/research", "immediate dependencies", "broad repository survey"} {
+		if !strings.Contains(implementation, required) {
+			t.Fatalf("implementer prompt omitted %q", required)
+		}
 	}
 }
