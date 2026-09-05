@@ -134,6 +134,11 @@ toolchain:
 brew install --cask basant-kumar/tap/rolemux
 ```
 
+Starting with v0.1.1, the release pipeline refuses to publish unless binaries
+are signed with an Apple Developer ID and accepted by Apple's notarization
+service. Users installing archives manually should also verify their GitHub
+attestation as documented below.
+
 Then install the host-agent skill and verify provider readiness:
 
 ```bash
@@ -186,12 +191,24 @@ public `basant-kumar/homebrew-tap` Cask, and submit GitHub artifact attestations
 The npm registry is intentionally not a v0.1 distribution channel.
 
 The repository secret `HOMEBREW_TAP_GITHUB_TOKEN` must contain a token with
-content-write access to the tap repository. Review and publish a release with:
+content-write access to the tap repository. macOS release signing additionally
+requires these GitHub Actions secrets:
+
+- `MACOS_SIGN_P12`: base64-encoded Developer ID Application certificate and
+  private key exported as a password-protected `.p12` file;
+- `MACOS_SIGN_PASSWORD`: the `.p12` export password;
+- `MACOS_NOTARY_KEY`: base64-encoded App Store Connect API `.p8` key;
+- `MACOS_NOTARY_KEY_ID`: the API key ID;
+- `MACOS_NOTARY_ISSUER_ID`: the API issuer UUID.
+
+The release workflow fails before GoReleaser if any signing secret is absent,
+so an unsigned Cask cannot be published accidentally. Review and publish a
+release with:
 
 ```bash
 ROLEMUX_REPOSITORY="basant-kumar/rolemux"
 ROLEMUX_MODULE="github.com/${ROLEMUX_REPOSITORY}"
-ROLEMUX_VERSION="v0.1.0"
+ROLEMUX_VERSION="v0.1.1"
 
 go vet ./...
 go test -count=1 ./...

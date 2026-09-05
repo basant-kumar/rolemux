@@ -22,6 +22,11 @@ jobs:
       HOMEBREW_TAP_OWNER: ${{ github.repository_owner }}
       HOMEBREW_TAP_REPOSITORY: homebrew-tap
       ROLEMUX_REPOSITORY_NAME: ${{ github.event.repository.name }}
+      MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+      MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -38,6 +43,28 @@ jobs:
         run: |
           go vet ./...
           go test -count=1 ./...
+
+      - name: Require Apple signing and notarization credentials
+        shell: bash
+        run: |
+          missing=()
+          for name in \
+            MACOS_SIGN_P12 \
+            MACOS_SIGN_PASSWORD \
+            MACOS_NOTARY_KEY \
+            MACOS_NOTARY_KEY_ID \
+            MACOS_NOTARY_ISSUER_ID
+          do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required release secrets: ${missing[*]}" >&2
+            echo "Refusing to publish unverified macOS binaries." >&2
+            exit 1
+          fi
 
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0
