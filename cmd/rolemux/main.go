@@ -7,7 +7,7 @@ import (
 	"context"
 	"os"
 
-	"github.com/basant/rolemux/internal/cli"
+	"github.com/basant-kumar/rolemux/internal/cli"
 )
 
 var version = "dev"

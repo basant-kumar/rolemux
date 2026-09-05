@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/basant/rolemux/internal/config"
-	"github.com/basant/rolemux/internal/runner"
+	"github.com/basant-kumar/rolemux/internal/config"
+	"github.com/basant-kumar/rolemux/internal/runner"
 )
 
 type Catalog struct {

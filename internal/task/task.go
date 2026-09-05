@@ -113,6 +113,37 @@ type Diagnostic struct {
 	Paths    []string `json:"paths,omitempty"`
 }
 
+// TokenUsage is accumulated per workflow role. Token fields are populated
+// only when the provider reports them; requests and prompt bytes are measured
+// by RoleMux for every provider invocation.
+type TokenUsage struct {
+	Requests          int64 `json:"requests"`
+	PromptBytes       int64 `json:"prompt_bytes"`
+	InputTokens       int64 `json:"input_tokens,omitempty"`
+	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
+	CacheWriteTokens  int64 `json:"cache_write_tokens,omitempty"`
+	OutputTokens      int64 `json:"output_tokens,omitempty"`
+	ReasoningTokens   int64 `json:"reasoning_tokens,omitempty"`
+	TotalTokens       int64 `json:"total_tokens,omitempty"`
+}
+
+func (u TokenUsage) Empty() bool {
+	return u.Requests == 0 && u.PromptBytes == 0 && u.InputTokens == 0 &&
+		u.CachedInputTokens == 0 && u.CacheWriteTokens == 0 &&
+		u.OutputTokens == 0 && u.ReasoningTokens == 0 && u.TotalTokens == 0
+}
+
+func (u *TokenUsage) Add(turn TokenUsage) {
+	u.Requests += turn.Requests
+	u.PromptBytes += turn.PromptBytes
+	u.InputTokens += turn.InputTokens
+	u.CachedInputTokens += turn.CachedInputTokens
+	u.CacheWriteTokens += turn.CacheWriteTokens
+	u.OutputTokens += turn.OutputTokens
+	u.ReasoningTokens += turn.ReasoningTokens
+	u.TotalTokens += turn.TotalTokens
+}
+
 type ProfileSnapshot struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
@@ -204,6 +235,7 @@ type State struct {
 	Findings              []Finding                  `json:"findings,omitempty"`
 	Advisories            []Diagnostic               `json:"advisories,omitempty"`
 	Diagnostics           []string                   `json:"diagnostics,omitempty"`
+	Usage                 map[string]TokenUsage      `json:"usage,omitempty"`
 	InFlight              *InFlight                  `json:"in_flight,omitempty"`
 	Retry                 *RetryState                `json:"retry,omitempty"`
 }

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/basant/rolemux/internal/runner"
+	"github.com/basant-kumar/rolemux/internal/runner"
 )
 
 func TestFilteringAndArrowNavigation(t *testing.T) {

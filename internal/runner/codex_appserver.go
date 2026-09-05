@@ -11,7 +11,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 type codexRPC struct {

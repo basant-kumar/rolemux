@@ -3,14 +3,17 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
+
+type TokenUsage = task.TokenUsage
 
 type Role string
 
@@ -61,6 +64,79 @@ type Response struct {
 	ReportedEffort string          `json:"reported_effort,omitempty"`
 	Envelope       *Envelope       `json:"envelope,omitempty"`
 	Raw            json.RawMessage `json:"raw,omitempty"`
+	Usage          task.TokenUsage `json:"usage,omitempty"`
+}
+
+// UsageFromMap normalizes snake_case and camelCase usage payloads. For OpenAI
+// and Copilot, cached tokens are a subset of input tokens; Anthropic reports
+// cache read/write tokens separately, so callers select the correct total.
+func UsageFromMap(values map[string]any, inputIncludesCache bool) task.TokenUsage {
+	if nested, ok := values["usage"].(map[string]any); ok {
+		values = nested
+	}
+	usage := task.TokenUsage{
+		InputTokens:       number(values, "input_tokens", "inputTokens"),
+		CachedInputTokens: number(values, "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
+		CacheWriteTokens:  number(values, "cache_creation_input_tokens", "cacheWriteTokens"),
+		OutputTokens:      number(values, "output_tokens", "outputTokens"),
+		ReasoningTokens:   number(values, "reasoning_tokens", "reasoningTokens"),
+		TotalTokens:       number(values, "total_tokens", "totalTokens"),
+	}
+	if details, ok := values["input_tokens_details"].(map[string]any); ok && usage.CachedInputTokens == 0 {
+		usage.CachedInputTokens = number(details, "cached_tokens")
+	}
+	if details, ok := values["output_tokens_details"].(map[string]any); ok && usage.ReasoningTokens == 0 {
+		usage.ReasoningTokens = number(details, "reasoning_tokens")
+	}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+		if !inputIncludesCache {
+			usage.TotalTokens += usage.CachedInputTokens + usage.CacheWriteTokens
+		}
+	}
+	return usage
+}
+
+func number(values map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		switch value := values[key].(type) {
+		case float64:
+			return int64(value)
+		case int64:
+			return value
+		case int:
+			return int64(value)
+		case json.Number:
+			n, _ := value.Int64()
+			return n
+		}
+	}
+	return 0
+}
+
+func usageFromJSONDocument(data []byte, inputIncludesCache bool) TokenUsage {
+	var values map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&values); err != nil {
+		return TokenUsage{}
+	}
+	return UsageFromMap(values, inputIncludesCache)
+}
+
+func usageFromJSONLines(data []byte, inputIncludesCache bool) TokenUsage {
+	var latest TokenUsage
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		usage := usageFromJSONDocument(line, inputIncludesCache)
+		if !usage.Empty() {
+			latest = usage
+		}
+	}
+	return latest
 }
 
 type ModelInfo struct {

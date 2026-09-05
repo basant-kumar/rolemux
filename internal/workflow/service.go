@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/basant/rolemux/internal/config"
-	"github.com/basant/rolemux/internal/runner"
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/config"
+	"github.com/basant-kumar/rolemux/internal/runner"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 const MaxRounds = 5
@@ -633,6 +633,20 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 		})
 		return updateErr
 	}})
+	turnUsage := resp.Usage
+	turnUsage.Requests++
+	turnUsage.PromptBytes += int64(len(request.Prompt))
+	if _, updateErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
+		if st.Usage == nil {
+			st.Usage = map[string]task.TokenUsage{}
+		}
+		total := st.Usage[string(role)]
+		total.Add(turnUsage)
+		st.Usage[string(role)] = total
+		return nil
+	}); updateErr != nil {
+		return runner.Response{}, classify(id, updateErr)
+	}
 	if callErr != nil {
 		return resp, s.fail(id, token, callErr)
 	}

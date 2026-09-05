@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 const (

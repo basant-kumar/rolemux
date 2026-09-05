@@ -177,6 +177,11 @@ func (d ManifestDeltaResult) Paths() []string {
 func UnmatchedScopePatterns(entries []FileEntry, scope string) []string {
 	result := []string{}
 	for _, pattern := range ScopePatterns(scope) {
+		// ** intentionally owns all current and future project files, so it is
+		// meaningful even when a new repository has an empty baseline.
+		if pattern == "**" {
+			continue
+		}
 		matched := false
 		for _, entry := range entries {
 			if ScopeMatches(pattern, entry.Path) {

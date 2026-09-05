@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/basant/rolemux/internal/config"
-	"github.com/basant/rolemux/internal/runner"
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/config"
+	"github.com/basant-kumar/rolemux/internal/runner"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 type scriptedAdapter struct {
@@ -172,6 +172,10 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 	for _, role := range []runner.Role{runner.RolePlanner, runner.RolePlanReviewer, runner.RoleImplementer, runner.RoleCodeReviewer} {
 		if counts[role] != 2 {
 			t.Fatalf("role %s calls=%d, want 2", role, counts[role])
+		}
+		usage := approvedCode.State.Usage[string(role)]
+		if usage.Requests != 2 || usage.PromptBytes == 0 {
+			t.Fatalf("role %s usage=%#v", role, usage)
 		}
 	}
 }

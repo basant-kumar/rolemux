@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/basant/rolemux/internal/runner"
+	"github.com/basant-kumar/rolemux/internal/runner"
 )
 
 type Option struct{ ID, Label string }

@@ -23,7 +23,9 @@ prevent accidental context growth.
 
 RoleMux does not guess at token counts, truncate plans, or replace required
 evidence with a summary. Provider/model token limits configured for gateways
-are honored by their adapters.
+are honored by their adapters. `rolemux usage <task-id> --json` reports
+per-role provider requests, prompt bytes, and input/cache/output/reasoning/total
+tokens whenever the selected provider exposes usage data.
 
 ## Status
 
@@ -46,18 +48,28 @@ fail-closed as an implementation provider in v1 until its write isolation and
 resume surface can satisfy the same guarantees as the Codex and Claude
 adapters. RoleMux never silently switches to another model or provider.
 
-## Build
+## Install on macOS
 
 Go 1.24 or newer is required.
 
 ```bash
-go build -o rolemux ./cmd/rolemux
+go install github.com/basant-kumar/rolemux/cmd/rolemux@latest
 ```
 
-After the public repository is published:
+Go installs the binary in `$(go env GOPATH)/bin`. Add that directory to your
+shell path if needed, then install the host-agent skill and verify the setup:
 
 ```bash
-go install github.com/basant/rolemux/cmd/rolemux@latest
+export PATH="$(go env GOPATH)/bin:$PATH"
+rolemux install --global --hosts all
+rolemux doctor --json
+rolemux configure --global
+```
+
+From an existing source checkout, install the current revision with:
+
+```bash
+go install ./cmd/rolemux
 ```
 
 RoleMux uses installed provider CLIs and their existing logins. If a provider
@@ -166,9 +178,15 @@ Recovery commands:
 
 ```bash
 rolemux status <task-id> --json
+rolemux usage <task-id> --json
 rolemux retry <task-id> --json
 rolemux list --json
 ```
+
+`rolemux usage` is the compact token comparison view. It reports measured
+request counts and prompt bytes plus provider-reported input, cache, output,
+reasoning, and total tokens for each delegated role. Host-orchestrator usage is
+not available through provider CLIs and is therefore not estimated.
 
 ## Shared-checkout concurrency
 

@@ -69,17 +69,20 @@ func (c *Claude) Run(ctx context.Context, req Request, callbacks Callbacks) (Res
 	}
 	result, processErr := c.Process(ctx, ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes})
 	outerID, nested, model, effort, parseErr := parseClaudeResult(result.Stdout, req.SessionID, req.Role)
+	usage := usageFromJSONDocument(result.Stdout, false)
+	response := Response{SessionID: outerID, Text: string(nested), ReportedModel: model, ReportedEffort: effort, Usage: usage}
 	known := req.Resume || outerID != ""
 	if processErr != nil {
-		return Response{SessionID: outerID, ReportedModel: model, ReportedEffort: effort}, providerProcessError("claude", processErr, known, outerIDOr(outerID, req.SessionID))
+		return response, providerProcessError("claude", processErr, known, outerIDOr(outerID, req.SessionID))
 	}
 	if parseErr != nil {
-		return Response{SessionID: outerID, ReportedModel: model, ReportedEffort: effort}, providerError("CLAUDE_OUTPUT", parseErr.Error(), known, known, outerIDOr(outerID, req.SessionID), parseErr)
+		return response, providerError("CLAUDE_OUTPUT", parseErr.Error(), known, known, outerIDOr(outerID, req.SessionID), parseErr)
 	}
 	if outerID == "" || outerID != req.SessionID {
-		return Response{}, providerError("CLAUDE_SESSION_MISMATCH", "claude result session_id did not match requested session", false, known, outerID, nil)
+		return response, providerError("CLAUDE_SESSION_MISMATCH", "claude result session_id did not match requested session", false, known, outerID, nil)
 	}
-	return Response{SessionID: outerID, Text: string(nested), Raw: result.Stdout, ReportedModel: model, ReportedEffort: effort, Envelope: envelopePtr(nested, req.Role)}, nil
+	response.Raw, response.Envelope = result.Stdout, envelopePtr(nested, req.Role)
+	return response, nil
 }
 
 func envelopePtr(nested []byte, role Role) *Envelope {

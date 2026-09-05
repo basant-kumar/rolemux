@@ -9,8 +9,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/basant/rolemux/internal/config"
-	"github.com/basant/rolemux/internal/workflow"
+	"github.com/basant-kumar/rolemux/internal/config"
+	"github.com/basant-kumar/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/workflow"
 )
 
 func cliRepo(t *testing.T) string {
@@ -62,6 +63,30 @@ func TestVersionAndUsageEmitExactlyOneJSONObject(t *testing.T) {
 	value = decodeSingleObject(t, output)
 	if value["ok"] != false || value["error"].(map[string]any)["code"] != "USAGE" {
 		t.Fatalf("payload=%#v", value)
+	}
+}
+
+func TestSummarizeUsageIsCompactSortedAndTotalsUncachedInput(t *testing.T) {
+	state := task.State{
+		ID: "task-1", Phase: task.PhaseApproved,
+		ProfilesSnapshot: map[string]task.ProfileSnapshot{
+			"planner":     {Provider: "codex", Model: "plan", Effort: "max"},
+			"implementer": {Provider: "codex", Model: "code", Effort: "high"},
+		},
+		Usage: map[string]task.TokenUsage{
+			"planner":     {Requests: 1, InputTokens: 100, CachedInputTokens: 80, OutputTokens: 10, TotalTokens: 110},
+			"implementer": {Requests: 2, InputTokens: 200, CachedInputTokens: 50, OutputTokens: 20, TotalTokens: 220},
+		},
+	}
+	summary := summarizeUsage(state)
+	if len(summary.Roles) != 2 || summary.Roles[0].Role != "implementer" || summary.Roles[1].Role != "planner" {
+		t.Fatalf("roles=%#v", summary.Roles)
+	}
+	if summary.Roles[0].UncachedInputTokens != 150 || summary.Totals.UncachedInputTokens != 170 {
+		t.Fatalf("uncached role=%d total=%d", summary.Roles[0].UncachedInputTokens, summary.Totals.UncachedInputTokens)
+	}
+	if summary.Totals.Requests != 3 || summary.Totals.TotalTokens != 330 {
+		t.Fatalf("totals=%#v", summary.Totals)
 	}
 }
 

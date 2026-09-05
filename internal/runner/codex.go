@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 type Codex struct {
@@ -67,37 +67,41 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 	}
 	result, processErr := c.Process(ctx, ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes})
 	threadID, text, reportedModel, reportedEffort, parseErr := parseCodexOutput(result.Stdout, req.Role, callbacks)
+	usage := usageFromJSONLines(result.Stdout, true)
+	response := Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort, Usage: usage}
 	known := threadID != ""
 	if req.Resume && threadID == "" {
 		threadID = req.SessionID
 		known = true
+		response.SessionID = threadID
 	}
 	if req.Resume && known && threadID != req.SessionID {
-		return Response{}, providerError("CODEX_SESSION_MISMATCH", "codex resumed a different session", false, true, threadID, nil)
+		return response, providerError("CODEX_SESSION_MISMATCH", "codex resumed a different session", false, true, threadID, nil)
 	}
 	if processErr != nil {
-		return Response{SessionID: threadID, ReportedModel: reportedModel, ReportedEffort: reportedEffort, Text: text}, providerProcessError("codex", processErr, known, threadID)
+		return response, providerProcessError("codex", processErr, known, threadID)
 	}
 	if parseErr != nil {
-		return Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort}, providerError("CODEX_OUTPUT", parseErr.Error(), known, known, threadID, parseErr)
+		return response, providerError("CODEX_OUTPUT", parseErr.Error(), known, known, threadID, parseErr)
 	}
 	if !req.Resume && threadID == "" {
-		return Response{}, providerError("CODEX_NO_THREAD", "fresh codex turn did not emit thread.started", false, false, "", ErrMissingSession)
+		return response, providerError("CODEX_NO_THREAD", "fresh codex turn did not emit thread.started", false, false, "", ErrMissingSession)
 	}
 	if strings.TrimSpace(text) == "" {
-		return Response{}, providerError("CODEX_NO_ENVELOPE", "codex produced no structured response", known, known, threadID, ErrInvalidEnvelope)
+		return response, providerError("CODEX_NO_ENVELOPE", "codex produced no structured response", known, known, threadID, ErrInvalidEnvelope)
 	}
 	if reportedModel != "" && reportedModel != req.Model {
-		return Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort}, providerError("CODEX_MODEL_MISMATCH", "codex reported a different model than requested", false, known, threadID, nil)
+		return response, providerError("CODEX_MODEL_MISMATCH", "codex reported a different model than requested", false, known, threadID, nil)
 	}
 	if req.Effort != "" && reportedEffort != "" && reportedEffort != req.Effort {
-		return Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort}, providerError("CODEX_EFFORT_MISMATCH", "codex reported a different reasoning effort than requested", false, known, threadID, nil)
+		return response, providerError("CODEX_EFFORT_MISMATCH", "codex reported a different reasoning effort than requested", false, known, threadID, nil)
 	}
 	envelope, err := DecodeEnvelope([]byte(text), req.Role)
 	if err != nil {
-		return Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort}, providerError("CODEX_ENVELOPE", err.Error(), known, known, threadID, err)
+		return response, providerError("CODEX_ENVELOPE", err.Error(), known, known, threadID, err)
 	}
-	return Response{SessionID: threadID, Text: text, Envelope: &envelope, ReportedModel: reportedModel, ReportedEffort: reportedEffort, Raw: result.Stdout}, nil
+	response.Envelope, response.Raw = &envelope, result.Stdout
+	return response, nil
 }
 
 func (c *Codex) childEnv(req Request) []string {

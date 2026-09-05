@@ -44,6 +44,12 @@ func TestCanonicalScopeAndOverlapAreRepositoryRelative(t *testing.T) {
 	}
 }
 
+func TestDefaultScopeIsNotUnmatchedInEmptyRepository(t *testing.T) {
+	if unmatched := UnmatchedScopePatterns(nil, "**"); len(unmatched) != 0 {
+		t.Fatalf("default scope reported unmatched: %v", unmatched)
+	}
+}
+
 func TestManifestContainsExactWorktreeAndIndexAndExcludesSiblings(t *testing.T) {
 	root := testRepo(t)
 	for name, data := range map[string]string{"internal/a.txt": "old", "internal/b.txt": "b", "cmd/main.go": "main"} {

@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/basant/rolemux/internal/provider"
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/provider"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 // Factory constructs one provider adapter and returns its resolved executable

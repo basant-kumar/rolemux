@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 func TestCodexArgumentPlacementFreshAndResume(t *testing.T) {
@@ -121,6 +121,33 @@ func TestEnvelopeDecoderRejectsProseUnknownsAndInvalidVerdicts(t *testing.T) {
 		if _, err := DecodeEnvelope([]byte(value), role); err == nil {
 			t.Errorf("accepted %s", value)
 		}
+	}
+}
+
+func TestUsageNormalizationPreservesProviderCacheSemantics(t *testing.T) {
+	codex := usageFromJSONLines([]byte("{\"type\":\"thread.started\"}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":120,\"cached_input_tokens\":100,\"output_tokens\":20,\"total_tokens\":140}}\n"), true)
+	if codex.InputTokens != 120 || codex.CachedInputTokens != 100 || codex.OutputTokens != 20 || codex.TotalTokens != 140 {
+		t.Fatalf("codex usage=%#v", codex)
+	}
+	claude := usageFromJSONDocument([]byte(`{"usage":{"input_tokens":10,"cache_read_input_tokens":40,"cache_creation_input_tokens":5,"output_tokens":8}}`), false)
+	if claude.InputTokens != 10 || claude.CachedInputTokens != 40 || claude.CacheWriteTokens != 5 || claude.OutputTokens != 8 || claude.TotalTokens != 63 {
+		t.Fatalf("claude usage=%#v", claude)
+	}
+}
+
+func TestNativeWorkerSchemaRequiresEveryProperty(t *testing.T) {
+	schema := NativeSchema(RolePlanner)
+	for _, required := range []string{`"required":["role","status","plan","question"]`, `"additionalProperties":false`} {
+		if !strings.Contains(schema, required) {
+			t.Fatalf("schema missing %s: %s", required, schema)
+		}
+	}
+}
+
+func TestNativeReviewerSchemaRequiresEveryFindingProperty(t *testing.T) {
+	schema := NativeSchema(RoleCodeReviewer)
+	if !strings.Contains(schema, `"required":["severity","path","line","message"]`) {
+		t.Fatalf("reviewer schema has a non-strict finding: %s", schema)
 	}
 }
 

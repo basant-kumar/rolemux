@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/basant/rolemux/internal/provider"
+	"github.com/basant-kumar/rolemux/internal/provider"
 )
 
 type registryAdapter struct{}

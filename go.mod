@@ -1,4 +1,4 @@
-module github.com/basant/rolemux
+module github.com/basant-kumar/rolemux
 
 go 1.24
 

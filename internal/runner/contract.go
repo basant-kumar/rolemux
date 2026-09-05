@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/basant/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 // Envelope is the only model output accepted by the workflow. Fields are
@@ -103,11 +103,14 @@ func NativeSchema(role Role) string {
 	var required []string
 	properties := `"role":{"type":"string"}`
 	if role == RolePlanner || role == RoleImplementer {
-		required = []string{"role", "status"}
+		// Strict structured-output APIs require every declared property to be
+		// listed in required. Unused plan/question values are empty strings and
+		// semantic validation below still enforces the role/status combination.
+		required = []string{"role", "status", "plan", "question"}
 		properties += `,"status":{"type":"string","enum":["ready","needs_input"]},"plan":{"type":"string"},"question":{"type":"string"}`
 	} else {
 		required = []string{"role", "verdict", "findings"}
-		properties += `,"verdict":{"type":"string","enum":["approved","changes_requested"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["message"],"properties":{"severity":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"message":{"type":"string"}}}}`
+		properties += `,"verdict":{"type":"string","enum":["approved","changes_requested"]},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["severity","path","line","message"],"properties":{"severity":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"message":{"type":"string"}}}}`
 	}
 	b, _ := json.Marshal(required)
 	return fmt.Sprintf(`{"type":"object","additionalProperties":false,"required":%s,"properties":{%s}}`, b, properties)

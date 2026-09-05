@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	copilot "github.com/github/copilot-sdk/go"
 	"github.com/github/copilot-sdk/go/rpc"
@@ -263,26 +264,52 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 			return Response{}, providerError("COPILOT_SESSION", "cannot persist session ID", false, true, session.SessionID, err)
 		}
 	}
+	var usageMu sync.Mutex
+	var usage TokenUsage
+	unsubscribe := session.On(func(event copilot.SessionEvent) {
+		data, ok := event.Data.(*copilot.AssistantUsageData)
+		if !ok || data == nil {
+			return
+		}
+		turn := TokenUsage{InputTokens: int64Value(data.InputTokens), CachedInputTokens: int64Value(data.CacheReadTokens), CacheWriteTokens: int64Value(data.CacheWriteTokens), OutputTokens: int64Value(data.OutputTokens), ReasoningTokens: int64Value(data.ReasoningTokens)}
+		turn.TotalTokens = turn.InputTokens + turn.OutputTokens
+		usageMu.Lock()
+		usage.Add(turn)
+		usageMu.Unlock()
+	})
+	defer unsubscribe()
+	usageSnapshot := func() TokenUsage {
+		usageMu.Lock()
+		defer usageMu.Unlock()
+		return usage
+	}
 	result, err := session.SendAndWait(ctx, copilot.MessageOptions{Prompt: CopilotEnvelopePrompt(req.Role) + "\n\n" + req.Prompt})
 	if err != nil {
-		return Response{SessionID: session.SessionID}, providerProcessError("copilot", err, true, session.SessionID)
+		return Response{SessionID: session.SessionID, Usage: usageSnapshot()}, providerProcessError("copilot", err, true, session.SessionID)
 	}
 	if result == nil {
-		return Response{}, providerError("COPILOT_OUTPUT", "Copilot produced no terminal assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
+		return Response{SessionID: session.SessionID, Usage: usageSnapshot()}, providerError("COPILOT_OUTPUT", "Copilot produced no terminal assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
 	}
 	data, ok := result.Data.(*copilot.AssistantMessageData)
 	if !ok || data == nil {
-		return Response{}, providerError("COPILOT_OUTPUT", "Copilot terminal event was not an assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
+		return Response{SessionID: session.SessionID, Usage: usageSnapshot()}, providerError("COPILOT_OUTPUT", "Copilot terminal event was not an assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
 	}
 	env, err := DecodeEnvelope([]byte(data.Content), req.Role)
 	if err != nil {
-		return Response{SessionID: session.SessionID, Text: data.Content}, providerError("COPILOT_ENVELOPE", err.Error(), true, true, session.SessionID, err)
+		return Response{SessionID: session.SessionID, Text: data.Content, Usage: usageSnapshot()}, providerError("COPILOT_ENVELOPE", err.Error(), true, true, session.SessionID, err)
 	}
-	response := Response{SessionID: session.SessionID, Text: data.Content, Envelope: &env}
+	response := Response{SessionID: session.SessionID, Text: data.Content, Envelope: &env, Usage: usageSnapshot()}
 	if data.Model != nil {
 		response.ReportedModel = *data.Model
 	}
 	return response, nil
+}
+
+func int64Value(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (c *Copilot) ListModels(ctx context.Context, req ModelListRequest) (ModelPage, error) {

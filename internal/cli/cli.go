@@ -17,13 +17,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/basant/rolemux/internal/catalog"
-	"github.com/basant/rolemux/internal/config"
-	"github.com/basant/rolemux/internal/install"
-	"github.com/basant/rolemux/internal/picker"
-	"github.com/basant/rolemux/internal/runner"
-	"github.com/basant/rolemux/internal/task"
-	"github.com/basant/rolemux/internal/workflow"
+	"github.com/basant-kumar/rolemux/internal/catalog"
+	"github.com/basant-kumar/rolemux/internal/config"
+	"github.com/basant-kumar/rolemux/internal/install"
+	"github.com/basant-kumar/rolemux/internal/picker"
+	"github.com/basant-kumar/rolemux/internal/runner"
+	"github.com/basant-kumar/rolemux/internal/task"
+	"github.com/basant-kumar/rolemux/internal/workflow"
 )
 
 const usageText = `RoleMux — Right model. Right role. Same thread.
@@ -41,6 +41,7 @@ Usage:
   rolemux implement answer TASK-ID --answer TEXT [--json]
   rolemux code review TASK-ID [--json]
   rolemux status TASK-ID [--json]
+  rolemux usage TASK-ID [--json]
   rolemux retry TASK-ID [--json]
   rolemux list [--json]
   rolemux doctor [--json]
@@ -96,6 +97,8 @@ func (a *app) run(args []string) int {
 		return a.runCode(args[1:])
 	case "status":
 		return a.runStatus(args[1:])
+	case "usage":
+		return a.runUsage(args[1:])
 	case "retry":
 		return a.runRetry(args[1:])
 	case "list":
@@ -501,6 +504,30 @@ func (a *app) runStatus(args []string) int {
 	return workflow.ExitOK
 }
 
+func (a *app) runUsage(args []string) int {
+	opts, err := parse(args, map[string]bool{"--json": false})
+	if err != nil || len(opts.positionals) != 1 {
+		if err == nil {
+			err = usage("usage requires TASK-ID")
+		}
+		return a.fail("usage", err, opts.json(), workflow.Result{})
+	}
+	service, err := a.workflowService()
+	if err != nil {
+		return a.fail("usage", err, opts.json(), workflow.Result{})
+	}
+	state, loadErr := service.Status(opts.positionals[0])
+	if loadErr != nil {
+		return a.fail("usage", loadErr, opts.json(), workflow.Result{})
+	}
+	summary := summarizeUsage(state)
+	if opts.json() {
+		return a.success("usage", summary, &state, nil, true)
+	}
+	printUsage(a.out, summary)
+	return workflow.ExitOK
+}
+
 func (a *app) runRetry(args []string) int {
 	opts, err := parse(args, map[string]bool{"--json": false})
 	if err != nil || len(opts.positionals) != 1 {
@@ -794,6 +821,56 @@ type taskSummary struct {
 	PendingQuestionSource string `json:"pending_question_source,omitempty"`
 }
 
+type usageNumbers struct {
+	task.TokenUsage
+	UncachedInputTokens int64 `json:"uncached_input_tokens,omitempty"`
+}
+
+type roleUsage struct {
+	Role     string `json:"role"`
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Effort   string `json:"effort,omitempty"`
+	usageNumbers
+}
+
+type usageSummary struct {
+	TaskID string       `json:"task_id"`
+	Phase  string       `json:"phase"`
+	Roles  []roleUsage  `json:"roles"`
+	Totals usageNumbers `json:"totals"`
+}
+
+func summarizeUsage(st task.State) usageSummary {
+	roles := make([]string, 0, len(st.Usage))
+	for role := range st.Usage {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+
+	summary := usageSummary{TaskID: st.ID, Phase: st.Phase, Roles: make([]roleUsage, 0, len(roles))}
+	var totals task.TokenUsage
+	for _, role := range roles {
+		u := st.Usage[role]
+		profile := st.ProfilesSnapshot[role]
+		summary.Roles = append(summary.Roles, roleUsage{
+			Role: role, Provider: profile.Provider, Model: profile.Model, Effort: profile.Effort,
+			usageNumbers: usageNumbersFor(u),
+		})
+		totals.Add(u)
+	}
+	summary.Totals = usageNumbersFor(totals)
+	return summary
+}
+
+func usageNumbersFor(u task.TokenUsage) usageNumbers {
+	uncached := u.InputTokens - u.CachedInputTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	return usageNumbers{TokenUsage: u, UncachedInputTokens: uncached}
+}
+
 type errorOutput struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
@@ -908,6 +985,36 @@ func printState(out io.Writer, st task.State) {
 	if st.Retry != nil {
 		fmt.Fprintf(out, "retry: %s (%s)\n", st.Retry.Operation, st.Retry.Role)
 	}
+	roles := make([]string, 0, len(st.Usage))
+	for role := range st.Usage {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	for _, role := range roles {
+		u := st.Usage[role]
+		fmt.Fprintf(out, "usage %s: requests=%d prompt_bytes=%d input=%d cached=%d cache_write=%d output=%d reasoning=%d total=%d\n", role, u.Requests, u.PromptBytes, u.InputTokens, u.CachedInputTokens, u.CacheWriteTokens, u.OutputTokens, u.ReasoningTokens, u.TotalTokens)
+	}
+}
+
+func printUsage(out io.Writer, summary usageSummary) {
+	fmt.Fprintf(out, "task: %s\nphase: %s\n", summary.TaskID, summary.Phase)
+	for _, role := range summary.Roles {
+		profile := role.Provider + "/" + role.Model
+		if role.Provider == "" && role.Model == "" {
+			profile = "unknown"
+		}
+		if role.Effort != "" {
+			profile += " (" + role.Effort + ")"
+		}
+		fmt.Fprintf(out, "%s [%s]: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d\n",
+			role.Role, profile, role.Requests, role.InputTokens, role.CachedInputTokens,
+			role.UncachedInputTokens, role.OutputTokens, role.ReasoningTokens,
+			role.TotalTokens, role.PromptBytes)
+	}
+	t := summary.Totals
+	fmt.Fprintf(out, "total: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d\n",
+		t.Requests, t.InputTokens, t.CachedInputTokens, t.UncachedInputTokens,
+		t.OutputTokens, t.ReasoningTokens, t.TotalTokens, t.PromptBytes)
 }
 
 func (a *app) optionalRepo() string {

@@ -39,6 +39,9 @@ provider output, rely on RoleMux's resumed sessions, and avoid calling `status`
 or refreshing `models` unless the workflow or recovery actually requires it.
 Never omit new user constraints or evidence needed for correctness.
 
+Use `rolemux usage <task-id> --json` for a compact per-role token comparison;
+do not load full task state merely to inspect consumption.
+
 ## Interpret results
 
 - Treat JSON stdout as the sole machine-readable result; diagnostics are on

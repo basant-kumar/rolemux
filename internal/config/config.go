@@ -18,7 +18,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
-	providerid "github.com/basant/rolemux/internal/provider"
+	providerid "github.com/basant-kumar/rolemux/internal/provider"
 )
 
 var (
