@@ -73,7 +73,9 @@ jobs:
         run: goreleaser check
 
       - name: Lint GitHub Actions workflows
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
 
       - name: Build snapshot
         run: goreleaser release --snapshot --clean --skip=publish
