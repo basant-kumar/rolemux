@@ -1,0 +1,4 @@
+interface:
+  display_name: "RoleMux"
+  short_description: "Route each coding role to the right model"
+  default_prompt: "Use $rolemux to plan, implement, and review this task with my configured role models."

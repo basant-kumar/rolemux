@@ -1,0 +1,171 @@
+package runner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os/exec"
+	"strings"
+	"sync/atomic"
+)
+
+const defaultMaxOutputBytes int64 = 16 << 20
+
+type ProcessSpec struct {
+	Path           string
+	Args           []string
+	Dir            string
+	Env            []string
+	Stdin          string
+	MaxOutputBytes int64
+}
+
+type ProcessResult struct {
+	Stdout   []byte
+	Stderr   []byte
+	ExitCode int
+}
+
+// ProcessFunc is injectable for adapter tests. Production adapters use
+// RunProcess, which drains both pipes concurrently.
+type ProcessFunc func(context.Context, ProcessSpec) (ProcessResult, error)
+
+func RunProcess(ctx context.Context, spec ProcessSpec) (ProcessResult, error) {
+	if spec.MaxOutputBytes <= 0 {
+		spec.MaxOutputBytes = defaultMaxOutputBytes
+	}
+	cmd := exec.CommandContext(ctx, spec.Path, spec.Args...)
+	cmd.Dir, cmd.Env = spec.Dir, spec.Env
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return ProcessResult{}, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return ProcessResult{}, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return ProcessResult{}, err
+	}
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	outCh := make(chan readResult, 1)
+	errCh := make(chan readResult, 1)
+	stdinCh := make(chan error, 1)
+	kill := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+	go func() {
+		_, writeErr := io.WriteString(stdin, spec.Stdin)
+		if closeErr := stdin.Close(); writeErr == nil {
+			writeErr = closeErr
+		}
+		stdinCh <- writeErr
+	}()
+	// stdout and stderr share one budget. A noisy stderr stream must not let a
+	// child consume twice the documented limit, and both pipes are drained at
+	// the same time so neither can deadlock the other.
+	var used atomic.Int64
+	go func() { b, e := readBoundedShared(stdout, spec.MaxOutputBytes, &used, kill); outCh <- readResult{b, e} }()
+	go func() { b, e := readBoundedShared(stderr, spec.MaxOutputBytes, &used, kill); errCh <- readResult{b, e} }()
+	out, serr, stdinErr := <-outCh, <-errCh, <-stdinCh
+	if out.err != nil || serr.err != nil || stdinErr != nil {
+		// Kill before Wait: an over-limit reader may have stopped consuming a
+		// pipe while the child is blocked writing to it.
+		kill()
+	}
+	waitErr := cmd.Wait()
+	if out.err != nil {
+		return ProcessResult{Stdout: out.data, Stderr: serr.data}, out.err
+	}
+	if serr.err != nil {
+		return ProcessResult{Stdout: out.data, Stderr: serr.data}, serr.err
+	}
+	if ctx.Err() != nil {
+		return ProcessResult{Stdout: out.data, Stderr: serr.data}, ctx.Err()
+	}
+	result := ProcessResult{Stdout: out.data, Stderr: serr.data, ExitCode: exitCode(waitErr)}
+	if waitErr != nil {
+		message := strings.TrimSpace(string(result.Stderr))
+		if message == "" {
+			message = waitErr.Error()
+		}
+		return result, fmt.Errorf("provider process exited %d: %s", result.ExitCode, message)
+	}
+	if stdinErr != nil {
+		return result, stdinErr
+	}
+	return result, nil
+}
+
+func readBounded(r io.Reader, limit int64, kill func()) ([]byte, error) {
+	if limit <= 0 {
+		limit = defaultMaxOutputBytes
+	}
+	reader := io.LimitReader(r, limit+1)
+	b, err := io.ReadAll(reader)
+	if int64(len(b)) > limit {
+		kill()
+		return b[:limit], ErrOutputLimit
+	}
+	return b, err
+}
+
+func readBoundedShared(r io.Reader, limit int64, used *atomic.Int64, kill func()) ([]byte, error) {
+	if limit <= 0 {
+		limit = defaultMaxOutputBytes
+	}
+	var result []byte
+	buffer := make([]byte, 32<<10)
+	for {
+		n, err := r.Read(buffer)
+		if n > 0 {
+			before := used.Add(int64(n)) - int64(n)
+			remaining := limit - before
+			if remaining <= 0 {
+				kill()
+				return result, ErrOutputLimit
+			}
+			keep := int64(n)
+			if keep > remaining {
+				keep = remaining
+			}
+			result = append(result, buffer[:int(keep)]...)
+			if keep != int64(n) {
+				kill()
+				return result, ErrOutputLimit
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return result, nil
+			}
+			return result, err
+		}
+	}
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
+}

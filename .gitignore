@@ -1,0 +1,13 @@
+# Local build output and caches.
+/.gocache/
+/rolemux
+*.test
+
+# RoleMux runtime state is normally kept below the repository's git directory;
+# keep accidental checked-out state out of commits as well.
+/.rolemux/state/
+/.rolemux/tasks/
+/.rolemux/*.lock
+
+# Local configuration may contain non-secret choices and machine paths.
+/.rolemux/config.toml
