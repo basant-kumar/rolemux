@@ -194,8 +194,10 @@ The repository secret `HOMEBREW_TAP_GITHUB_TOKEN` must contain a token with
 content-write access to the tap repository. macOS release signing additionally
 requires these GitHub Actions secrets:
 
-- `MACOS_SIGN_P12`: base64-encoded Developer ID Application certificate and
-  private key exported as a password-protected `.p12` file;
+- `MACOS_SIGN_P12`: base64-encoded Developer ID Application leaf certificate
+  and private key exported as a password-protected `.p12` file; do not bundle
+  Apple intermediate or root certificates because GoReleaser resolves the
+  signing chain;
 - `MACOS_SIGN_PASSWORD`: the `.p12` export password;
 - `MACOS_NOTARY_KEY`: base64-encoded App Store Connect API `.p8` key;
 - `MACOS_NOTARY_KEY_ID`: the API key ID;
