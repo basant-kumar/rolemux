@@ -1,5 +1,8 @@
 # RoleMux
 
+[![Release](https://img.shields.io/github/v/release/basant-kumar/rolemux?sort=semver)](https://github.com/basant-kumar/rolemux/releases/latest)
+[![CI](https://github.com/basant-kumar/rolemux/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/basant-kumar/rolemux/actions/workflows/ci.yml)
+
 **The right mind for every role.**
 
 Plan with one model. Build with another. Review with a third—without making any
