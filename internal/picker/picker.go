@@ -164,9 +164,6 @@ func Pick(ctx context.Context, in io.Reader, out io.Writer, options []Option) (O
 		if out == nil {
 			return
 		}
-		if renderedLines > 0 {
-			_, _ = fmt.Fprintf(out, "\r\x1b[%dA", renderedLines)
-		}
 		lines := []string{"Search: " + state.Query}
 		filtered := state.Filtered()
 		start := 0
@@ -194,18 +191,33 @@ func Pick(ctx context.Context, in io.Reader, out io.Writer, options []Option) (O
 			lines = append(lines, "  No matches")
 		}
 		lines = append(lines, "↑/↓ move  enter select  esc cancel")
+
+		// Build and write one synchronized frame. The cursor is left on the
+		// previous frame's final line, so reaching its first line requires
+		// renderedLines-1 upward moves. Using renderedLines here makes every
+		// keypress drift upward and leaves stale footer lines behind.
+		var frame strings.Builder
+		frame.WriteString("\x1b[?2026h")
+		if renderedLines > 0 {
+			frame.WriteByte('\r')
+			if renderedLines > 1 {
+				_, _ = fmt.Fprintf(&frame, "\x1b[%dA", renderedLines-1)
+			}
+		}
 		for i, line := range lines {
-			_, _ = fmt.Fprintf(out, "\r\x1b[2K%s", line)
+			_, _ = fmt.Fprintf(&frame, "\r\x1b[2K%s", line)
 			if i < len(lines)-1 {
-				_, _ = io.WriteString(out, "\n")
+				frame.WriteByte('\n')
 			}
 		}
 		for i := len(lines); i < renderedLines; i++ {
-			_, _ = io.WriteString(out, "\n\r\x1b[2K")
+			frame.WriteString("\n\r\x1b[2K")
 		}
 		if renderedLines > len(lines) {
-			_, _ = fmt.Fprintf(out, "\x1b[%dA", renderedLines-len(lines))
+			_, _ = fmt.Fprintf(&frame, "\x1b[%dA", renderedLines-len(lines))
 		}
+		frame.WriteString("\x1b[?2026l")
+		_, _ = io.WriteString(out, frame.String())
 		renderedLines = len(lines)
 	}
 	if out != nil {
