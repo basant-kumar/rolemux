@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -187,6 +188,47 @@ func TestCopilotImplementerFailsClosedBeforeStartingSDK(t *testing.T) {
 	var providerErr *ProviderError
 	if !errors.As(err, &providerErr) || providerErr.Code != "UNSUPPORTED_PROVIDER" || !errors.Is(err, ErrUnsupportedProvider) {
 		t.Fatalf("unexpected error: %#v", err)
+	}
+}
+
+func TestProviderLoginUsesOfficialInteractiveCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		make func(InteractiveProcessFunc) Authenticator
+	}{
+		{"codex", []string{"login"}, func(run InteractiveProcessFunc) Authenticator {
+			return &Codex{Path: "/bin/codex", Env: []string{"PATH=/bin"}, InteractiveProcess: run}
+		}},
+		{"claude", []string{"auth", "login"}, func(run InteractiveProcessFunc) Authenticator {
+			return &Claude{Path: "/bin/claude", Env: []string{"PATH=/bin"}, InteractiveProcess: run}
+		}},
+		{"copilot", []string{"login"}, func(run InteractiveProcessFunc) Authenticator {
+			return &Copilot{Path: "/bin/copilot", Env: []string{"PATH=/bin"}, InteractiveProcess: run}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			run := func(_ context.Context, path string, args []string, dir string, env []string, stdin io.Reader, stdout, stderr io.Writer) error {
+				called = true
+				if path != "/bin/"+test.name || !reflect.DeepEqual(args, test.args) || dir != "/repo" || !reflect.DeepEqual(env, []string{"PATH=/bin"}) {
+					t.Fatalf("path=%q args=%#v dir=%q env=%#v", path, args, dir, env)
+				}
+				if stdin == nil || stdout == nil || stderr == nil {
+					t.Fatal("login did not inherit terminal streams")
+				}
+				return nil
+			}
+			authenticator := test.make(run)
+			buffer := strings.NewReader("")
+			if err := authenticator.Login(context.Background(), LoginRequest{RepoRoot: "/repo", Stdin: buffer, Stdout: io.Discard, Stderr: io.Discard}); err != nil {
+				t.Fatal(err)
+			}
+			if !called {
+				t.Fatal("interactive login command was not called")
+			}
+		})
 	}
 }
 

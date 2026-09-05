@@ -80,9 +80,13 @@ From an existing source checkout, install the current revision with:
 go install ./cmd/rolemux
 ```
 
-RoleMux uses installed provider CLIs and their existing logins. If a provider
-is not installed or authenticated, `rolemux doctor` reports the exact login
-action instead of attempting a fallback.
+RoleMux uses installed provider CLIs and their existing logins. The configure
+picker shows each provider's sign-in state. Selecting an installed provider
+that needs authentication temporarily leaves the picker, runs its official
+login (`claude auth login`, `codex login`, or `copilot login`), and returns to
+a freshly discovered model list when login succeeds. A missing CLI stays in
+the provider screen with installation guidance; on macOS, install GitHub
+Copilot CLI with `brew install copilot-cli` and select it again.
 
 ## Configure roles
 
@@ -91,6 +95,10 @@ Open the searchable picker for global defaults:
 ```bash
 rolemux configure --global
 ```
+
+Each wizard step replaces the previous screen. Use the arrow keys and Enter to
+select, type to search provider/model lists, press Escape to go back, and press
+Ctrl+C to cancel from any step.
 
 Or update one profile atomically:
 

@@ -47,16 +47,47 @@ func TestPickRedrawKeepsOneFixedTerminalRegion(t *testing.T) {
 		t.Fatalf("choice=%#v cancelled=%v err=%v", choice, cancelled, err)
 	}
 
-	// Search + three choices + footer is five lines. Since the cursor remains
-	// on the fifth line, a redraw must move up four lines, never five.
-	if got := bytes.Count(output.Bytes(), []byte("\x1b[4A")); got != 2 {
+	// Search + three choices + spacer + footer is six lines. Since the cursor
+	// remains on the sixth line, a redraw must move up five lines, never six.
+	if got := bytes.Count(output.Bytes(), []byte("\x1b[5A")); got != 2 {
 		t.Fatalf("fixed-region redraws=%d, output=%q", got, output.Bytes())
 	}
-	if bytes.Contains(output.Bytes(), []byte("\x1b[5A")) {
+	if bytes.Contains(output.Bytes(), []byte("\x1b[6A")) {
 		t.Fatalf("redraw drifted above its region: %q", output.Bytes())
 	}
 	if got := bytes.Count(output.Bytes(), []byte("\x1b[?2026h")); got != 3 {
 		t.Fatalf("synchronized frames=%d, output=%q", got, output.Bytes())
+	}
+}
+
+func TestSelectDistinguishesBackCancelAndConfirmationShortcut(t *testing.T) {
+	options := []Option{{ID: "no", Label: "No"}, {ID: "yes", Label: "Yes"}}
+	_, action, err := Select(context.Background(), bytes.NewBuffer([]byte{0x1b}), &bytes.Buffer{}, options, View{CanBack: true})
+	if err != nil || action != ActionBack {
+		t.Fatalf("escape action=%v err=%v", action, err)
+	}
+	_, action, err = Select(context.Background(), bytes.NewBuffer([]byte{0x03}), &bytes.Buffer{}, options, View{CanBack: true})
+	if err != nil || action != ActionCancel {
+		t.Fatalf("ctrl-c action=%v err=%v", action, err)
+	}
+	choice, action, err := Select(context.Background(), bytes.NewBufferString("y"), &bytes.Buffer{}, options, View{})
+	if err != nil || action != ActionSelected || choice.ID != "yes" {
+		t.Fatalf("shortcut choice=%#v action=%v err=%v", choice, action, err)
+	}
+}
+
+func TestAlternateScreenEnterLeaveIsIdempotent(t *testing.T) {
+	var output bytes.Buffer
+	screen := NewScreen(&output)
+	screen.Enter()
+	screen.Enter()
+	screen.Leave()
+	screen.Leave()
+	if got := bytes.Count(output.Bytes(), []byte("\x1b[?1049h")); got != 1 {
+		t.Fatalf("entries=%d output=%q", got, output.Bytes())
+	}
+	if got := bytes.Count(output.Bytes(), []byte("\x1b[?1049l")); got != 1 {
+		t.Fatalf("leaves=%d output=%q", got, output.Bytes())
 	}
 }
 

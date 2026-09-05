@@ -13,9 +13,10 @@ import (
 )
 
 type Codex struct {
-	Path    string
-	Process ProcessFunc
-	Env     []string
+	Path               string
+	Process            ProcessFunc
+	InteractiveProcess InteractiveProcessFunc
+	Env                []string
 	// ModelPages is a deterministic seam for discovery tests. Production uses
 	// the app-server model/list protocol when it is nil.
 	ModelPages func(context.Context, task.RuntimeSnapshot) ([]ModelInfo, string, string, error)
@@ -32,7 +33,7 @@ func NewCodex(path string) (*Codex, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Codex{Path: resolved, Process: RunProcess, Env: SanitizedEnv(os.Environ())}, nil
+	return &Codex{Path: resolved, Process: RunProcess, InteractiveProcess: RunInteractiveProcess, Env: SanitizedEnv(os.Environ())}, nil
 }
 
 func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Response, error) {
@@ -286,6 +287,17 @@ func (c *Codex) Auth(ctx context.Context) (AuthStatus, error) {
 	return AuthStatus{Version: version, Authenticated: true}, nil
 }
 
+func (c *Codex) Login(ctx context.Context, req LoginRequest) error {
+	if c == nil || c.Path == "" {
+		return errors.New("codex executable is not configured")
+	}
+	run := c.InteractiveProcess
+	if run == nil {
+		run = RunInteractiveProcess
+	}
+	return run(ctx, c.Path, []string{"login"}, req.RepoRoot, c.Env, req.Stdin, req.Stdout, req.Stderr)
+}
+
 // PaginateModelPages follows every non-empty cursor and detects cursor loops.
 // The function is used by live Codex discovery and is independently testable.
 func PaginateModelPages(ctx context.Context, first func(context.Context, string) (ModelPage, error)) ([]ModelInfo, string, error) {
@@ -339,3 +351,4 @@ func (c *Codex) ListModels(ctx context.Context, req ModelListRequest) (ModelPage
 }
 
 var _ Adapter = (*Codex)(nil)
+var _ Authenticator = (*Codex)(nil)

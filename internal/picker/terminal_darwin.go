@@ -5,9 +5,29 @@ package picker
 import (
 	"io"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// inputReady waits only while distinguishing a lone Escape key from the
+// beginning of an ANSI key sequence. Regular key reads remain blocking.
+func inputReady(reader io.Reader, wait time.Duration) (bool, error) {
+	if sized, ok := reader.(interface{ Len() int }); ok {
+		return sized.Len() > 0, nil
+	}
+	file, ok := reader.(*os.File)
+	if !ok {
+		return true, nil
+	}
+	timeout := int(wait / time.Millisecond)
+	if timeout < 1 {
+		timeout = 1
+	}
+	fds := []unix.PollFd{{Fd: int32(file.Fd()), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, timeout)
+	return n > 0, err
+}
 
 func enterRawMode(reader io.Reader) (func(), error) {
 	file, ok := reader.(*os.File)

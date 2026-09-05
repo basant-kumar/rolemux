@@ -31,6 +31,17 @@ type ProcessResult struct {
 // RunProcess, which drains both pipes concurrently.
 type ProcessFunc func(context.Context, ProcessSpec) (ProcessResult, error)
 
+// InteractiveProcessFunc is the terminal-attached process seam used by
+// provider login commands.
+type InteractiveProcessFunc func(context.Context, string, []string, string, []string, io.Reader, io.Writer, io.Writer) error
+
+func RunInteractiveProcess(ctx context.Context, path string, args []string, dir string, env []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.Dir, cmd.Env = dir, env
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+	return cmd.Run()
+}
+
 func RunProcess(ctx context.Context, spec ProcessSpec) (ProcessResult, error) {
 	if spec.MaxOutputBytes <= 0 {
 		spec.MaxOutputBytes = defaultMaxOutputBytes

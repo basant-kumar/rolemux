@@ -4,7 +4,6 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -224,18 +223,15 @@ func (a *app) runConfigure(args []string) int {
 		return a.fail("configure", usage("interactive configure requires a terminal, or pass --role/--from and a target"), opts.json(), workflow.Result{})
 	}
 	root := a.optionalRepo()
-	if interactive && !opts.bool("--global") && !opts.bool("--project") {
-		if root == "" {
-			return a.fail("configure", usage("interactive project configuration requires a Git worktree"), false, workflow.Result{})
+	if interactive {
+		target, profiles, before, pickErr := a.pickInteractiveConfiguration(root, opts.bool("--global"), opts.bool("--project"))
+		if pickErr != nil {
+			return a.fail("configure", pickErr, false, workflow.Result{})
 		}
-		ok, askErr := a.confirm(fmt.Sprintf("Configure this project (%s)?", root))
-		if askErr != nil {
-			return a.fail("configure", askErr, false, workflow.Result{})
+		if err := config.ConfigureProfilesAtomic(target, profiles, before); err != nil {
+			return a.fail("configure", configProblem(err), false, workflow.Result{})
 		}
-		if !ok {
-			return a.fail("configure", usage("configuration cancelled"), false, workflow.Result{})
-		}
-		opts.bools["--project"] = true
+		return a.configureSuccess(target, "updated", false)
 	}
 	target, err := configTarget(root, opts.bool("--global"), opts.bool("--project"), a.environ)
 	if err != nil {
@@ -269,14 +265,7 @@ func (a *app) runConfigure(args []string) int {
 		}
 		return a.configureSuccess(target, "updated", opts.json())
 	}
-	profiles, pickErr := a.pickProfiles(root)
-	if pickErr != nil {
-		return a.fail("configure", pickErr, false, workflow.Result{})
-	}
-	if err := config.ConfigureProfilesAtomic(target, profiles, before); err != nil {
-		return a.fail("configure", configProblem(err), false, workflow.Result{})
-	}
-	return a.configureSuccess(target, "updated", false)
+	return a.fail("configure", usage("configuration mode is required"), false, workflow.Result{})
 }
 
 func (a *app) configureSuccess(path, status string, jsonMode bool) int {
@@ -288,93 +277,422 @@ func (a *app) configureSuccess(path, status string, jsonMode bool) int {
 	return workflow.ExitOK
 }
 
-func (a *app) pickProfiles(root string) (map[string]config.Profile, error) {
+func (a *app) pickInteractiveConfiguration(root string, global, project bool) (string, map[string]config.Profile, string, error) {
+	screen := picker.NewScreen(a.out)
+	screen.Enter()
+	defer screen.Leave()
+
+	if !global && !project {
+		if root == "" {
+			return "", nil, "", usage("interactive project configuration requires a Git worktree")
+		}
+		choice, action, err := picker.Select(a.ctx, a.in, a.out, yesNoOptions("Cancel", "Configure this project"), picker.View{
+			Title: "Configure RoleMux", Subtitle: fmt.Sprintf("Configure this project (%s)?", root), FullScreen: true,
+		})
+		if err != nil {
+			return "", nil, "", err
+		}
+		if action != picker.ActionSelected || choice.ID != "yes" {
+			return "", nil, "", usage("configuration cancelled")
+		}
+		project = true
+	}
+	target, err := configTarget(root, global, project, a.environ)
+	if err != nil {
+		return "", nil, "", usage("%v", err)
+	}
+	before, err := config.FileHash(target)
+	if err != nil {
+		return "", nil, "", configProblem(err)
+	}
+	profiles, err := a.pickProfiles(root, screen)
+	return target, profiles, before, err
+}
+
+type wizardScreenKind int
+
+const (
+	wizardProvider wizardScreenKind = iota
+	wizardModel
+	wizardVerifyModel
+	wizardEffort
+	wizardSplitPlanReview
+	wizardSplitCodeReview
+)
+
+type wizardScreen struct {
+	kind wizardScreenKind
+	role string
+}
+
+type profileDraft struct {
+	provider string
+	models   []runner.ModelInfo
+	model    runner.ModelInfo
+	effort   string
+}
+
+type providerReadiness struct {
+	adapter       runner.Adapter
+	authenticated bool
+	externalAuth  bool
+	status        string
+	message       string
+}
+
+func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]config.Profile, error) {
 	cfg, err := config.LoadWithEnv(root, a.environ)
 	if err != nil {
 		return nil, configProblem(err)
 	}
-	cfg, adapters, _ := prepareAdapters(cfg, root, a.runnerRegistry())
+	cfg, adapters, adapterErrors := prepareAdapters(cfg, root, a.runnerRegistry())
 	cat := catalog.New(adapters, cfg, "")
-	profiles := map[string]config.Profile{}
-	roles := []string{config.RolePlanner, config.RoleImplementer, config.RoleReviewer}
-	for _, role := range roles {
-		profile, pickErr := a.pickProfile(role, cfg, cat)
+	readiness := a.inspectProviders(cfg, adapters, adapterErrors)
+	drafts := map[string]*profileDraft{}
+	modelsByProvider := map[string][]runner.ModelInfo{}
+	separate := map[string]bool{}
+	history := []wizardScreen{}
+	current := wizardScreen{kind: wizardProvider, role: config.RolePlanner}
+	notice := ""
+
+	goBack := func() bool {
+		if len(history) == 0 {
+			return false
+		}
+		current = history[len(history)-1]
+		history = history[:len(history)-1]
+		notice = ""
+		return true
+	}
+	advance := func(next wizardScreen) {
+		history = append(history, current)
+		current = next
+		notice = ""
+	}
+
+	for {
+		view := wizardView(current, len(history) > 0, notice, drafts)
+		var options []picker.Option
+		switch current.kind {
+		case wizardProvider:
+			options = providerWizardOptions(a.runnerRegistry().Names(), readiness)
+		case wizardModel:
+			options = picker.ModelOptions(drafts[current.role].models)
+		case wizardVerifyModel:
+			options = yesNoOptions("No, choose another model", "Yes, select anyway")
+		case wizardSplitPlanReview, wizardSplitCodeReview:
+			options = yesNoOptions("No, use shared reviewer", "Yes, configure separately")
+		case wizardEffort:
+			options = picker.EffortOptions(drafts[current.role].model)
+		}
+		choice, pickAction, pickErr := picker.Select(a.ctx, a.in, a.out, options, view)
 		if pickErr != nil {
 			return nil, pickErr
 		}
-		profiles[role] = profile
-	}
-	for _, role := range []string{config.RolePlanReviewer, config.RoleCodeReviewer} {
-		ok, askErr := a.confirm("Configure a separate " + strings.ReplaceAll(role, "_", " ") + "?")
-		if askErr != nil {
-			return nil, askErr
+		if pickAction == picker.ActionCancel {
+			return nil, usage("configuration cancelled")
 		}
-		if !ok {
+		if pickAction == picker.ActionBack {
+			if !goBack() {
+				return nil, usage("configuration cancelled")
+			}
 			continue
 		}
-		profile, pickErr := a.pickProfile(role, cfg, cat)
-		if pickErr != nil {
-			return nil, pickErr
+
+		switch current.kind {
+		case wizardProvider:
+			ready := readiness[choice.ID]
+			if ready.adapter == nil {
+				provider := cfg.Provider(choice.ID)
+				adapter, resolved, buildErr := a.runnerRegistry().Build(choice.ID, provider.CLIPath, root)
+				if buildErr != nil {
+					ready.message = providerInstallMessage(choice.ID, buildErr)
+					readiness[choice.ID] = ready
+					notice = ready.message
+					continue
+				}
+				provider.CLIPath = resolved
+				cfg.Providers[choice.ID] = provider
+				adapters[choice.ID] = adapter
+				cat.Config = cfg
+				ready = a.inspectProvider(choice.ID, cfg, adapter, nil)
+				readiness[choice.ID] = ready
+			}
+			if ready.externalAuth && !ready.authenticated {
+				notice = ready.message
+				continue
+			}
+			if !ready.authenticated && !ready.externalAuth {
+				loginErr := a.loginProvider(choice.ID, ready.adapter, root, terminal)
+				if loginErr != nil {
+					ready.status = "login required"
+					ready.message = fmt.Sprintf("Login did not complete: %v", loginErr)
+					readiness[choice.ID] = ready
+					notice = ready.message
+					continue
+				}
+				probeCtx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
+				auth, authErr := ready.adapter.Auth(probeCtx)
+				cancel()
+				if authErr != nil || !auth.Authenticated {
+					ready.status = "login required"
+					ready.message = loginRequiredMessage(choice.ID, auth, authErr)
+					readiness[choice.ID] = ready
+					notice = ready.message
+					continue
+				}
+				ready.authenticated, ready.status, ready.message = true, "signed in", ""
+				readiness[choice.ID] = ready
+			}
+			models := modelsByProvider[choice.ID]
+			if models == nil {
+				runtime := workflow.RuntimeSnapshot(choice.ID, cfg.Provider(choice.ID))
+				var modelErr error
+				models, modelErr = cat.Models(a.ctx, choice.ID, true, runner.ModelListRequest{Refresh: true, Runtime: runtime})
+				if modelErr != nil {
+					notice = "Model discovery failed: " + modelErr.Error()
+					continue
+				}
+				modelsByProvider[choice.ID] = models
+			}
+			drafts[current.role] = &profileDraft{provider: choice.ID, models: models}
+			advance(wizardScreen{kind: wizardModel, role: current.role})
+
+		case wizardModel:
+			draft := drafts[current.role]
+			draft.model, draft.effort = findModel(draft.models, choice.ID), ""
+			if picker.UnknownAvailabilityWarning(draft.model) != "" {
+				advance(wizardScreen{kind: wizardVerifyModel, role: current.role})
+			} else if len(draft.model.Efforts) > 0 {
+				advance(wizardScreen{kind: wizardEffort, role: current.role})
+			} else if next, done := nextProfileScreen(current.role); done {
+				return buildProfiles(drafts, separate), nil
+			} else {
+				advance(next)
+			}
+
+		case wizardVerifyModel:
+			if choice.ID == "no" {
+				goBack()
+				continue
+			}
+			draft := drafts[current.role]
+			if len(draft.model.Efforts) > 0 {
+				advance(wizardScreen{kind: wizardEffort, role: current.role})
+			} else if next, done := nextProfileScreen(current.role); done {
+				return buildProfiles(drafts, separate), nil
+			} else {
+				advance(next)
+			}
+
+		case wizardEffort:
+			drafts[current.role].effort = choice.ID
+			if next, done := nextProfileScreen(current.role); done {
+				return buildProfiles(drafts, separate), nil
+			} else {
+				advance(next)
+			}
+
+		case wizardSplitPlanReview:
+			separate[config.RolePlanReviewer] = choice.ID == "yes"
+			if choice.ID == "yes" {
+				advance(wizardScreen{kind: wizardProvider, role: config.RolePlanReviewer})
+			} else {
+				advance(wizardScreen{kind: wizardSplitCodeReview})
+			}
+
+		case wizardSplitCodeReview:
+			separate[config.RoleCodeReviewer] = choice.ID == "yes"
+			if choice.ID == "yes" {
+				advance(wizardScreen{kind: wizardProvider, role: config.RoleCodeReviewer})
+			} else {
+				return buildProfiles(drafts, separate), nil
+			}
 		}
-		profiles[role] = profile
 	}
-	return profiles, nil
 }
 
-func (a *app) pickProfile(role string, cfg config.Config, cat *catalog.Catalog) (config.Profile, error) {
-	fmt.Fprintf(a.out, "\n%s provider\n", strings.ReplaceAll(role, "_", " "))
-	providerChoice, cancelled, err := picker.Pick(a.ctx, a.in, a.out, providerOptions(a.runnerRegistry().Names()))
-	fmt.Fprintln(a.out)
-	if err != nil {
-		return config.Profile{}, err
+func (a *app) inspectProviders(cfg config.Config, adapters map[string]runner.Adapter, adapterErrors map[string]error) map[string]providerReadiness {
+	result := map[string]providerReadiness{}
+	for _, name := range a.runnerRegistry().Names() {
+		result[name] = a.inspectProvider(name, cfg, adapters[name], adapterErrors[name])
 	}
-	if cancelled {
-		return config.Profile{}, usage("configuration cancelled")
+	return result
+}
+
+func (a *app) inspectProvider(name string, cfg config.Config, adapter runner.Adapter, adapterErr error) providerReadiness {
+	if adapter == nil {
+		return providerReadiness{status: "not installed", message: providerInstallMessage(name, adapterErr)}
 	}
-	runtime := workflow.RuntimeSnapshot(providerChoice.ID, cfg.Provider(providerChoice.ID))
-	models, err := cat.Models(a.ctx, providerChoice.ID, false, runner.ModelListRequest{Runtime: runtime})
-	if err != nil {
-		return config.Profile{}, action("MODEL_DISCOVERY_FAILED", err.Error())
-	}
-	fmt.Fprintf(a.out, "%s model\n", strings.ReplaceAll(role, "_", " "))
-	modelChoice, cancelled, err := picker.Pick(a.ctx, a.in, a.out, picker.ModelOptions(models))
-	fmt.Fprintln(a.out)
-	if err != nil || cancelled {
-		if err != nil {
-			return config.Profile{}, err
+	provider := cfg.Provider(name)
+	runtime := workflow.RuntimeSnapshot(name, provider)
+	if len(runtime.AuthEnvRefs) > 0 && !provider.RequiresOpenAIAuth {
+		missing := missingEnvironment(runtime.AuthEnvRefs, a.environ)
+		if len(missing) > 0 {
+			return providerReadiness{adapter: adapter, externalAuth: true, status: "credentials required", message: "Set required credential environment: " + strings.Join(missing, ", ")}
 		}
-		return config.Profile{}, usage("configuration cancelled")
+		return providerReadiness{adapter: adapter, authenticated: true, externalAuth: true, status: "configured credentials"}
 	}
-	var selected runner.ModelInfo
+	probeCtx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
+	auth, authErr := adapter.Auth(probeCtx)
+	cancel()
+	if authErr == nil && auth.Authenticated {
+		return providerReadiness{adapter: adapter, authenticated: true, status: "signed in"}
+	}
+	return providerReadiness{adapter: adapter, status: "login required", message: loginRequiredMessage(name, auth, authErr)}
+}
+
+func (a *app) loginProvider(name string, adapter runner.Adapter, root string, terminal *picker.Screen) error {
+	authenticator, ok := adapter.(runner.Authenticator)
+	if !ok {
+		return fmt.Errorf("%s adapter does not support interactive login; run %s", providerDisplayName(name), providerLoginCommand(name))
+	}
+	terminal.Leave()
+	fmt.Fprintf(a.out, "RoleMux: %s login required; starting `%s`.\n\n", providerDisplayName(name), providerLoginCommand(name))
+	err := authenticator.Login(a.ctx, runner.LoginRequest{RepoRoot: root, Stdin: a.in, Stdout: a.out, Stderr: a.errOut})
+	terminal.Enter()
+	return err
+}
+
+func wizardView(screen wizardScreen, canBack bool, notice string, drafts map[string]*profileDraft) picker.View {
+	view := picker.View{Title: "Configure RoleMux", CanBack: canBack, FullScreen: true}
+	role := roleDisplayName(screen.role)
+	switch screen.kind {
+	case wizardProvider:
+		view.Subtitle, view.Search = role+" · Select provider", true
+	case wizardModel:
+		view.Subtitle, view.Search = role+" · Select "+providerDisplayName(drafts[screen.role].provider)+" model", true
+	case wizardVerifyModel:
+		view.Subtitle = fmt.Sprintf("%s is not provider-verified. Select it anyway?", drafts[screen.role].model.ID)
+	case wizardEffort:
+		view.Subtitle = role + " · Select reasoning effort"
+	case wizardSplitPlanReview:
+		view.Subtitle = "Use a separate model for plan review?"
+	case wizardSplitCodeReview:
+		view.Subtitle = "Use a separate model for code review?"
+	}
+	if notice != "" {
+		view.Subtitle = notice
+	}
+	return view
+}
+
+func nextProfileScreen(role string) (wizardScreen, bool) {
+	switch role {
+	case config.RolePlanner:
+		return wizardScreen{kind: wizardProvider, role: config.RoleImplementer}, false
+	case config.RoleImplementer:
+		return wizardScreen{kind: wizardProvider, role: config.RoleReviewer}, false
+	case config.RoleReviewer:
+		return wizardScreen{kind: wizardSplitPlanReview}, false
+	case config.RolePlanReviewer:
+		return wizardScreen{kind: wizardSplitCodeReview}, false
+	case config.RoleCodeReviewer:
+		return wizardScreen{}, true
+	default:
+		return wizardScreen{}, true
+	}
+}
+
+func buildProfiles(drafts map[string]*profileDraft, separate map[string]bool) map[string]config.Profile {
+	result := map[string]config.Profile{}
+	for _, role := range []string{config.RolePlanner, config.RoleImplementer, config.RoleReviewer, config.RolePlanReviewer, config.RoleCodeReviewer} {
+		if (role == config.RolePlanReviewer || role == config.RoleCodeReviewer) && !separate[role] {
+			continue
+		}
+		draft := drafts[role]
+		if draft != nil {
+			result[role] = config.Profile{Provider: draft.provider, Model: draft.model.ID, Effort: draft.effort}
+		}
+	}
+	return result
+}
+
+func findModel(models []runner.ModelInfo, id string) runner.ModelInfo {
 	for _, model := range models {
-		if model.ID == modelChoice.ID {
-			selected = model
-			break
+		if model.ID == id {
+			return model
 		}
 	}
-	if warning := picker.UnknownAvailabilityWarning(selected); warning != "" {
-		ok, askErr := a.confirm(warning + ". Select it anyway?")
-		if askErr != nil {
-			return config.Profile{}, askErr
+	return runner.ModelInfo{ID: id}
+}
+
+func yesNoOptions(noLabel, yesLabel string) []picker.Option {
+	return []picker.Option{{ID: "no", Label: noLabel}, {ID: "yes", Label: yesLabel}}
+}
+
+func providerWizardOptions(names []string, readiness map[string]providerReadiness) []picker.Option {
+	options := make([]picker.Option, 0, len(names))
+	for _, name := range names {
+		label := providerDisplayName(name)
+		if status := readiness[name].status; status != "" {
+			label += " · " + status
 		}
-		if !ok {
-			return config.Profile{}, usage("configuration cancelled")
+		options = append(options, picker.Option{ID: name, Label: label})
+	}
+	return options
+}
+
+func providerDisplayName(name string) string {
+	labels := map[string]string{"codex": "Codex", "claude": "Claude Code", "copilot": "GitHub Copilot"}
+	if label := labels[name]; label != "" {
+		return label
+	}
+	return name
+}
+
+func roleDisplayName(role string) string {
+	label := strings.ReplaceAll(role, "_", " ")
+	if label == "" {
+		return "Review roles"
+	}
+	return strings.ToUpper(label[:1]) + label[1:]
+}
+
+func providerLoginCommand(name string) string {
+	if command := map[string]string{"codex": "codex login", "claude": "claude auth login", "copilot": "copilot login"}[name]; command != "" {
+		return command
+	}
+	return name + " login"
+}
+
+func loginRequiredMessage(name string, auth runner.AuthStatus, err error) string {
+	message := strings.TrimSpace(auth.Message)
+	if message == "" && err != nil {
+		message = err.Error()
+	}
+	if message == "" {
+		message = "authentication was not found"
+	}
+	return fmt.Sprintf("%s login required (%s); select it to run `%s`", providerDisplayName(name), message, providerLoginCommand(name))
+}
+
+func providerInstallMessage(name string, err error) string {
+	if name == "copilot" {
+		return "GitHub Copilot CLI is not installed; run `brew install copilot-cli`, then select it again"
+	}
+	message := providerDisplayName(name) + " CLI is not installed"
+	if err != nil {
+		message += ": " + err.Error()
+	}
+	return message
+}
+
+func missingEnvironment(names, environ []string) []string {
+	available := map[string]bool{}
+	for _, item := range environ {
+		name, value, ok := strings.Cut(item, "=")
+		if ok && value != "" {
+			available[name] = true
 		}
 	}
-	effort := ""
-	if len(selected.Efforts) > 0 {
-		fmt.Fprintf(a.out, "%s effort\n", strings.ReplaceAll(role, "_", " "))
-		effortChoice, cancelled, pickErr := picker.Pick(a.ctx, a.in, a.out, picker.EffortOptions(selected))
-		fmt.Fprintln(a.out)
-		if pickErr != nil {
-			return config.Profile{}, pickErr
+	missing := []string{}
+	for _, name := range names {
+		if !available[name] {
+			missing = append(missing, name)
 		}
-		if cancelled {
-			return config.Profile{}, usage("configuration cancelled")
-		}
-		effort = effortChoice.ID
 	}
-	return config.Profile{Provider: providerChoice.ID, Model: modelChoice.ID, Effort: effort}, nil
+	return missing
 }
 
 func (a *app) runPlan(args []string) int {
@@ -1084,19 +1402,6 @@ func (a *app) runnerRegistry() *runner.Registry {
 	return a.runners
 }
 
-func providerOptions(names []string) []picker.Option {
-	labels := map[string]string{"codex": "Codex", "claude": "Claude Code", "copilot": "GitHub Copilot"}
-	options := make([]picker.Option, 0, len(names))
-	for _, name := range names {
-		label := labels[name]
-		if label == "" {
-			label = name
-		}
-		options = append(options, picker.Option{ID: name, Label: label})
-	}
-	return options
-}
-
 func isInteractive(reader io.Reader) bool {
 	file, ok := reader.(*os.File)
 	if !ok {
@@ -1104,16 +1409,6 @@ func isInteractive(reader io.Reader) bool {
 	}
 	info, err := file.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
-}
-
-func (a *app) confirm(prompt string) (bool, error) {
-	fmt.Fprintf(a.out, "%s [y/N] ", prompt)
-	line, err := bufio.NewReader(a.in).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes", nil
 }
 
 type doctorCheck struct {

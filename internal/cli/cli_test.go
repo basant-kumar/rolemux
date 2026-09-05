@@ -4,15 +4,42 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/basant-kumar/rolemux/internal/config"
+	"github.com/basant-kumar/rolemux/internal/runner"
 	"github.com/basant-kumar/rolemux/internal/task"
 	"github.com/basant-kumar/rolemux/internal/workflow"
 )
+
+type loginAdapter struct {
+	authenticated bool
+	loginCalls    int
+	listRequests  []runner.ModelListRequest
+}
+
+func (f *loginAdapter) Run(context.Context, runner.Request, runner.Callbacks) (runner.Response, error) {
+	return runner.Response{}, nil
+}
+func (f *loginAdapter) ListModels(_ context.Context, req runner.ModelListRequest) (runner.ModelPage, error) {
+	f.listRequests = append(f.listRequests, req)
+	return runner.ModelPage{Models: []runner.ModelInfo{{ID: "model-1", Label: "Model 1", Availability: "available"}}}, nil
+}
+func (f *loginAdapter) Version(context.Context) (string, error) { return "1.0", nil }
+func (f *loginAdapter) Auth(context.Context) (runner.AuthStatus, error) {
+	return runner.AuthStatus{Authenticated: f.authenticated, Message: "not logged in"}, nil
+}
+func (f *loginAdapter) Login(context.Context, runner.LoginRequest) error {
+	f.loginCalls++
+	f.authenticated = true
+	return nil
+}
 
 func cliRepo(t *testing.T) string {
 	t.Helper()
@@ -112,6 +139,83 @@ func TestConfigureProjectDirectAndImport(t *testing.T) {
 	data, err := os.ReadFile(path)
 	if err != nil || !bytes.Contains(data, []byte("gpt-5.6-luna")) {
 		t.Fatalf("config=%s err=%v", data, err)
+	}
+}
+
+func TestInteractiveConfigurationLogsInThenUsesFreshModelsAcrossScreens(t *testing.T) {
+	root := cliRepo(t)
+	fake := &loginAdapter{}
+	registry := runner.NewRegistry()
+	if err := registry.Register("test", func(_, _ string) (runner.Adapter, string, error) {
+		return fake, "/bin/test", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	a := &app{
+		ctx: context.Background(), in: bytes.NewBufferString("\r\r\r\r\r\r\r\r"), out: &output, errOut: &output,
+		cwd: root, environ: []string{"HOME=" + t.TempDir(), "PATH=" + os.Getenv("PATH")}, runners: registry,
+	}
+	target, profiles, _, err := a.pickInteractiveConfiguration(root, true, false)
+	if err != nil {
+		t.Fatalf("%v; output=%q", err, output.Bytes())
+	}
+	if target == "" || len(profiles) != 3 || profiles[config.RolePlanner].Model != "model-1" || profiles[config.RoleImplementer].Provider != "test" || profiles[config.RoleReviewer].Model != "model-1" {
+		t.Fatalf("target=%q profiles=%#v", target, profiles)
+	}
+	if fake.loginCalls != 1 {
+		t.Fatalf("login calls=%d", fake.loginCalls)
+	}
+	if len(fake.listRequests) != 1 || !fake.listRequests[0].Refresh {
+		t.Fatalf("model requests=%#v", fake.listRequests)
+	}
+	if !bytes.Contains(output.Bytes(), []byte("login required")) || !bytes.Contains(output.Bytes(), []byte("\x1b[?1049l")) || !bytes.Contains(output.Bytes(), []byte("\x1b[?1049h")) {
+		t.Fatalf("login transition output=%q", output.Bytes())
+	}
+}
+
+func TestInteractiveConfigurationEscapeReturnsToPreviousScreen(t *testing.T) {
+	root := cliRepo(t)
+	fake := &loginAdapter{authenticated: true}
+	registry := runner.NewRegistry()
+	if err := registry.Register("test", func(_, _ string) (runner.Adapter, string, error) {
+		return fake, "/bin/test", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	a := &app{
+		ctx: ctx, in: bytes.NewBuffer([]byte{'\r', 0x1b, 0x03}), out: &output, errOut: &output,
+		cwd: root, environ: []string{"HOME=" + t.TempDir(), "PATH=" + os.Getenv("PATH")}, runners: registry,
+	}
+	_, _, _, err := a.pickInteractiveConfiguration(root, true, false)
+	if err == nil || !strings.Contains(err.Error(), "configuration cancelled") {
+		t.Fatalf("err=%v output=%q", err, output.Bytes())
+	}
+	if got := bytes.Count(output.Bytes(), []byte("Planner · Select provider")); got != 2 {
+		t.Fatalf("provider screen count=%d output=%q", got, output.Bytes())
+	}
+	if got := bytes.Count(output.Bytes(), []byte("Planner · Select test model")); got != 1 {
+		t.Fatalf("model screen count=%d output=%q", got, output.Bytes())
+	}
+}
+
+func TestProviderReadinessExplainsMissingCLIAndCredentials(t *testing.T) {
+	a := &app{ctx: context.Background(), environ: []string{"PRESENT=value"}}
+	missing := a.inspectProvider("copilot", config.Config{}, nil, errors.New("not found"))
+	if missing.status != "not installed" || !strings.Contains(missing.message, "brew install copilot-cli") {
+		t.Fatalf("missing=%#v", missing)
+	}
+	cfg := config.Config{Providers: map[string]config.Provider{"test": {APIKeyEnv: "MISSING"}}}
+	credentials := a.inspectProvider("test", cfg, &loginAdapter{}, nil)
+	if credentials.status != "credentials required" || credentials.authenticated || !credentials.externalAuth {
+		t.Fatalf("credentials=%#v", credentials)
+	}
+	options := providerWizardOptions([]string{"copilot"}, map[string]providerReadiness{"copilot": missing})
+	if len(options) != 1 || !strings.Contains(options[0].Label, "not installed") {
+		t.Fatalf("options=%#v", options)
 	}
 }
 

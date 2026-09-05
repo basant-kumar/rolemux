@@ -15,10 +15,11 @@ import (
 var claudeReadTools = []string{"Read", "Glob", "Grep", "WebSearch", "WebFetch"}
 
 type Claude struct {
-	Path    string
-	Process ProcessFunc
-	Env     []string
-	Custom  []ModelInfo
+	Path               string
+	Process            ProcessFunc
+	InteractiveProcess InteractiveProcessFunc
+	Env                []string
+	Custom             []ModelInfo
 }
 
 func NewClaude(path string) (*Claude, error) {
@@ -32,7 +33,7 @@ func NewClaude(path string) (*Claude, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Claude{Path: resolved, Process: RunProcess, Env: SanitizedEnv(os.Environ())}, nil
+	return &Claude{Path: resolved, Process: RunProcess, InteractiveProcess: RunInteractiveProcess, Env: SanitizedEnv(os.Environ())}, nil
 }
 
 func (c *Claude) Run(ctx context.Context, req Request, callbacks Callbacks) (Response, error) {
@@ -214,6 +215,17 @@ func (c *Claude) Auth(ctx context.Context) (AuthStatus, error) {
 	return AuthStatus{Version: v, Authenticated: true, Account: account}, nil
 }
 
+func (c *Claude) Login(ctx context.Context, req LoginRequest) error {
+	if c == nil || c.Path == "" {
+		return errors.New("claude executable is not configured")
+	}
+	run := c.InteractiveProcess
+	if run == nil {
+		run = RunInteractiveProcess
+	}
+	return run(ctx, c.Path, []string{"auth", "login"}, req.RepoRoot, c.Env, req.Stdin, req.Stdout, req.Stderr)
+}
+
 func (c *Claude) ListModels(context.Context, ModelListRequest) (ModelPage, error) {
 	models := []ModelInfo{
 		{ID: "claude-sonnet", Label: "Claude Sonnet", Provider: "claude", Origin: "local", Availability: "unknown", Aliases: []string{"sonnet"}},
@@ -226,3 +238,4 @@ func (c *Claude) ListModels(context.Context, ModelListRequest) (ModelPage, error
 }
 
 var _ Adapter = (*Claude)(nil)
+var _ Authenticator = (*Claude)(nil)

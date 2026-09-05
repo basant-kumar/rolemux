@@ -17,9 +17,10 @@ import (
 const CopilotSDKVersion = "v1.0.13-preview.4"
 
 type Copilot struct {
-	Path          string
-	BaseDirectory string
-	Env           []string
+	Path               string
+	BaseDirectory      string
+	InteractiveProcess InteractiveProcessFunc
+	Env                []string
 	// Discover is a deterministic seam for catalog tests. Production uses the
 	// pinned SDK's ListModels method.
 	Discover func(context.Context) ([]copilot.ModelInfo, error)
@@ -44,7 +45,7 @@ func NewCopilot(path string) (*Copilot, error) {
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return nil, err
 	}
-	return &Copilot{Path: resolved, BaseDirectory: base, Env: SanitizedEnv(os.Environ())}, nil
+	return &Copilot{Path: resolved, BaseDirectory: base, InteractiveProcess: RunInteractiveProcess, Env: SanitizedEnv(os.Environ())}, nil
 }
 
 func CopilotReadOnlyTools() []string {
@@ -372,6 +373,16 @@ func (c *Copilot) Auth(ctx context.Context) (AuthStatus, error) {
 	}
 	return AuthStatus{Authenticated: status.IsAuthenticated, Version: version, Message: deref(status.StatusMessage), Account: account}, nil
 }
+func (c *Copilot) Login(ctx context.Context, req LoginRequest) error {
+	if c == nil || c.Path == "" {
+		return errors.New("copilot executable is not configured")
+	}
+	run := c.InteractiveProcess
+	if run == nil {
+		run = RunInteractiveProcess
+	}
+	return run(ctx, c.Path, []string{"login"}, req.RepoRoot, c.Env, req.Stdin, req.Stdout, req.Stderr)
+}
 func deref(value *string) string {
 	if value == nil {
 		return ""
@@ -380,4 +391,5 @@ func deref(value *string) string {
 }
 
 var _ Adapter = (*Copilot)(nil)
+var _ Authenticator = (*Copilot)(nil)
 var _ = errors.Is

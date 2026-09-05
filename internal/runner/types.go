@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/basant-kumar/rolemux/internal/task"
@@ -172,6 +173,19 @@ type AuthStatus struct {
 	// Account is used only as an in-memory cache discriminator. Catalog cache
 	// files persist its hash, never the raw account identifier.
 	Account string `json:"-"`
+}
+
+type LoginRequest struct {
+	RepoRoot string
+	Stdin    io.Reader
+	Stdout   io.Writer
+	Stderr   io.Writer
+}
+
+// Authenticator is optional so third-party adapters can remain read-only.
+// Built-in CLI adapters implement it with their official interactive login.
+type Authenticator interface {
+	Login(context.Context, LoginRequest) error
 }
 
 type Adapter interface {

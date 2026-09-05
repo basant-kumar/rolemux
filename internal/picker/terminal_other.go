@@ -2,6 +2,16 @@
 
 package picker
 
-import "io"
+import (
+	"io"
+	"time"
+)
 
 func enterRawMode(io.Reader) (func(), error) { return func() {}, nil }
+
+func inputReady(reader io.Reader, _ time.Duration) (bool, error) {
+	if sized, ok := reader.(interface{ Len() int }); ok {
+		return sized.Len() > 0, nil
+	}
+	return true, nil
+}
