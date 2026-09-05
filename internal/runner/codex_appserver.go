@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/basant-kumar/rolemux/internal/task"
@@ -41,12 +43,20 @@ type codexModelListResult struct {
 		ID                        string `json:"id"`
 		Model                     string `json:"model"`
 		DisplayName               string `json:"displayName"`
+		Description               string `json:"description"`
 		DefaultReasoningEffort    string `json:"defaultReasoningEffort"`
 		SupportedReasoningEfforts []struct {
 			ReasoningEffort string `json:"reasoningEffort"`
+			Description     string `json:"description"`
 		} `json:"supportedReasoningEfforts"`
-		Hidden    bool `json:"hidden"`
-		IsDefault bool `json:"isDefault"`
+		ServiceTiers []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"serviceTiers"`
+		DefaultServiceTier string `json:"defaultServiceTier"`
+		Hidden             bool   `json:"hidden"`
+		IsDefault          bool   `json:"isDefault"`
 	} `json:"data"`
 	NextCursor *string `json:"nextCursor"`
 }
@@ -195,14 +205,22 @@ func (c *Codex) listModelsAppServer(ctx context.Context, runtime task.RuntimeSna
 			if model.Hidden {
 				continue
 			}
-			info := ModelInfo{ID: model.ID, Label: model.DisplayName, Provider: "codex", Origin: "live", Availability: "available", Efforts: make([]string, 0, len(model.SupportedReasoningEfforts))}
+			info := ModelInfo{ID: model.ID, Label: model.DisplayName, Description: model.Description, Provider: "codex", Origin: "live", Availability: "available", IsDefault: model.IsDefault, Efforts: make([]string, 0, len(model.SupportedReasoningEfforts))}
 			if info.ID == "" {
 				info.ID = model.Model
 			}
 			for _, effort := range model.SupportedReasoningEfforts {
 				info.Efforts = append(info.Efforts, effort.ReasoningEffort)
+				info.EffortOptions = append(info.EffortOptions, ModelOption{ID: effort.ReasoningEffort, Label: effort.ReasoningEffort, Description: effort.Description})
 			}
 			info.DefaultEffort = model.DefaultReasoningEffort
+			for _, tier := range model.ServiceTiers {
+				info.SpeedOptions = append(info.SpeedOptions, ModelOption{ID: tier.ID, Label: tier.Name, Description: tier.Description})
+			}
+			info.DefaultSpeed = model.DefaultServiceTier
+			if len(info.SpeedOptions) > 0 && info.DefaultSpeed == "" {
+				info.DefaultSpeed = "standard"
+			}
 			all = append(all, info)
 		}
 		if page.NextCursor == nil || *page.NextCursor == "" {
@@ -221,7 +239,82 @@ func (c *Codex) listModelsAppServer(ctx context.Context, runtime task.RuntimeSna
 	if waitErr != nil {
 		return ModelPage{Account: account, Endpoint: endpoint}, waitErr
 	}
+	enrichCodexModelsFromCache(all, env)
 	return ModelPage{Models: all, Account: account, Endpoint: endpoint}, nil
+}
+
+func enrichCodexModelsFromCache(models []ModelInfo, env []string) {
+	type cachedModel struct {
+		Slug                    string `json:"slug"`
+		Description             string `json:"description"`
+		ContextWindow           int    `json:"context_window"`
+		MaxContextWindow        int    `json:"max_context_window"`
+		DefaultReasoningEffort  string `json:"default_reasoning_level"`
+		SupportedReasoningLevel []struct {
+			Effort      string `json:"effort"`
+			Description string `json:"description"`
+		} `json:"supported_reasoning_levels"`
+		ServiceTiers []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"service_tiers"`
+		DefaultServiceTier string `json:"default_service_tier"`
+	}
+	var cache struct {
+		Models []cachedModel `json:"models"`
+	}
+	values := map[string]string{}
+	for _, item := range env {
+		if key, value, ok := strings.Cut(item, "="); ok {
+			values[key] = value
+		}
+	}
+	root := values["CODEX_HOME"]
+	if root == "" && values["HOME"] != "" {
+		root = filepath.Join(values["HOME"], ".codex")
+	}
+	if root == "" {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(root, "models_cache.json"))
+	if err != nil || json.Unmarshal(data, &cache) != nil {
+		return
+	}
+	byID := make(map[string]cachedModel, len(cache.Models))
+	for _, model := range cache.Models {
+		byID[model.Slug] = model
+	}
+	for i := range models {
+		cached, ok := byID[models[i].ID]
+		if !ok {
+			continue
+		}
+		models[i].ContextWindowTokens = cached.ContextWindow
+		models[i].MaxContextWindowTokens = cached.MaxContextWindow
+		if models[i].Description == "" {
+			models[i].Description = cached.Description
+		}
+		if models[i].DefaultEffort == "" {
+			models[i].DefaultEffort = cached.DefaultReasoningEffort
+		}
+		if len(models[i].EffortOptions) == 0 {
+			for _, effort := range cached.SupportedReasoningLevel {
+				models[i].EffortOptions = append(models[i].EffortOptions, ModelOption{ID: effort.Effort, Label: effort.Effort, Description: effort.Description})
+			}
+		}
+		if len(models[i].SpeedOptions) == 0 {
+			for _, tier := range cached.ServiceTiers {
+				models[i].SpeedOptions = append(models[i].SpeedOptions, ModelOption{ID: tier.ID, Label: tier.Name, Description: tier.Description})
+			}
+		}
+		if models[i].DefaultSpeed == "" {
+			models[i].DefaultSpeed = cached.DefaultServiceTier
+			if len(models[i].SpeedOptions) > 0 && models[i].DefaultSpeed == "" {
+				models[i].DefaultSpeed = "standard"
+			}
+		}
+	}
 }
 
 func extractAccount(raw json.RawMessage) string {
@@ -243,5 +336,3 @@ func extractAccount(raw json.RawMessage) string {
 	}
 	return ""
 }
-
-var _ = strings.TrimSpace

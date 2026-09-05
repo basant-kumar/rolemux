@@ -3,6 +3,7 @@ package picker
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +77,26 @@ func TestSelectDistinguishesBackCancelAndConfirmationShortcut(t *testing.T) {
 	}
 }
 
+func TestSelectStartsOnConfiguredOption(t *testing.T) {
+	options := []Option{{ID: "one"}, {ID: "two"}}
+	choice, action, err := Select(context.Background(), bytes.NewBufferString("\r"), &bytes.Buffer{}, options, View{InitialID: "two"})
+	if err != nil || action != ActionSelected || choice.ID != "two" {
+		t.Fatalf("choice=%#v action=%v err=%v", choice, action, err)
+	}
+}
+
+func TestWrapLinesAccountsForTerminalRows(t *testing.T) {
+	wrapped := wrapLines([]string{"    a provider description that is deliberately long"}, 24)
+	if len(wrapped) < 2 {
+		t.Fatalf("description did not wrap: %#v", wrapped)
+	}
+	for _, line := range wrapped {
+		if len([]rune(line)) >= 24 || !strings.HasPrefix(line, "    ") {
+			t.Fatalf("bad wrapped line %q", line)
+		}
+	}
+}
+
 func TestAlternateScreenEnterLeaveIsIdempotent(t *testing.T) {
 	var output bytes.Buffer
 	screen := NewScreen(&output)
@@ -92,13 +113,21 @@ func TestAlternateScreenEnterLeaveIsIdempotent(t *testing.T) {
 }
 
 func TestModelAndEffortOptionsExposeUnknowns(t *testing.T) {
-	model := runner.ModelInfo{ID: "gpt-test", Availability: "unknown", Efforts: []string{"low", "max"}, DefaultEffort: "max"}
+	model := runner.ModelInfo{ID: "gpt-test", Label: "GPT Test", Description: "Live details", Availability: "unknown", ContextWindowTokens: 272000, MaxContextWindowTokens: 872000, Efforts: []string{"low", "max"}, EffortOptions: []runner.ModelOption{{ID: "low", Description: "Quick"}, {ID: "max", Description: "Deep"}}, DefaultEffort: "max", SpeedOptions: []runner.ModelOption{{ID: "priority", Label: "Fast", Description: "2x speed"}}}
 	if warning := UnknownAvailabilityWarning(model); warning == "" {
 		t.Fatal("unknown model had no warning")
 	}
 	efforts := EffortOptions(model)
 	if len(efforts) != 2 || efforts[1].ID != "max" {
 		t.Fatalf("efforts=%#v", efforts)
+	}
+	models := ModelOptions([]runner.ModelInfo{model})
+	if !strings.Contains(models[0].Meta, "272K context") || !strings.Contains(models[0].Meta, "872K max") || models[0].Description != "Live details" {
+		t.Fatalf("model options=%#v", models)
+	}
+	speeds := SpeedOptions(model)
+	if len(speeds) != 2 || speeds[0].ID != "standard" || speeds[1].ID != "priority" {
+		t.Fatalf("speed options=%#v", speeds)
 	}
 	unknown := EffortOptions(runner.ModelInfo{ID: "unknown"})
 	if len(unknown) != 1 || unknown[0].ID != "" {

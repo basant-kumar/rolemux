@@ -32,7 +32,7 @@ Usage:
   rolemux models [--refresh] [--runner codex|claude|copilot] [--json]
   rolemux configure [--global|--project] [--from PATH|-]
                     [--role planner|implementer|reviewer|plan-reviewer|code-reviewer]
-                    [--runner PROVIDER] [--model MODEL] [--effort EFFORT] [--json]
+                    [--runner PROVIDER] [--model MODEL] [--effort EFFORT] [--speed SPEED] [--json]
   rolemux plan start --task TEXT [--id TASK-ID] [--json]
   rolemux plan answer TASK-ID --answer TEXT [--json]
   rolemux plan review TASK-ID [--json]
@@ -196,7 +196,7 @@ func (a *app) runModels(args []string) int {
 func (a *app) runConfigure(args []string) int {
 	opts, err := parse(args, map[string]bool{
 		"--json": false, "--global": false, "--project": false, "--from": true,
-		"--role": true, "--runner": true, "--model": true, "--effort": true,
+		"--role": true, "--runner": true, "--model": true, "--effort": true, "--speed": true,
 	})
 	if err != nil || len(opts.positionals) != 0 {
 		if err == nil {
@@ -207,7 +207,7 @@ func (a *app) runConfigure(args []string) int {
 	if opts.bool("--global") && opts.bool("--project") {
 		return a.fail("configure", usage("--global and --project are mutually exclusive"), opts.json(), workflow.Result{})
 	}
-	direct := opts.present("--role") || opts.present("--runner") || opts.present("--model") || opts.present("--effort")
+	direct := opts.present("--role") || opts.present("--runner") || opts.present("--model") || opts.present("--effort") || opts.present("--speed")
 	from := opts.present("--from")
 	if from && direct {
 		return a.fail("configure", usage("--from is mutually exclusive with role selection flags"), opts.json(), workflow.Result{})
@@ -259,7 +259,7 @@ func (a *app) runConfigure(args []string) int {
 			}
 			return a.fail("configure", roleErr, opts.json(), workflow.Result{})
 		}
-		profile := config.Profile{Provider: strings.ToLower(opts.value("--runner")), Model: opts.value("--model"), Effort: opts.value("--effort")}
+		profile := config.Profile{Provider: strings.ToLower(opts.value("--runner")), Model: opts.value("--model"), Effort: opts.value("--effort"), Speed: opts.value("--speed")}
 		if err := config.ConfigureProfile(target, role, profile, before); err != nil {
 			return a.fail("configure", configProblem(err), opts.json(), workflow.Result{})
 		}
@@ -316,6 +316,7 @@ const (
 	wizardModel
 	wizardVerifyModel
 	wizardEffort
+	wizardSpeed
 	wizardSplitPlanReview
 	wizardSplitCodeReview
 )
@@ -330,6 +331,7 @@ type profileDraft struct {
 	models   []runner.ModelInfo
 	model    runner.ModelInfo
 	effort   string
+	speed    string
 }
 
 type providerReadiness struct {
@@ -372,6 +374,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 
 	for {
 		view := wizardView(current, len(history) > 0, notice, drafts)
+		view.InitialID = wizardInitialID(current, cfg, drafts)
 		var options []picker.Option
 		switch current.kind {
 		case wizardProvider:
@@ -384,6 +387,8 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			options = yesNoOptions("No, use shared reviewer", "Yes, configure separately")
 		case wizardEffort:
 			options = picker.EffortOptions(drafts[current.role].model)
+		case wizardSpeed:
+			options = picker.SpeedOptions(drafts[current.role].model)
 		}
 		choice, pickAction, pickErr := picker.Select(a.ctx, a.in, a.out, options, view)
 		if pickErr != nil {
@@ -460,11 +465,13 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 
 		case wizardModel:
 			draft := drafts[current.role]
-			draft.model, draft.effort = findModel(draft.models, choice.ID), ""
+			draft.model, draft.effort, draft.speed = findModel(draft.models, choice.ID), "", ""
 			if picker.UnknownAvailabilityWarning(draft.model) != "" {
 				advance(wizardScreen{kind: wizardVerifyModel, role: current.role})
 			} else if len(draft.model.Efforts) > 0 {
 				advance(wizardScreen{kind: wizardEffort, role: current.role})
+			} else if len(draft.model.SpeedOptions) > 0 {
+				advance(wizardScreen{kind: wizardSpeed, role: current.role})
 			} else if next, done := nextProfileScreen(current.role); done {
 				return buildProfiles(drafts, separate), nil
 			} else {
@@ -479,6 +486,8 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			draft := drafts[current.role]
 			if len(draft.model.Efforts) > 0 {
 				advance(wizardScreen{kind: wizardEffort, role: current.role})
+			} else if len(draft.model.SpeedOptions) > 0 {
+				advance(wizardScreen{kind: wizardSpeed, role: current.role})
 			} else if next, done := nextProfileScreen(current.role); done {
 				return buildProfiles(drafts, separate), nil
 			} else {
@@ -487,6 +496,16 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 
 		case wizardEffort:
 			drafts[current.role].effort = choice.ID
+			if len(drafts[current.role].model.SpeedOptions) > 0 {
+				advance(wizardScreen{kind: wizardSpeed, role: current.role})
+			} else if next, done := nextProfileScreen(current.role); done {
+				return buildProfiles(drafts, separate), nil
+			} else {
+				advance(next)
+			}
+
+		case wizardSpeed:
+			drafts[current.role].speed = choice.ID
 			if next, done := nextProfileScreen(current.role); done {
 				return buildProfiles(drafts, separate), nil
 			} else {
@@ -510,6 +529,81 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			}
 		}
 	}
+}
+
+func wizardInitialID(screen wizardScreen, cfg config.Config, drafts map[string]*profileDraft) string {
+	draft := drafts[screen.role]
+	profile := cfg.Profiles[screen.role]
+	if profile.Provider == "" && (screen.role == config.RolePlanReviewer || screen.role == config.RoleCodeReviewer) {
+		profile = cfg.Profiles[config.RoleReviewer]
+	}
+	switch screen.kind {
+	case wizardProvider:
+		if draft != nil && draft.provider != "" {
+			return draft.provider
+		}
+		return profile.Provider
+	case wizardModel:
+		if draft == nil {
+			return ""
+		}
+		if draft.model.ID != "" {
+			return draft.model.ID
+		}
+		if profile.Provider == draft.provider && profile.Model != "" {
+			for _, model := range draft.models {
+				if modelSelectorMatches(model, profile.Model) {
+					return model.ID
+				}
+			}
+		}
+		for _, model := range draft.models {
+			if model.IsDefault {
+				return model.ID
+			}
+		}
+	case wizardEffort:
+		if draft == nil {
+			return ""
+		}
+		if draft.effort != "" {
+			return draft.effort
+		}
+		if profile.Provider == draft.provider && modelSelectorMatches(draft.model, profile.Model) && profile.Effort != "" {
+			return profile.Effort
+		}
+		return draft.model.DefaultEffort
+	case wizardSpeed:
+		if draft == nil {
+			return ""
+		}
+		if draft.speed != "" {
+			return draft.speed
+		}
+		if profile.Provider == draft.provider && modelSelectorMatches(draft.model, profile.Model) && profile.Speed != "" {
+			return profile.Speed
+		}
+		if draft.model.DefaultSpeed != "" {
+			return draft.model.DefaultSpeed
+		}
+		return "standard"
+	}
+	return ""
+}
+
+func modelSelectorMatches(model runner.ModelInfo, selector string) bool {
+	if selector == "" {
+		return false
+	}
+	if model.ID == selector {
+		return true
+	}
+	for _, alias := range model.Aliases {
+		if alias == selector {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *app) inspectProviders(cfg config.Config, adapters map[string]runner.Adapter, adapterErrors map[string]error) map[string]providerReadiness {
@@ -565,7 +659,9 @@ func wizardView(screen wizardScreen, canBack bool, notice string, drafts map[str
 	case wizardVerifyModel:
 		view.Subtitle = fmt.Sprintf("%s is not provider-verified. Select it anyway?", drafts[screen.role].model.ID)
 	case wizardEffort:
-		view.Subtitle = role + " · Select reasoning effort"
+		view.Subtitle = role + " · Select reasoning effort for " + drafts[screen.role].model.Label
+	case wizardSpeed:
+		view.Subtitle = role + " · Select speed for " + drafts[screen.role].model.Label
 	case wizardSplitPlanReview:
 		view.Subtitle = "Use a separate model for plan review?"
 	case wizardSplitCodeReview:
@@ -602,7 +698,7 @@ func buildProfiles(drafts map[string]*profileDraft, separate map[string]bool) ma
 		}
 		draft := drafts[role]
 		if draft != nil {
-			result[role] = config.Profile{Provider: draft.provider, Model: draft.model.ID, Effort: draft.effort}
+			result[role] = config.Profile{Provider: draft.provider, Model: draft.model.ID, Effort: draft.effort, Speed: draft.speed}
 		}
 	}
 	return result
@@ -1149,6 +1245,7 @@ type roleUsage struct {
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
 	Effort   string `json:"effort,omitempty"`
+	Speed    string `json:"speed,omitempty"`
 	usageNumbers
 }
 
@@ -1172,7 +1269,7 @@ func summarizeUsage(st task.State) usageSummary {
 		u := st.Usage[role]
 		profile := st.ProfilesSnapshot[role]
 		summary.Roles = append(summary.Roles, roleUsage{
-			Role: role, Provider: profile.Provider, Model: profile.Model, Effort: profile.Effort,
+			Role: role, Provider: profile.Provider, Model: profile.Model, Effort: profile.Effort, Speed: profile.Speed,
 			usageNumbers: usageNumbersFor(u),
 		})
 		totals.Add(u)
@@ -1323,6 +1420,9 @@ func printUsage(out io.Writer, summary usageSummary) {
 		}
 		if role.Effort != "" {
 			profile += " (" + role.Effort + ")"
+		}
+		if role.Speed != "" {
+			profile += " [" + role.Speed + "]"
 		}
 		fmt.Fprintf(out, "%s [%s]: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d\n",
 			role.Role, profile, role.Requests, role.InputTokens, role.CachedInputTokens,

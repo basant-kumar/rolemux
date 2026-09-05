@@ -621,7 +621,7 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 	if role == runner.RoleImplementer {
 		sandbox = "workspace-write"
 	}
-	request := runner.Request{Role: role, Operation: st.InFlight.Operation, Prompt: st.InFlight.Prompt, Model: profile.Model, Effort: profile.Effort, RepoRoot: s.RepoRoot, Scope: st.InFlight.Scope, SessionID: st.InFlight.SessionID, Resume: st.InFlight.KnownSession && st.InFlight.SessionID != "", Runtime: st.RuntimeSnapshot[string(role)], Sandbox: sandbox}
+	request := runner.Request{Role: role, Operation: st.InFlight.Operation, Prompt: st.InFlight.Prompt, Model: profile.Model, Effort: profile.Effort, Speed: profile.Speed, RepoRoot: s.RepoRoot, Scope: st.InFlight.Scope, SessionID: st.InFlight.SessionID, Resume: st.InFlight.KnownSession && st.InFlight.SessionID != "", Runtime: st.RuntimeSnapshot[string(role)], Sandbox: sandbox}
 	resp, callErr := adapter.Run(ctx, request, runner.Callbacks{SessionStarted: func(session string) error {
 		if strings.TrimSpace(session) == "" {
 			return runner.ErrMissingSession
@@ -709,7 +709,7 @@ func (s *Service) snapshots() (map[string]task.ProfileSnapshot, map[string]task.
 		if err := config.ValidateProfile(p); err != nil {
 			return nil, nil, fmt.Errorf("profile %s: %w", role, err)
 		}
-		profiles[role] = task.ProfileSnapshot{Provider: p.Provider, Model: p.Model, Effort: p.Effort}
+		profiles[role] = task.ProfileSnapshot{Provider: p.Provider, Model: p.Model, Effort: p.Effort, Speed: p.Speed}
 		runtimes[role] = RuntimeSnapshot(p.Provider, providerConfig)
 	}
 	return profiles, runtimes, nil

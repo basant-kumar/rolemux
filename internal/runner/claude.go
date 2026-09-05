@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -101,12 +103,20 @@ func BuildClaudeArgs(req Request) ([]string, error) {
 	if req.Resume && req.SessionID == "" {
 		return nil, errors.New("claude resume session is required")
 	}
+	if req.Speed != "" && req.Speed != "standard" && req.Speed != "fast" {
+		return nil, fmt.Errorf("unsupported Claude speed %q", req.Speed)
+	}
 	tools := append([]string(nil), claudeReadTools...)
 	if req.Role == RoleImplementer {
 		tools = append(tools, "Edit", "Write")
 	}
 	toolList := strings.Join(tools, ",")
 	args := []string{"--print", "--output-format", "json", "--input-format", "text", "--safe-mode", "--restricted", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--tools", toolList, "--allowed-tools", toolList, "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`}
+	if req.Speed == "fast" {
+		args = append(args, "--settings", `{"fastMode":true}`)
+	} else if req.Speed == "standard" {
+		args = append(args, "--settings", `{"fastMode":false}`)
+	}
 	if req.Resume {
 		args = append(args, "--resume", req.SessionID)
 	} else {
@@ -226,15 +236,130 @@ func (c *Claude) Login(ctx context.Context, req LoginRequest) error {
 	return run(ctx, c.Path, []string{"auth", "login"}, req.RepoRoot, c.Env, req.Stdin, req.Stdout, req.Stderr)
 }
 
-func (c *Claude) ListModels(context.Context, ModelListRequest) (ModelPage, error) {
-	models := []ModelInfo{
-		{ID: "claude-sonnet", Label: "Claude Sonnet", Provider: "claude", Origin: "local", Availability: "unknown", Aliases: []string{"sonnet"}},
-		{ID: "claude-opus", Label: "Claude Opus", Provider: "claude", Origin: "local", Availability: "unknown", Aliases: []string{"opus"}},
-		{ID: "claude-haiku", Label: "Claude Haiku", Provider: "claude", Origin: "local", Availability: "unknown", Aliases: []string{"haiku"}},
-		{ID: "claude-fable-5", Label: "Claude Fable 5", Provider: "claude", Origin: "custom", Availability: "unknown", Aliases: []string{"fable"}},
+func (c *Claude) ListModels(ctx context.Context, req ModelListRequest) (ModelPage, error) {
+	if c == nil || c.Path == "" || c.Process == nil {
+		return ModelPage{}, providerError("CLAUDE_UNAVAILABLE", "claude executable is not configured", false, false, "", nil)
 	}
-	models = append(models, c.Custom...)
-	return ModelPage{Models: models}, nil
+	path, err := executableForRequest(c.Path, req.Runtime.CLIPath)
+	if err != nil {
+		return ModelPage{}, providerError("CLAUDE_UNAVAILABLE", err.Error(), false, false, "", err)
+	}
+	env, err := runtimeEnvironmentMapped(c.Env, req.Runtime.AuthEnvRefs, stringMapSetting(req.Runtime.SDKSettings, "env_map"), "ANTHROPIC_BASE_URL", req.Runtime.Endpoint)
+	if err != nil {
+		return ModelPage{}, providerError("CLAUDE_AUTH", err.Error(), false, false, "", err)
+	}
+	args := []string{"--output-format", "stream-json", "--verbose", "--input-format", "stream-json", "--safe-mode", "--restricted", "--permission-mode", "plan", "--permission-prompts", "none", "--tools", "", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`, "--setting-sources", "", "--no-session-persistence"}
+	input := `{"type":"control_request","request_id":"rolemux-models","request":{"subtype":"initialize"}}` + "\n"
+	discoveryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	result, runErr := c.Process(discoveryCtx, ProcessSpec{Path: path, Args: args, Dir: ".", Env: env, Stdin: input, MaxOutputBytes: 8 << 20})
+	if runErr != nil {
+		return ModelPage{}, providerProcessError("claude", runErr, false, "")
+	}
+	page, parseErr := parseClaudeModelHandshake(result.Stdout)
+	if parseErr != nil {
+		return ModelPage{}, providerError("CLAUDE_MODEL_DISCOVERY", parseErr.Error(), false, false, "", parseErr)
+	}
+	page.Models = append(page.Models, c.Custom...)
+	page.Endpoint = req.Runtime.Endpoint
+	return page, nil
+}
+
+func parseClaudeModelHandshake(data []byte) (ModelPage, error) {
+	type model struct {
+		Value                 string   `json:"value"`
+		ResolvedModel         string   `json:"resolvedModel"`
+		DisplayName           string   `json:"displayName"`
+		Description           string   `json:"description"`
+		SupportsEffort        bool     `json:"supportsEffort"`
+		SupportedEffortLevels []string `json:"supportedEffortLevels"`
+		SupportsFastMode      bool     `json:"supportsFastMode"`
+	}
+	type payload struct {
+		Models  []model `json:"models"`
+		Account struct {
+			Email        string `json:"email"`
+			Organization string `json:"organization"`
+		} `json:"account"`
+	}
+	type frame struct {
+		Type     string `json:"type"`
+		Response struct {
+			Subtype   string  `json:"subtype"`
+			RequestID string  `json:"request_id"`
+			Response  payload `json:"response"`
+			Error     string  `json:"error"`
+		} `json:"response"`
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var message frame
+		if json.Unmarshal([]byte(line), &message) != nil || message.Type != "control_response" || message.Response.RequestID != "rolemux-models" {
+			continue
+		}
+		if message.Response.Subtype != "success" {
+			return ModelPage{}, fmt.Errorf("Claude model handshake failed: %s", message.Response.Error)
+		}
+		models := make([]ModelInfo, 0, len(message.Response.Response.Models))
+		for _, item := range message.Response.Response.Models {
+			if item.Value == "" {
+				continue
+			}
+			info := ModelInfo{ID: item.Value, Label: item.DisplayName, Description: item.Description, Provider: "claude", Origin: "live", Availability: "available", IsDefault: item.Value == "default"}
+			if item.SupportsEffort {
+				info.Efforts = append([]string(nil), item.SupportedEffortLevels...)
+				for _, effort := range item.SupportedEffortLevels {
+					info.EffortOptions = append(info.EffortOptions, ModelOption{ID: effort, Label: effort})
+				}
+			}
+			if item.SupportsFastMode {
+				info.SpeedOptions = []ModelOption{{ID: "fast", Label: "Fast", Description: "Provider fast mode; lower latency with higher usage"}}
+				info.DefaultSpeed = "standard"
+			}
+			info.ContextWindowTokens = contextWindowFromModelValue(item.Value)
+			if item.ResolvedModel != "" && item.ResolvedModel != item.Value {
+				info.Aliases = []string{item.ResolvedModel}
+			}
+			models = append(models, info)
+		}
+		if len(models) == 0 {
+			return ModelPage{}, errors.New("Claude model handshake returned no models")
+		}
+		account := message.Response.Response.Account.Email
+		if account == "" {
+			account = message.Response.Response.Account.Organization
+		}
+		return ModelPage{Models: models, Account: account}, nil
+	}
+	return ModelPage{}, errors.New("Claude model handshake returned no matching response")
+}
+
+func contextWindowFromModelValue(value string) int {
+	value = strings.ToLower(strings.TrimSpace(value))
+	start := strings.LastIndexByte(value, '[')
+	if start < 0 || !strings.HasSuffix(value, "]") {
+		return 0
+	}
+	amount := strings.TrimSuffix(value[start+1:], "]")
+	if len(amount) < 2 {
+		return 0
+	}
+	multiplier := 0
+	switch amount[len(amount)-1] {
+	case 'k':
+		multiplier = 1_000
+	case 'm':
+		multiplier = 1_000_000
+	default:
+		return 0
+	}
+	number, err := strconv.Atoi(amount[:len(amount)-1])
+	if err != nil || number <= 0 {
+		return 0
+	}
+	return number * multiplier
 }
 
 var _ Adapter = (*Claude)(nil)

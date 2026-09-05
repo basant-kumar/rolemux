@@ -31,6 +31,7 @@ type Request struct {
 	Prompt    string
 	Model     string
 	Effort    string
+	Speed     string
 	RepoRoot  string
 	Scope     string
 	SessionID string
@@ -40,6 +41,14 @@ type Request struct {
 
 	// MaxOutputBytes is a hard process-output bound. Zero uses a safe default.
 	MaxOutputBytes int64
+}
+
+// ModelOption is a provider-advertised setting value. Descriptions are kept
+// optional because not every CLI exposes them.
+type ModelOption struct {
+	ID          string `json:"id"`
+	Label       string `json:"label,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type Callbacks struct {
@@ -141,17 +150,26 @@ func usageFromJSONLines(data []byte, inputIncludesCache bool) TokenUsage {
 }
 
 type ModelInfo struct {
-	ID            string   `json:"id"`
-	Label         string   `json:"label,omitempty"`
-	Provider      string   `json:"provider"`
-	Origin        string   `json:"origin"`
-	Availability  string   `json:"availability"`
-	AgeSeconds    int64    `json:"age_seconds,omitempty"`
-	Efforts       []string `json:"efforts,omitempty"`
-	DefaultEffort string   `json:"default_effort,omitempty"`
-	Aliases       []string `json:"aliases,omitempty"`
-	Custom        bool     `json:"custom"`
-	Account       string   `json:"-"`
+	ID                     string        `json:"id"`
+	Label                  string        `json:"label,omitempty"`
+	Description            string        `json:"description,omitempty"`
+	Provider               string        `json:"provider"`
+	Origin                 string        `json:"origin"`
+	Availability           string        `json:"availability"`
+	AgeSeconds             int64         `json:"age_seconds,omitempty"`
+	ContextWindowTokens    int           `json:"context_window_tokens,omitempty"`
+	MaxContextWindowTokens int           `json:"max_context_window_tokens,omitempty"`
+	MaxPromptTokens        int           `json:"max_prompt_tokens,omitempty"`
+	MaxOutputTokens        int           `json:"max_output_tokens,omitempty"`
+	IsDefault              bool          `json:"is_default,omitempty"`
+	Efforts                []string      `json:"efforts,omitempty"`
+	EffortOptions          []ModelOption `json:"effort_options,omitempty"`
+	DefaultEffort          string        `json:"default_effort,omitempty"`
+	SpeedOptions           []ModelOption `json:"speed_options,omitempty"`
+	DefaultSpeed           string        `json:"default_speed,omitempty"`
+	Aliases                []string      `json:"aliases,omitempty"`
+	Custom                 bool          `json:"custom"`
+	Account                string        `json:"-"`
 }
 
 type ModelListRequest struct {

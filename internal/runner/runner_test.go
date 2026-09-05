@@ -12,15 +12,16 @@ import (
 	"testing"
 
 	"github.com/basant-kumar/rolemux/internal/task"
+	copilotsdk "github.com/github/copilot-sdk/go"
 )
 
 func TestCodexArgumentPlacementFreshAndResume(t *testing.T) {
-	req := Request{RepoRoot: "/repo", Sandbox: "workspace-write", Model: "gpt-5.6-luna", Effort: "max"}
+	req := Request{RepoRoot: "/repo", Sandbox: "workspace-write", Model: "gpt-5.6-luna", Effort: "max", Speed: "priority"}
 	got, err := BuildCodexArgs(req, "/schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "-"}
+	want := []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "--config", "service_tier=priority", "-"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("fresh args\n got: %#v\nwant: %#v", got, want)
 	}
@@ -29,7 +30,7 @@ func TestCodexArgumentPlacementFreshAndResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "resume", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "thread-123", "-"}
+	want = []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "resume", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "--config", "service_tier=priority", "thread-123", "-"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("resume args\n got: %#v\nwant: %#v", got, want)
 	}
@@ -80,13 +81,13 @@ func TestCodexOutputRequiresThreadAndStrictEnvelope(t *testing.T) {
 }
 
 func TestClaudeArgumentsAndNestedResultAreStrict(t *testing.T) {
-	req := Request{Role: RoleImplementer, RepoRoot: "/repo", Model: "claude-fable-5", Effort: "max", SessionID: "123e4567-e89b-12d3-a456-426614174000"}
+	req := Request{Role: RoleImplementer, RepoRoot: "/repo", Model: "claude-fable-5", Effort: "max", Speed: "fast", SessionID: "123e4567-e89b-12d3-a456-426614174000"}
 	args, err := BuildClaudeArgs(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, " ")
-	for _, required := range []string{"--safe-mode", "--restricted", "--permission-mode dontAsk", "--permission-prompts none", "Read,Glob,Grep,WebSearch,WebFetch,Edit,Write", "--strict-mcp-config", "--session-id " + req.SessionID, "--model claude-fable-5", "--effort max"} {
+	for _, required := range []string{"--safe-mode", "--restricted", "--permission-mode dontAsk", "--permission-prompts none", "Read,Glob,Grep,WebSearch,WebFetch,Edit,Write", "--strict-mcp-config", `--settings {"fastMode":true}`, "--session-id " + req.SessionID, "--model claude-fable-5", "--effort max"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("missing %q in %s", required, joined)
 		}
@@ -104,6 +105,60 @@ func TestClaudeArgumentsAndNestedResultAreStrict(t *testing.T) {
 	outer = append(outer, []byte(` {}`)...)
 	if _, _, _, _, err := parseClaudeResult(outer, req.SessionID, RoleImplementer); err == nil {
 		t.Fatal("multiple outer JSON values were accepted")
+	}
+}
+
+func TestClaudeModelHandshakeUsesProviderMetadata(t *testing.T) {
+	line := `{"type":"control_response","response":{"subtype":"success","request_id":"rolemux-models","response":{"models":[{"value":"current[1m]","resolvedModel":"claude-current","displayName":"Current","description":"Live description","supportsEffort":true,"supportedEffortLevels":["low","max"],"supportsFastMode":true}],"account":{"email":"user@example.test"}}}}`
+	page, err := parseClaudeModelHandshake([]byte(line + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Account != "user@example.test" || len(page.Models) != 1 {
+		t.Fatalf("page=%#v", page)
+	}
+	model := page.Models[0]
+	if model.ID != "current[1m]" || model.Description != "Live description" || model.ContextWindowTokens != 1_000_000 || len(model.EffortOptions) != 2 || model.SpeedOptions[0].ID != "fast" {
+		t.Fatalf("model=%#v", model)
+	}
+}
+
+func TestCodexCacheEnrichesOnlyLiveModels(t *testing.T) {
+	root := t.TempDir()
+	data := `{"models":[{"slug":"live-model","description":"From CLI cache","context_window":272000,"max_context_window":872000,"supported_reasoning_levels":[{"effort":"high","description":"Deep"}],"service_tiers":[{"id":"priority","name":"Fast","description":"2x speed"}]}]}`
+	if err := os.WriteFile(filepath.Join(root, "models_cache.json"), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	models := []ModelInfo{{ID: "live-model"}, {ID: "not-in-cache"}}
+	enrichCodexModelsFromCache(models, []string{"CODEX_HOME=" + root})
+	if models[0].ContextWindowTokens != 272000 || models[0].MaxContextWindowTokens != 872000 || models[0].SpeedOptions[0].ID != "priority" || models[0].EffortOptions[0].Description != "Deep" {
+		t.Fatalf("enriched=%#v", models[0])
+	}
+	if models[1].ContextWindowTokens != 0 {
+		t.Fatalf("unmatched model was enriched: %#v", models[1])
+	}
+}
+
+func TestCopilotModelDiscoveryPreservesCapabilities(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, contextWindow := 120000, 128000
+	adapter := &Copilot{Path: executable, Discover: func(context.Context) ([]copilotsdk.ModelInfo, error) {
+		return []copilotsdk.ModelInfo{{
+			ID: "copilot-current", Name: "Copilot Current",
+			Capabilities:              copilotsdk.ModelCapabilities{Limits: copilotsdk.ModelLimits{MaxPromptTokens: &prompt, MaxContextWindowTokens: &contextWindow}},
+			SupportedReasoningEfforts: []string{"low", "high"}, DefaultReasoningEffort: "high",
+		}}, nil
+	}}
+	page, err := adapter.ListModels(context.Background(), ModelListRequest{})
+	if err != nil || len(page.Models) != 1 {
+		t.Fatalf("page=%#v err=%v", page, err)
+	}
+	model := page.Models[0]
+	if model.ContextWindowTokens != contextWindow || model.MaxPromptTokens != prompt || len(model.EffortOptions) != 2 || model.DefaultEffort != "high" {
+		t.Fatalf("model=%#v", model)
 	}
 }
 

@@ -29,6 +29,18 @@ func inputReady(reader io.Reader, wait time.Duration) (bool, error) {
 	return n > 0, err
 }
 
+func terminalWidth(writer io.Writer) int {
+	file, ok := writer.(*os.File)
+	if !ok {
+		return 0
+	}
+	size, err := unix.IoctlGetWinsize(int(file.Fd()), unix.TIOCGWINSZ)
+	if err != nil {
+		return 0
+	}
+	return int(size.Col)
+}
+
 func enterRawMode(reader io.Reader) (func(), error) {
 	file, ok := reader.(*os.File)
 	if !ok {

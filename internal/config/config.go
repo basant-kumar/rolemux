@@ -51,6 +51,7 @@ type Profile struct {
 	Provider string `toml:"provider" json:"provider"`
 	Model    string `toml:"model" json:"model"`
 	Effort   string `toml:"effort,omitempty" json:"effort,omitempty"`
+	Speed    string `toml:"speed,omitempty" json:"speed,omitempty"`
 }
 
 type AuthCommand struct {
@@ -372,6 +373,9 @@ func merge(dst *Config, src Config) {
 		if p.Effort != "" {
 			old.Effort = p.Effort
 		}
+		if p.Speed != "" {
+			old.Speed = p.Speed
+		}
 		dst.Profiles[role] = old
 	}
 	if dst.Providers == nil {
@@ -554,6 +558,9 @@ func Validate(c Config) error {
 		}
 		if p.Effort != "" && !validEffort(p.Effort) {
 			return fmt.Errorf("profile %s has invalid effort %q", role, p.Effort)
+		}
+		if p.Speed != "" && !modelIDPattern.MatchString(p.Speed) {
+			return fmt.Errorf("profile %s has invalid speed %q", role, p.Speed)
 		}
 		if credentialLike(p.Model) || credentialLike(p.Provider) {
 			return fmt.Errorf("%w: profile %s contains credential-like data", ErrUnsafeConfig, role)
@@ -943,6 +950,9 @@ func ConfigureProfile(name, role string, profile Profile, beforeHash string) err
 	if profile.Effort != "" {
 		profiles[canonical].(map[string]any)["effort"] = profile.Effort
 	}
+	if profile.Speed != "" {
+		profiles[canonical].(map[string]any)["speed"] = profile.Speed
+	}
 	raw["profiles"] = profiles
 	_ = cfg
 	return WriteRawAtomic(name, raw, beforeHash)
@@ -973,6 +983,9 @@ func ConfigureProfilesAtomic(name string, profilesToSet map[string]Profile, befo
 		value := map[string]any{"provider": profile.Provider, "model": profile.Model}
 		if profile.Effort != "" {
 			value["effort"] = profile.Effort
+		}
+		if profile.Speed != "" {
+			value["speed"] = profile.Speed
 		}
 		profiles[canonical] = value
 	}
@@ -1029,6 +1042,9 @@ func ValidateProfile(p Profile) error {
 	}
 	if p.Effort != "" && !validEffort(p.Effort) {
 		return errors.New("invalid effort")
+	}
+	if p.Speed != "" && !modelIDPattern.MatchString(p.Speed) {
+		return errors.New("invalid speed")
 	}
 	return nil
 }
@@ -1208,6 +1224,9 @@ func profilesRaw(profiles map[string]Profile) map[string]any {
 		}
 		if p.Effort != "" {
 			m["effort"] = p.Effort
+		}
+		if p.Speed != "" {
+			m["speed"] = p.Speed
 		}
 		out[k] = m
 	}

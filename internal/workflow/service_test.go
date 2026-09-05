@@ -87,7 +87,7 @@ func workflowRepo(t *testing.T) string {
 func workflowConfig() config.Config {
 	cfg := config.Default()
 	cfg.Profiles = map[string]config.Profile{
-		config.RolePlanner:     {Provider: "codex", Model: "planner-model", Effort: "max"},
+		config.RolePlanner:     {Provider: "codex", Model: "planner-model", Effort: "max", Speed: "priority"},
 		config.RoleImplementer: {Provider: "codex", Model: "implementer-model", Effort: "max"},
 		config.RoleReviewer:    {Provider: "codex", Model: "reviewer-model", Effort: "xhigh"},
 	}
@@ -147,6 +147,9 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 	counts := map[runner.Role]int{}
 	for _, request := range fake.requests {
 		counts[request.Role]++
+		if request.Role == runner.RolePlanner && request.Speed != "priority" {
+			t.Fatalf("planner speed=%q", request.Speed)
+		}
 		if request.Role == runner.RoleImplementer && request.Sandbox != "workspace-write" {
 			t.Fatalf("implementer sandbox=%q", request.Sandbox)
 		}

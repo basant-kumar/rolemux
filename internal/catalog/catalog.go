@@ -113,7 +113,6 @@ func normalizeLive(provider string, models []runner.ModelInfo) []runner.ModelInf
 		model.Aliases = uniqueSorted(model.Aliases)
 		result = append(result, model)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 	return result
 }
 
@@ -122,6 +121,7 @@ func appendCustom(models []runner.ModelInfo, cfg config.Config, provider string)
 	for _, model := range models {
 		seen[model.ID] = true
 	}
+	customModels := make([]runner.ModelInfo, 0, len(cfg.Models[provider]))
 	for name, custom := range cfg.Models[provider] {
 		id := custom.ID
 		if id == "" {
@@ -131,17 +131,11 @@ func appendCustom(models []runner.ModelInfo, cfg config.Config, provider string)
 			continue
 		}
 		aliases := uniqueSorted(custom.Aliases)
-		if provider == "claude" && id == "claude-fable-5" && !contains(aliases, "fable") {
-			aliases = append(aliases, "fable")
-		}
-		models = append(models, runner.ModelInfo{ID: id, Label: custom.Label, Provider: provider, Origin: "custom", Availability: "unknown", Efforts: uniqueSorted(custom.Efforts), DefaultEffort: custom.DefaultEffort, Aliases: aliases, Custom: true})
+		customModels = append(customModels, runner.ModelInfo{ID: id, Label: custom.Label, Provider: provider, Origin: "custom", Availability: "unknown", Efforts: uniqueSorted(custom.Efforts), DefaultEffort: custom.DefaultEffort, Aliases: aliases, Custom: true})
 		seen[id] = true
 	}
-	if provider == "claude" && !seen["claude-fable-5"] {
-		models = append(models, runner.ModelInfo{ID: "claude-fable-5", Label: "Claude Fable 5", Provider: provider, Origin: "custom", Availability: "unknown", Aliases: []string{"fable"}, Custom: true})
-	}
-	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
-	return models
+	sort.Slice(customModels, func(i, j int) bool { return customModels[i].ID < customModels[j].ID })
+	return append(models, customModels...)
 }
 
 func markCacheUnknown(models []runner.ModelInfo, age int64) []runner.ModelInfo {

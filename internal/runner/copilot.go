@@ -230,6 +230,9 @@ func stringMapSetting(m map[string]any, key string) map[string]string {
 }
 
 func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Response, error) {
+	if req.Speed != "" && req.Speed != "standard" {
+		return Response{}, providerError("COPILOT_SPEED", fmt.Sprintf("Copilot model %q does not advertise speed modes", req.Model), false, false, req.SessionID, ErrUnsupportedProvider)
+	}
 	if req.Role == RoleImplementer {
 		return Response{}, providerError("UNSUPPORTED_PROVIDER", "Copilot implementation is fail-closed until write isolation is proven", false, false, "", ErrUnsupportedProvider)
 	}
@@ -334,6 +337,16 @@ func (c *Copilot) ListModels(ctx context.Context, req ModelListRequest) (ModelPa
 	page := ModelPage{Models: make([]ModelInfo, 0, len(models))}
 	for _, model := range models {
 		info := ModelInfo{ID: model.ID, Label: model.Name, Provider: "copilot", Origin: "live", Availability: "available", Efforts: append([]string(nil), model.SupportedReasoningEfforts...), DefaultEffort: model.DefaultReasoningEffort}
+		for _, effort := range model.SupportedReasoningEfforts {
+			info.EffortOptions = append(info.EffortOptions, ModelOption{ID: effort, Label: effort})
+		}
+		if model.Capabilities.Limits.MaxPromptTokens != nil {
+			info.MaxPromptTokens = *model.Capabilities.Limits.MaxPromptTokens
+		}
+		if model.Capabilities.Limits.MaxContextWindowTokens != nil {
+			info.ContextWindowTokens = *model.Capabilities.Limits.MaxContextWindowTokens
+			info.MaxContextWindowTokens = *model.Capabilities.Limits.MaxContextWindowTokens
+		}
 		page.Models = append(page.Models, info)
 	}
 	return page, nil

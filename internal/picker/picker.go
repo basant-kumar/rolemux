@@ -14,7 +14,12 @@ import (
 	"github.com/basant-kumar/rolemux/internal/runner"
 )
 
-type Option struct{ ID, Label string }
+type Option struct {
+	ID          string
+	Label       string
+	Description string
+	Meta        string
+}
 
 type Action int
 
@@ -29,6 +34,7 @@ const (
 type View struct {
 	Title      string
 	Subtitle   string
+	InitialID  string
 	Search     bool
 	CanBack    bool
 	FullScreen bool
@@ -71,7 +77,7 @@ func (s *State) Filtered() []Option {
 	query := strings.ToLower(strings.TrimSpace(s.Query))
 	result := []Option{}
 	for _, option := range s.Options {
-		if query == "" || strings.Contains(strings.ToLower(option.ID), query) || strings.Contains(strings.ToLower(option.Label), query) {
+		if query == "" || strings.Contains(strings.ToLower(option.ID), query) || strings.Contains(strings.ToLower(option.Label), query) || strings.Contains(strings.ToLower(option.Description), query) || strings.Contains(strings.ToLower(option.Meta), query) {
 			result = append(result, option)
 		}
 	}
@@ -174,6 +180,14 @@ func Select(ctx context.Context, in io.Reader, out io.Writer, options []Option, 
 	}
 	defer restore()
 	state := New(options)
+	if view.InitialID != "" {
+		for i, option := range state.Options {
+			if option.ID == view.InitialID {
+				state.Cursor = i
+				break
+			}
+		}
+	}
 	renderedLines := 0
 	nextByte := func(wait time.Duration) (byte, bool, error) {
 		if wait > 0 {
@@ -211,7 +225,7 @@ func Select(ctx context.Context, in io.Reader, out io.Writer, options []Option, 
 		}
 		filtered := state.Filtered()
 		start := 0
-		const visible = 10
+		const visible = 6
 		if state.Cursor >= visible {
 			start = state.Cursor - visible + 1
 		}
@@ -225,10 +239,15 @@ func Select(ctx context.Context, in io.Reader, out io.Writer, options []Option, 
 				marker = "> "
 			}
 			label := filtered[i].Label
-			if label == "" || label == filtered[i].ID {
-				lines = append(lines, marker+filtered[i].ID)
-			} else {
-				lines = append(lines, fmt.Sprintf("%s%s  %s", marker, filtered[i].ID, label))
+			if label == "" {
+				label = filtered[i].ID
+			}
+			lines = append(lines, marker+label)
+			if filtered[i].Description != "" {
+				lines = append(lines, "    "+filtered[i].Description)
+			}
+			if filtered[i].Meta != "" {
+				lines = append(lines, "    "+filtered[i].Meta)
 			}
 		}
 		if len(filtered) == 0 {
@@ -239,6 +258,7 @@ func Select(ctx context.Context, in io.Reader, out io.Writer, options []Option, 
 			footer = "↑/↓ move  enter select  esc back  ctrl+c cancel"
 		}
 		lines = append(lines, "", footer)
+		lines = wrapLines(lines, terminalWidth(out))
 
 		// Build and write one synchronized frame. The cursor is left on the
 		// previous frame's final line, so reaching its first line requires
@@ -356,6 +376,38 @@ func Select(ctx context.Context, in io.Reader, out io.Writer, options []Option, 
 	}
 }
 
+func wrapLines(lines []string, width int) []string {
+	if width < 20 {
+		return lines
+	}
+	// Avoid writing in the terminal's final column; terminals differ in when
+	// they materialize an automatic wrap there.
+	limit := width - 1
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		runes := []rune(line)
+		indentLength := 0
+		for indentLength < len(runes) && runes[indentLength] == ' ' {
+			indentLength++
+		}
+		indent := string(runes[:indentLength])
+		for len(runes) > limit {
+			cut := limit
+			for i := limit; i > indentLength+8; i-- {
+				if runes[i] == ' ' {
+					cut = i
+					break
+				}
+			}
+			result = append(result, strings.TrimRight(string(runes[:cut]), " "))
+			remainder := strings.TrimLeft(string(runes[cut:]), " ")
+			runes = []rune(indent + remainder)
+		}
+		result = append(result, string(runes))
+	}
+	return result
+}
+
 func ModelOptions(models []runner.ModelInfo) []Option {
 	result := make([]Option, 0, len(models))
 	for _, model := range models {
@@ -363,7 +415,20 @@ func ModelOptions(models []runner.ModelInfo) []Option {
 		if label == "" {
 			label = model.ID
 		}
-		result = append(result, Option{ID: model.ID, Label: label})
+		meta := []string{model.ID}
+		if model.IsDefault {
+			meta = append(meta, "default")
+		}
+		if model.ContextWindowTokens > 0 {
+			meta = append(meta, formatTokens(model.ContextWindowTokens)+" context")
+		}
+		if model.MaxContextWindowTokens > 0 && model.MaxContextWindowTokens != model.ContextWindowTokens {
+			meta = append(meta, formatTokens(model.MaxContextWindowTokens)+" max")
+		}
+		if len(model.SpeedOptions) > 0 {
+			meta = append(meta, "speed modes available")
+		}
+		result = append(result, Option{ID: model.ID, Label: label, Description: model.Description, Meta: strings.Join(meta, " · ")})
 	}
 	return result
 }
@@ -372,15 +437,66 @@ func EffortOptions(model runner.ModelInfo) []Option {
 	if len(model.Efforts) == 0 {
 		return []Option{{ID: "", Label: "(optional effort; provider default/unknown)"}}
 	}
-	result := make([]Option, 0, len(model.Efforts))
-	for _, effort := range model.Efforts {
-		label := effort
-		if effort == model.DefaultEffort {
+	advertised := model.EffortOptions
+	if len(advertised) == 0 {
+		for _, effort := range model.Efforts {
+			advertised = append(advertised, runner.ModelOption{ID: effort, Label: effort})
+		}
+	}
+	result := make([]Option, 0, len(advertised))
+	for _, effort := range advertised {
+		label := effort.Label
+		if label == "" {
+			label = effort.ID
+		}
+		label = titleSetting(label)
+		if effort.ID == model.DefaultEffort {
 			label += " (default)"
 		}
-		result = append(result, Option{ID: effort, Label: label})
+		result = append(result, Option{ID: effort.ID, Label: label, Description: effort.Description})
 	}
 	return result
+}
+
+func SpeedOptions(model runner.ModelInfo) []Option {
+	if len(model.SpeedOptions) == 0 {
+		return nil
+	}
+	standardLabel := "Standard"
+	if model.DefaultSpeed == "" || model.DefaultSpeed == "standard" {
+		standardLabel += " (default)"
+	}
+	result := []Option{{ID: "standard", Label: standardLabel, Description: "Provider default speed and usage"}}
+	for _, speed := range model.SpeedOptions {
+		label := speed.Label
+		if label == "" {
+			label = speed.ID
+		}
+		if speed.ID == model.DefaultSpeed {
+			label += " (default)"
+		}
+		result = append(result, Option{ID: speed.ID, Label: titleSetting(label), Description: speed.Description})
+	}
+	return result
+}
+
+func formatTokens(tokens int) string {
+	if tokens >= 1_000_000 && tokens%1_000_000 == 0 {
+		return fmt.Sprintf("%dM", tokens/1_000_000)
+	}
+	if tokens >= 1_000 && tokens%1_000 == 0 {
+		return fmt.Sprintf("%dK", tokens/1_000)
+	}
+	return fmt.Sprintf("%d", tokens)
+}
+
+func titleSetting(value string) string {
+	if value == "" {
+		return value
+	}
+	runes := []rune(value)
+	runes[0] = []rune(strings.ToUpper(string(runes[0])))[0]
+	return string(runes)
 }
 
 func UnknownAvailabilityWarning(model runner.ModelInfo) string {

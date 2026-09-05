@@ -148,6 +148,7 @@ type ProfileSnapshot struct {
 	Provider string `json:"provider"`
 	Model    string `json:"model"`
 	Effort   string `json:"effort,omitempty"`
+	Speed    string `json:"speed,omitempty"`
 }
 
 // RuntimeSnapshot stores routing metadata but never a credential value.

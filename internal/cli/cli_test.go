@@ -119,7 +119,7 @@ func TestSummarizeUsageIsCompactSortedAndTotalsUncachedInput(t *testing.T) {
 
 func TestConfigureProjectDirectAndImport(t *testing.T) {
 	root := cliRepo(t)
-	code, output, stderr := runTestApp(t, root, "", "configure", "--project", "--role", "planner", "--runner", "codex", "--model", "gpt-5.6-sol", "--effort", "max", "--json")
+	code, output, stderr := runTestApp(t, root, "", "configure", "--project", "--role", "planner", "--runner", "codex", "--model", "gpt-5.6-sol", "--effort", "max", "--speed", "priority", "--json")
 	if code != 0 || stderr != "" {
 		t.Fatalf("configure code=%d output=%s stderr=%s", code, output, stderr)
 	}
@@ -128,7 +128,7 @@ func TestConfigureProjectDirectAndImport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Profiles[config.RolePlanner]; got.Model != "gpt-5.6-sol" || got.Effort != "max" {
+	if got := cfg.Profiles[config.RolePlanner]; got.Model != "gpt-5.6-sol" || got.Effort != "max" || got.Speed != "priority" {
 		t.Fatalf("profile=%#v", got)
 	}
 	fragment := "title='preserved'\n[profiles.implementer]\nprovider='codex'\nmodel='gpt-5.6-luna'\neffort='max'\n"
@@ -199,6 +199,21 @@ func TestInteractiveConfigurationEscapeReturnsToPreviousScreen(t *testing.T) {
 	}
 	if got := bytes.Count(output.Bytes(), []byte("Planner · Select test model")); got != 1 {
 		t.Fatalf("model screen count=%d output=%q", got, output.Bytes())
+	}
+}
+
+func TestWizardStartsFromConfiguredDynamicModelSettings(t *testing.T) {
+	cfg := config.Default()
+	cfg.Profiles[config.RolePlanner] = config.Profile{Provider: "claude", Model: "claude-current", Effort: "max", Speed: "fast"}
+	drafts := map[string]*profileDraft{config.RolePlanner: {
+		provider: "claude",
+		models:   []runner.ModelInfo{{ID: "current", Aliases: []string{"claude-current"}, IsDefault: true}},
+		model:    runner.ModelInfo{ID: "current", Aliases: []string{"claude-current"}},
+	}}
+	for kind, want := range map[wizardScreenKind]string{wizardProvider: "claude", wizardModel: "current", wizardEffort: "max", wizardSpeed: "fast"} {
+		if got := wizardInitialID(wizardScreen{kind: kind, role: config.RolePlanner}, cfg, drafts); got != want {
+			t.Fatalf("kind=%v got=%q want=%q", kind, got, want)
+		}
 	}
 }
 

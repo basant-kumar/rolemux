@@ -15,3 +15,5 @@ func inputReady(reader io.Reader, _ time.Duration) (bool, error) {
 	}
 	return true, nil
 }
+
+func terminalWidth(io.Writer) int { return 0 }

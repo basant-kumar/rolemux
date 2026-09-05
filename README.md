@@ -35,7 +35,8 @@ RoleMux v1 is macOS-first and built as a single Go binary. It supports:
   code-reviewer override profiles;
 - live-first, account-aware model discovery with an explicit cache/custom
   fallback and machine-readable JSON;
-- an interactive searchable model and effort picker;
+- a searchable, full-screen model, effort, and speed picker with live model
+  descriptions and context limits when the provider exposes them;
 - durable provider sessions and restart-safe questions/retries;
 - automatic plan-review and code-review fix loops, capped at five rounds;
 - multiple task IDs running concurrently in one shared checkout;
@@ -96,15 +97,19 @@ Open the searchable picker for global defaults:
 rolemux configure --global
 ```
 
-Each wizard step replaces the previous screen. Use the arrow keys and Enter to
-select, type to search provider/model lists, press Escape to go back, and press
-Ctrl+C to cancel from any step.
+Each wizard step replaces the previous screen. The model screen shows the
+provider-returned name, description, context window, maximum context window,
+default marker, and speed-mode availability when those fields exist. Effort
+and speed get their own screens and appear only when the selected model
+advertises them. Use the arrow keys and Enter to select, type to search
+provider/model lists, press Escape to go back, and press Ctrl+C to cancel from
+any step.
 
 Or update one profile atomically:
 
 ```bash
 rolemux configure --global --role planner \
-  --runner codex --model gpt-5.6-sol --effort max
+  --runner codex --model gpt-5.6-sol --effort max --speed priority
 
 rolemux configure --global --role implementer \
   --runner codex --model gpt-5.6-luna --effort max
@@ -115,7 +120,10 @@ rolemux configure --global --role reviewer \
 
 Use `--role plan-reviewer` or `--role code-reviewer` only when that review role
 needs to differ from the shared reviewer profile. Use `--project` to write an
-override to the current repository's `.rolemux.toml`.
+override to the current repository's `.rolemux.toml`. For non-interactive
+configuration, pass the provider-native speed option ID reported by
+`rolemux models --runner <provider> --refresh --json`; `standard` selects the
+provider default.
 
 Configuration paths:
 
@@ -130,6 +138,7 @@ Example TOML:
 provider = "codex"
 model = "gpt-5.6-sol"
 effort = "max"
+speed = "priority"
 
 [profiles.reviewer]
 provider = "codex"
@@ -148,7 +157,7 @@ credential values are reacquired for every fresh and resumed provider turn.
 
 ## Discover models
 
-Use the interactive list:
+Inspect the human-readable catalog:
 
 ```bash
 rolemux models
@@ -163,8 +172,13 @@ rolemux models --json
 ```
 
 Catalog records distinguish `live`, `cache`, and `custom` origin and report
-availability as `available`, `unavailable`, or `unknown`. Cached results include
-their age. Unknown availability is never presented as a successful live probe.
+availability as `available`, `unavailable`, or `unknown`. Model IDs and
+capabilities are not compiled into RoleMux: Codex comes from its app-server
+catalog (with context limits enriched from its own model cache), Claude comes
+from its stream-JSON initialization handshake, and Copilot comes from the
+installed CLI's SDK model list. Cached results include their age. Unknown
+availability is never presented as a successful live probe. `--json` includes
+structured effort and speed options plus context limits when advertised.
 
 ## Run a workflow
 
@@ -252,7 +266,7 @@ overwritten unless `--force` is explicitly supplied.
 
 ## Security model
 
-- Provider model/effort/routing choices are snapshotted when a task is created.
+- Provider model/effort/speed/routing choices are snapshotted when a task is created.
 - Secrets are never written to task state, catalog caches, argv, or diagnostics.
 - Codex and Claude runs use explicit non-interactive sandbox/tool restrictions.
 - Copilot planning/review uses SDK empty mode with only repository-confined

@@ -71,7 +71,7 @@ func TestConfigureProfileIsAtomicAndPreservesUnrelatedTables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ConfigureProfile(name, "planner", Profile{Provider: "codex", Model: "new", Effort: "high"}, before); err != nil {
+	if err := ConfigureProfile(name, "planner", Profile{Provider: "codex", Model: "new", Effort: "high", Speed: "priority"}, before); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(name)
@@ -79,7 +79,7 @@ func TestConfigureProfileIsAtomicAndPreservesUnrelatedTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(b)
-	for _, want := range []string{"title = \"keep me\"", "model = \"new\"", "model = \"other\"", "cli_path = \"/bin/codex\"", "effort = \"high\""} {
+	for _, want := range []string{"title = \"keep me\"", "model = \"new\"", "model = \"other\"", "cli_path = \"/bin/codex\"", "effort = \"high\"", "speed = \"priority\""} {
 		if !strings.Contains(s, want) {
 			t.Errorf("updated config missing %q:\n%s", want, s)
 		}

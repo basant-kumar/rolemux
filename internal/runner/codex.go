@@ -145,6 +145,9 @@ func BuildCodexArgs(req Request, schemaPath string) ([]string, error) {
 	if req.Effort != "" {
 		args = append(args, "--config", "model_reasoning_effort="+req.Effort)
 	}
+	if req.Speed != "" && req.Speed != "standard" {
+		args = append(args, "--config", "service_tier="+req.Speed)
+	}
 	if req.Resume {
 		args = append(args, req.SessionID)
 	}
