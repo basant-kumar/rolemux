@@ -617,10 +617,11 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 	if adapter == nil {
 		return runner.Response{}, s.fail(id, token, &runner.ProviderError{Code: "PROVIDER_UNAVAILABLE", Message: fmt.Sprintf("%s provider is unavailable; install or log in with its CLI", profile.Provider), Retryable: false, KnownSession: st.InFlight.KnownSession, SessionID: st.InFlight.SessionID})
 	}
-	request := runner.Request{Role: role, Operation: st.InFlight.Operation, Prompt: st.InFlight.Prompt, Model: profile.Model, Effort: profile.Effort, RepoRoot: s.RepoRoot, Scope: st.InFlight.Scope, SessionID: st.InFlight.SessionID, Resume: st.InFlight.KnownSession && st.InFlight.SessionID != "", Runtime: st.RuntimeSnapshot[string(role)], Sandbox: "read-only"}
+	sandbox := "read-only"
 	if role == runner.RoleImplementer {
-		request.Sandbox = "workspace-write"
+		sandbox = "workspace-write"
 	}
+	request := runner.Request{Role: role, Operation: st.InFlight.Operation, Prompt: st.InFlight.Prompt, Model: profile.Model, Effort: profile.Effort, RepoRoot: s.RepoRoot, Scope: st.InFlight.Scope, SessionID: st.InFlight.SessionID, Resume: st.InFlight.KnownSession && st.InFlight.SessionID != "", Runtime: st.RuntimeSnapshot[string(role)], Sandbox: sandbox}
 	resp, callErr := adapter.Run(ctx, request, runner.Callbacks{SessionStarted: func(session string) error {
 		if strings.TrimSpace(session) == "" {
 			return runner.ErrMissingSession
@@ -771,7 +772,7 @@ func RuntimeSnapshot(provider string, p config.Provider) task.RuntimeSnapshot {
 		}
 	} else if provider == "copilot" {
 		providerID = "copilot"
-		for key, value := range map[string]any{"type": p.Type, "wire_api": p.WireAPI, "transport": p.Transport, "base_url": p.BaseURL, "model_id": p.ModelID, "wire_model": p.WireModel, "max_prompt_tokens": p.MaxPromptTokens, "max_output_tokens": p.MaxOutputTokens, "headers": p.Headers, "bearer_token_env": p.BearerTokenEnv} {
+		for key, value := range map[string]any{"type": p.Type, "wire_api": p.WireAPI, "transport": p.Transport, "base_url": endpoint, "model_id": p.ModelID, "wire_model": p.WireModel, "max_prompt_tokens": p.MaxPromptTokens, "max_output_tokens": p.MaxOutputTokens, "headers": p.Headers, "bearer_token_env": p.BearerTokenEnv} {
 			if !isZero(value) {
 				sdk[key] = value
 			}

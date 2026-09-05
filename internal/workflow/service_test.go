@@ -94,6 +94,13 @@ func workflowConfig() config.Config {
 	return cfg
 }
 
+func TestRuntimeSnapshotUsesCopilotGateway(t *testing.T) {
+	snapshot := RuntimeSnapshot("copilot", config.Provider{GatewayURL: "https://gateway.example.invalid", BearerTokenEnv: "COPILOT_TOKEN"})
+	if snapshot.Endpoint != "https://gateway.example.invalid" || snapshot.SDKSettings["base_url"] != snapshot.Endpoint || snapshot.SDKSettings["bearer_token_env"] != "COPILOT_TOKEN" {
+		t.Fatalf("snapshot=%#v", snapshot)
+	}
+}
+
 func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 	root := workflowRepo(t)
 	fake := &scriptedAdapter{
@@ -140,6 +147,12 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 	counts := map[runner.Role]int{}
 	for _, request := range fake.requests {
 		counts[request.Role]++
+		if request.Role == runner.RoleImplementer && request.Sandbox != "workspace-write" {
+			t.Fatalf("implementer sandbox=%q", request.Sandbox)
+		}
+		if request.Role != runner.RoleImplementer && request.Sandbox != "read-only" {
+			t.Fatalf("read-only role %s sandbox=%q", request.Role, request.Sandbox)
+		}
 		if counts[request.Role] > 1 && (!request.Resume || request.SessionID != fake.sessions[request.Role]) {
 			t.Fatalf("role %s did not resume its exact session: %#v", request.Role, request)
 		}
