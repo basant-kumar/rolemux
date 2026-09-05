@@ -5,7 +5,7 @@
 [![Downloads](https://img.shields.io/github/downloads/basant-kumar/rolemux/total)](https://github.com/basant-kumar/rolemux/releases)
 [![Go](https://img.shields.io/github/go-mod/go-version/basant-kumar/rolemux)](https://go.dev/)
 [![License](https://img.shields.io/github/license/basant-kumar/rolemux)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](#install)
+[![macOS](https://img.shields.io/badge/macOS-supported-007AFF?logo=apple&logoColor=white)](#install)
 
 **The right mind for every role.**
 
@@ -103,8 +103,8 @@ RoleMux keeps context useful and small: the planner sends self-contained work
 packets, resumed turns send only new answers or diffs, task reviews inspect the
 change and its blast radius, and the full integration review runs once.
 `rolemux usage <task-id> --json` reports measured usage when providers expose
-it. If pxpipe is installed and eligible, RoleMux can use it automatically and
-prints the temporary dashboard URL.
+it. If [pxpipe](https://github.com/teamchong/pxpipe) is installed and eligible,
+RoleMux can use it automatically and prints the temporary dashboard URL.
 
 ## Useful commands
 

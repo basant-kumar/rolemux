@@ -166,7 +166,8 @@ idempotent success.
 ## pxpipe
 
 For eligible Claude and Codex task turns, RoleMux can start a private foreground
-pxpipe process and prints its temporary dashboard and event-log paths. No
+[pxpipe](https://github.com/teamchong/pxpipe) process and prints its temporary
+dashboard and event-log paths. No
 separately managed daemon is required. Authentication and model discovery still
 go directly to the provider.
 
