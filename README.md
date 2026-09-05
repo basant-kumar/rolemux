@@ -56,15 +56,23 @@ Go 1.24 or newer is required.
 go install github.com/basant-kumar/rolemux/cmd/rolemux@latest
 ```
 
-Go installs the binary in `$(go env GOPATH)/bin`. Add that directory to your
-shell path if needed, then install the host-agent skill and verify the setup:
+Go installs the binary in `GOBIN`, or in `GOPATH/bin` when `GOBIN` is unset.
+Resolve that directory and add it to the current shell path, then install the
+host-agent skill and verify the setup:
 
 ```bash
-export PATH="$(go env GOPATH)/bin:$PATH"
+ROLEMUX_BIN_DIR="$(go env GOBIN)"
+[ -n "$ROLEMUX_BIN_DIR" ] || ROLEMUX_BIN_DIR="$(go env GOPATH)/bin"
+export PATH="$ROLEMUX_BIN_DIR:$PATH"
+
+rolemux help
 rolemux install --global --hosts all
 rolemux doctor --json
 rolemux configure --global
 ```
+
+Add the same `export PATH=...` setting to `~/.zshrc` to make it persistent in
+new terminals.
 
 From an existing source checkout, install the current revision with:
 

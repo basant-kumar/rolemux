@@ -207,6 +207,47 @@ func TestPlannerQuestionReturnsExitThreeAndResumesSameSession(t *testing.T) {
 	}
 }
 
+func TestImplementerQuestionReturnsExitThreeAndResumesSameSession(t *testing.T) {
+	root := workflowRepo(t)
+	fake := &scriptedAdapter{
+		sessions: map[runner.Role]string{},
+		responses: map[runner.Role][]runner.Envelope{
+			runner.RolePlanner:      {{Role: string(runner.RolePlanner), Status: "ready", Plan: "change app"}},
+			runner.RolePlanReviewer: {{Role: string(runner.RolePlanReviewer), Verdict: "approved", Findings: []task.Finding{}}},
+			runner.RoleImplementer: {
+				{Role: string(runner.RoleImplementer), Status: "needs_input", Question: "Keep compatibility?"},
+				{Role: string(runner.RoleImplementer), Status: "ready"},
+			},
+		},
+	}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	if _, err := service.StartPlan(context.Background(), "change app", "implement-question"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ReviewPlan(context.Background(), "implement-question"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Implement(context.Background(), "implement-question", "app.go")
+	if ExitCode(err) != ExitNeedsInput || result.State.PendingQuestion != "Keep compatibility?" {
+		t.Fatalf("needs input result=%#v err=%v exit=%d", result, err, ExitCode(err))
+	}
+	result, err = service.AnswerImplement(context.Background(), "implement-question", "yes")
+	if err != nil || result.State.Phase != task.PhaseImplementationReady {
+		t.Fatalf("answer result=%#v err=%v", result, err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	var requests []runner.Request
+	for _, request := range fake.requests {
+		if request.Role == runner.RoleImplementer {
+			requests = append(requests, request)
+		}
+	}
+	if len(requests) != 2 || !requests[1].Resume || requests[1].SessionID != "session-implementer" || !strings.Contains(requests[1].Prompt, "yes") {
+		t.Fatalf("implementer session was not resumed: %#v", requests)
+	}
+}
+
 func TestPlanReviewStopsAfterFiveAcceptedRounds(t *testing.T) {
 	root := workflowRepo(t)
 	plannerResponses := []runner.Envelope{{Role: string(runner.RolePlanner), Status: "ready", Plan: "plan 0"}}
