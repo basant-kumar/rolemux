@@ -912,6 +912,7 @@ func TestCodeReviewRevisionPromptUsesOnlyFixCheckpointDelta(t *testing.T) {
 
 func TestPlannerAndImplementerPromptsAssignResearchToPlanner(t *testing.T) {
 	planning := plannerPrompt("change app", nil)
+	review := planReviewPrompt("change app", "plan", task.ComplexitySmall, []task.WorkUnit{{ID: "W1", Scope: "app.go,app_test.go"}}, true)
 	implementation := implementPrompt("change app", "packet", "app.go", nil)
 	for _, required := range []string{"primary research and architecture brain", "execution packet", "direct blast radius", "validation commands"} {
 		if !strings.Contains(planning, required) {
@@ -921,6 +922,11 @@ func TestPlannerAndImplementerPromptsAssignResearchToPlanner(t *testing.T) {
 	for _, required := range []string{"authoritative", "at most three", "repository-wide searches", "needs_input"} {
 		if !strings.Contains(implementation, required) {
 			t.Fatalf("implementer prompt omitted %q", required)
+		}
+	}
+	for _, required := range []string{"comma-separated", "commas between entries are valid"} {
+		if !strings.Contains(review, required) {
+			t.Fatalf("plan review prompt omitted canonical scope rule %q", required)
 		}
 	}
 }
