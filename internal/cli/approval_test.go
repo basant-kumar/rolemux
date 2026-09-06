@@ -76,8 +76,11 @@ func TestApprovalShowAndApproveAreProviderFree(t *testing.T) {
 	}
 	unconfirmed := decodeSingleObject(t, output)
 	unconfirmedResult := unconfirmed["result"].(map[string]any)
-	if unconfirmed["ok"] != false || unconfirmedResult["status"] != "approval_required" || unconfirmedResult["requires_explicit_human_confirmation"] != true {
+	if unconfirmed["ok"] != false || unconfirmedResult["status"] != "approval_required" || unconfirmedResult["requires_explicit_human_confirmation"] != true || unconfirmedResult["human_confirmation_flag"] != "--human-confirmed" {
 		t.Fatalf("unconfirmed payload=%#v", unconfirmed)
+	}
+	if !strings.Contains(unconfirmed["error"].(map[string]any)["message"].(string), "host agent must rerun") {
+		t.Fatalf("unconfirmed error is not actionable: %#v", unconfirmed["error"])
 	}
 
 	code, output, stderr = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "approve", "--human-confirmed", "--json")

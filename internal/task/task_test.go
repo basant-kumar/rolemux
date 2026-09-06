@@ -187,6 +187,20 @@ func TestManifestHashIgnoresDerivedStatusAndHEADButTracksModeAndContent(t *testi
 	}
 }
 
+func TestWorktreeManifestHashIgnoresStagingState(t *testing.T) {
+	a := FileEntry{Path: "a", Kind: "file", Worktree: ContentState{Present: true, Mode: "0600", Hash: "hash", Size: 4}, Index: IndexState{Present: true, Mode: "100644", Blob: "old", Stages: []int{0}}}
+	b := a
+	b.Index.Blob = "new"
+	b.Index.Stages = nil
+	if HashWorktreeManifest([]FileEntry{a}) != HashWorktreeManifest([]FileEntry{b}) {
+		t.Fatal("staging-only change altered worktree identity")
+	}
+	b.Worktree.Hash = "changed"
+	if HashWorktreeManifest([]FileEntry{a}) == HashWorktreeManifest([]FileEntry{b}) {
+		t.Fatal("content change did not alter worktree identity")
+	}
+}
+
 func TestImmutableBaselineAndCandidateRefsDoNotOverwrite(t *testing.T) {
 	root := testRepo(t)
 	name := filepath.Join(root, "a.txt")

@@ -28,7 +28,9 @@ persists the exact provider session used by that role.
    explicit human decision. Only after a new human reply in the current host
    conversation, use `rolemux approval respond` with the exact task and gate
    IDs, `--human-confirmed`, one of `approve`, `request_changes`, or `discuss`, and feedback
-   when requesting changes. Never approve automatically. At a final code gate,
+   when requesting changes. Never approve automatically. The host agent runs
+   this bookkeeping command after the reply; never ask the human to copy or
+   execute it. At a final code gate,
    also show the path-limited local Git review commands emitted by `approval
    show`. Offer `rolemux approval publish <task-id>` as an opt-in GitHub draft
    review when the user wants it; never publish implicitly. After the user adds

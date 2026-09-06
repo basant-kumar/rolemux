@@ -2123,7 +2123,7 @@ func (a *app) pendingApproval(command string, state task.State, control workflow
 		payload := commandOutput{
 			OK: false, Command: command, Task: summarize(state), Result: control,
 			Advisories: state.Advisories,
-			Error:      &errorOutput{Code: workflow.ApprovalRequiredCode, Message: "human approval is required before this workflow can advance", Retryable: true, TaskID: state.ID},
+			Error:      &errorOutput{Code: workflow.ApprovalRequiredCode, Message: workflow.ApprovalRequiredMessage, Retryable: true, TaskID: state.ID},
 		}
 		if payload.Advisories == nil {
 			payload.Advisories = []task.Diagnostic{}

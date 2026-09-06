@@ -230,7 +230,9 @@ Request changes resumes the saved planner, direct implementer, or dedicated
 integration fixer; the changed result must be reviewed again and produces a
 new gate. Repeating the same decision for the same gate is idempotent, while a
 stale or conflicting gate ID fails closed. Parent plan IDs resolve an existing
-integration gate through `approval_task_id`.
+integration gate through `approval_task_id`. In an agent-hosted session, the
+human replies in chat and the host agent runs `approval respond`; the human
+does not need to execute this CLI command.
 
 For final code approval, `approval show` also prints path-limited local `git
 status` and `git diff` commands. If the repository has a GitHub remote and the

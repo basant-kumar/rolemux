@@ -102,6 +102,9 @@ branch/index/worktree, and reuses one draft PR across fix/re-review rounds. The
 PR is a review surface only—do not merge it. If GitHub or `gh` is unavailable,
 review locally and use `approval respond --human-confirmed` only after the
 human explicitly supplies feedback or approval.
+When RoleMux is running through a host agent, reply in that conversation; the
+host records the decision. You should not need to copy or run the bookkeeping
+command yourself.
 
 The review safety limit is a top-level setting. The default is five accepted
 reviewer verdicts per review task:

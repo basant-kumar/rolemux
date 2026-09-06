@@ -1242,6 +1242,29 @@ func HashManifest(entries []FileEntry) string {
 	return digestBytes([]byte(strings.Join(parts, "\n")))
 }
 
+// HashWorktreeManifest identifies checked-out content independently of Git's
+// staging state. Deleted paths and structural directories have no checked-out
+// content. A submodule's index object is its checked-out identity.
+func HashWorktreeManifest(entries []FileEntry) string {
+	canonical := append([]FileEntry(nil), entries...)
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Path < canonical[j].Path })
+	parts := make([]string, 0, len(canonical))
+	for _, e := range canonical {
+		if e.Kind == "directory" || !e.Worktree.Present || e.Kind == "deleted" {
+			continue
+		}
+		identity := e.Worktree.Hash
+		if e.Kind == "submodule" {
+			identity = e.Index.Blob
+		}
+		parts = append(parts, strings.Join([]string{
+			e.Path, e.Kind, e.Worktree.Mode, identity,
+			strconv.FormatInt(e.Worktree.Size, 10),
+		}, "\x00"))
+	}
+	return digestBytes([]byte(strings.Join(parts, "\n")))
+}
+
 func NewToken() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err == nil {

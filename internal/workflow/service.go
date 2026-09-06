@@ -41,29 +41,30 @@ type Result struct {
 // only workflow coordination data; provider prompts, raw output, and detailed
 // usage stay in task.State. Review findings appear only inside bounded events.
 type Control struct {
-	Status         string                     `json:"status"`
-	ReviewKind     string                     `json:"review_kind,omitempty"`
-	ReviewRound    int                        `json:"review_round"`
-	MaxRounds      int                        `json:"max_rounds"`
-	CanReview      bool                       `json:"can_review"`
-	NextAction     string                     `json:"next_action"`
-	ApprovalID     string                     `json:"approval_id,omitempty"`
-	ApprovalTaskID string                     `json:"approval_task_id,omitempty"`
-	ApprovalKind   string                     `json:"approval_kind,omitempty"`
-	Question       string                     `json:"question,omitempty"`
-	Choices        []ApprovalChoice           `json:"choices,omitempty"`
-	ArtifactPath   string                     `json:"artifact_path,omitempty"`
-	Scope          string                     `json:"scope,omitempty"`
-	ChangedFiles   []task.ApprovalChangedFile `json:"changed_files,omitempty"`
-	Source         string                     `json:"source,omitempty"`
-	Events         []task.WorkflowEvent       `json:"events,omitempty"`
-	BudgetIssue    *task.BudgetIssue          `json:"budget_issue,omitempty"`
-	Progress       *task.Progress             `json:"progress,omitempty"`
-	ExternalReview *task.ExternalReview       `json:"external_review,omitempty"`
-	ReviewOutdated bool                       `json:"review_outdated,omitempty"`
-	// RequiresExplicitHumanConfirmation tells host agents that an approval
-	// response must be grounded in a new, explicit human reply.
-	RequiresExplicitHumanConfirmation bool `json:"requires_explicit_human_confirmation,omitempty"`
+	Status      string `json:"status"`
+	ReviewKind  string `json:"review_kind,omitempty"`
+	ReviewRound int    `json:"review_round"`
+	MaxRounds   int    `json:"max_rounds"`
+	CanReview   bool   `json:"can_review"`
+	NextAction  string `json:"next_action"`
+	// Keep the approval contract beside NextAction so even compact or
+	// truncated host output retains the required confirmation flag.
+	RequiresExplicitHumanConfirmation bool                       `json:"requires_explicit_human_confirmation,omitempty"`
+	HumanConfirmationFlag             string                     `json:"human_confirmation_flag,omitempty"`
+	ApprovalID                        string                     `json:"approval_id,omitempty"`
+	ApprovalTaskID                    string                     `json:"approval_task_id,omitempty"`
+	ApprovalKind                      string                     `json:"approval_kind,omitempty"`
+	Question                          string                     `json:"question,omitempty"`
+	Choices                           []ApprovalChoice           `json:"choices,omitempty"`
+	ArtifactPath                      string                     `json:"artifact_path,omitempty"`
+	Scope                             string                     `json:"scope,omitempty"`
+	ChangedFiles                      []task.ApprovalChangedFile `json:"changed_files,omitempty"`
+	Source                            string                     `json:"source,omitempty"`
+	Events                            []task.WorkflowEvent       `json:"events,omitempty"`
+	BudgetIssue                       *task.BudgetIssue          `json:"budget_issue,omitempty"`
+	Progress                          *task.Progress             `json:"progress,omitempty"`
+	ExternalReview                    *task.ExternalReview       `json:"external_review,omitempty"`
+	ReviewOutdated                    bool                       `json:"review_outdated,omitempty"`
 }
 
 type ApprovalChoice struct {
@@ -179,6 +180,7 @@ func ControlFor(st task.State) Control {
 			control.Choices = defaultApprovalChoices()
 			control.ApprovalTaskID = st.ID
 			control.RequiresExplicitHumanConfirmation = true
+			control.HumanConfirmationFlag = HumanConfirmationFlag
 		} else {
 			control.Status = "review_needed"
 			control.NextAction = "plan_review"
@@ -200,6 +202,7 @@ func ControlFor(st task.State) Control {
 			control.Choices = defaultApprovalChoices()
 			control.ApprovalTaskID = st.ID
 			control.RequiresExplicitHumanConfirmation = true
+			control.HumanConfirmationFlag = HumanConfirmationFlag
 		} else {
 			control.Status = "review_needed"
 			control.NextAction = "code_review"
@@ -212,6 +215,7 @@ func ControlFor(st task.State) Control {
 		control.ApprovalTaskID = st.ID
 		control.Choices = defaultApprovalChoices()
 		control.RequiresExplicitHumanConfirmation = true
+		control.HumanConfirmationFlag = HumanConfirmationFlag
 		if kind == "plan" {
 			control.Question = planApprovalQuestion
 		} else {
@@ -264,6 +268,7 @@ func approvalControl(control Control, st task.State, record *task.ApprovalRecord
 	}
 	control.Choices = defaultApprovalChoices()
 	control.RequiresExplicitHumanConfirmation = true
+	control.HumanConfirmationFlag = HumanConfirmationFlag
 	if record.Scope != "" {
 		control.Scope = record.Scope
 	} else if st.Scope != "" {
@@ -367,8 +372,13 @@ func approvalChangedFiles(st task.State) []task.ApprovalChangedFile {
 }
 
 func approvalRequiredResult(st task.State) (Result, error) {
-	return Result{State: st, Status: "approval_required"}, problem(ApprovalRequiredCode, "human approval is required before this workflow can advance", st.ID, ExitNeedsInput, true, nil)
+	return Result{State: st, Status: "approval_required"}, problem(ApprovalRequiredCode, ApprovalRequiredMessage, st.ID, ExitNeedsInput, true, nil)
 }
+
+const (
+	HumanConfirmationFlag   = "--human-confirmed"
+	ApprovalRequiredMessage = "human approval is required before this workflow can advance; after the human explicitly replies, the host agent must rerun approval respond with " + HumanConfirmationFlag
+)
 
 func answerAction(kind, source string) string {
 	if source == string(runner.RoleImplementer) || kind == "code" || kind == "integration" {
@@ -959,7 +969,18 @@ func (s *Service) liveCandidateMatches(st task.State, record task.ApprovalRecord
 	if err != nil {
 		return false, err
 	}
-	return !task.ManifestChanged(st.CandidateManifest, live) && task.HashManifest(live) == record.SubjectFingerprint, nil
+	if !task.ManifestChanged(st.CandidateManifest, live) && task.HashManifest(live) == record.SubjectFingerprint {
+		return true, nil
+	}
+	// Committing the already-reviewed bytes changes the index projection even
+	// though the checked-out candidate is identical. Accept that clean
+	// post-commit state while rejecting dirty or content-changing mutations.
+	for _, entry := range live {
+		if strings.TrimSpace(entry.Status) != "" {
+			return false, nil
+		}
+	}
+	return task.HashWorktreeManifest(st.CandidateManifest) == task.HashWorktreeManifest(live), nil
 }
 
 // RespondApproval applies one decision to exactly one pending gate. The

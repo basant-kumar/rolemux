@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -336,6 +337,38 @@ func TestCodeApprovalRejectsCandidateChangedAfterReview(t *testing.T) {
 	result, err := service.RespondApproval(context.Background(), state.ID, gate.State.Approval.GateID, task.ApprovalDecisionApprove, "")
 	if ExitCode(err) != ExitReviewNeeded || result.State.Phase != task.PhaseAwaitingApproval || result.State.Approval == nil || result.State.Approval.Status != "" {
 		t.Fatalf("stale approval result=%#v err=%v", result, err)
+	}
+}
+
+func TestCodeApprovalAcceptsReviewedCandidateCommittedUnchanged(t *testing.T) {
+	root := workflowRepo(t)
+	for _, args := range [][]string{{"commit", "-qm", "baseline"}} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "app.go"), []byte("package app\n\nconst reviewed = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &scriptedAdapter{sessions: map[runner.Role]string{}, responses: map[runner.Role][]runner.Envelope{
+		runner.RoleCodeReviewer: {{Role: string(runner.RoleCodeReviewer), Verdict: "approved", Findings: []task.Finding{}}},
+	}}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	state := readyCodeState(t, service, "committed-human-code", MaxRounds, false)
+	gate, err := service.ReviewCode(context.Background(), state.ID)
+	if ExitCode(err) != ExitNeedsInput || gate.State.Approval == nil {
+		t.Fatalf("gate=%#v err=%v", gate, err)
+	}
+	for _, args := range [][]string{{"add", "app.go"}, {"commit", "-qm", "reviewed candidate"}} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if output, runErr := cmd.CombinedOutput(); runErr != nil {
+			t.Fatalf("git %v: %v (%s)", args, runErr, output)
+		}
+	}
+	result, err := service.RespondApproval(context.Background(), state.ID, gate.State.Approval.GateID, task.ApprovalDecisionApprove, "")
+	if err != nil || result.Status != "approved" || result.State.Phase != task.PhaseApproved {
+		t.Fatalf("approval result=%#v err=%v", result, err)
 	}
 }
 
