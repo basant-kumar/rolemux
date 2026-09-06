@@ -588,7 +588,7 @@ func TestCopilotImplementerGetsOnlyScopeConfinedEditAccess(t *testing.T) {
 	}
 	request := Request{Role: RoleImplementer, RepoRoot: root, Scope: "src/**"}
 	config := (&Copilot{}).sessionConfig(request)
-	if tools := strings.Join(config.AvailableTools, ","); !strings.Contains(tools, "builtin:edit") || strings.Contains(tools, "builtin:bash") {
+	if tools := strings.Join(config.AvailableTools, ","); !strings.Contains(tools, "builtin:create") || !strings.Contains(tools, "builtin:edit") || !strings.Contains(tools, "builtin:apply_patch") || strings.Contains(tools, "builtin:bash") {
 		t.Fatalf("implementer tools=%q", tools)
 	}
 	approve := func(candidate string) rpc.PermissionDecision {
@@ -612,7 +612,7 @@ func TestCopilotImplementerGetsOnlyScopeConfinedEditAccess(t *testing.T) {
 		t.Fatal("symlink-escaped write was approved")
 	}
 	reviewer := (&Copilot{}).sessionConfig(Request{Role: RoleCodeReviewer, RepoRoot: root, Scope: "src/**"})
-	if tools := strings.Join(reviewer.AvailableTools, ","); strings.Contains(tools, "builtin:edit") {
+	if tools := strings.Join(reviewer.AvailableTools, ","); strings.Contains(tools, "builtin:edit") || strings.Contains(tools, "builtin:apply_patch") {
 		t.Fatalf("reviewer tools=%q", tools)
 	}
 }
@@ -711,6 +711,14 @@ func TestVerifyReportedSelectionRejectsProviderDrift(t *testing.T) {
 				t.Fatalf("error = %#v", err)
 			}
 		})
+	}
+}
+
+func TestVerifyReportedSelectionAcceptsResolvedAutomaticModel(t *testing.T) {
+	req := Request{Model: "auto"}
+	response := Response{SessionID: "session-1", ReportedModel: "resolved-model"}
+	if err := VerifyReportedSelection("copilot", req, response); err != nil {
+		t.Fatalf("automatic model resolution was rejected: %v", err)
 	}
 }
 

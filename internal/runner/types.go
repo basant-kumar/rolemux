@@ -427,7 +427,11 @@ func modelOptionContains(options []ModelOption, legacy []string, want string) bo
 
 func VerifyReportedSelection(provider string, req Request, response Response) error {
 	known := response.SessionID != ""
-	if response.ReportedModel != "" && response.ReportedModel != req.Model {
+	// Some providers expose an explicit automatic router as a selectable
+	// model. Its terminal response identifies the concrete model chosen for
+	// that turn, which is evidence that routing worked rather than drift.
+	automaticModel := strings.EqualFold(strings.TrimSpace(req.Model), "auto")
+	if response.ReportedModel != "" && response.ReportedModel != req.Model && !automaticModel {
 		return providerError(strings.ToUpper(provider)+"_MODEL_MISMATCH", provider+" reported a different model than requested", false, known, response.SessionID, nil)
 	}
 	if req.Effort != "" && response.ReportedEffort != "" && response.ReportedEffort != req.Effort {

@@ -58,7 +58,9 @@ func CopilotReadOnlyTools() []string {
 func CopilotTools(role Role) []string {
 	tools := CopilotReadOnlyTools()
 	if role == RoleImplementer {
-		tools = copilot.NewToolSet().AddBuiltIn("view", "grep", "web_fetch", "edit").ToSlice()
+		// Current Copilot runtimes can omit create/edit from the callable
+		// namespace unless the related patch tool is also exposed.
+		tools = copilot.NewToolSet().AddBuiltIn("view", "grep", "web_fetch", "create", "edit", "apply_patch").ToSlice()
 	}
 	return tools
 }
