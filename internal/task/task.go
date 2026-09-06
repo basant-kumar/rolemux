@@ -117,18 +117,21 @@ type Diagnostic struct {
 // only when the provider reports them; requests and prompt bytes are measured
 // by RoleMux for every provider invocation.
 type TokenUsage struct {
-	Requests          int64 `json:"requests"`
-	PromptBytes       int64 `json:"prompt_bytes"`
-	InputTokens       int64 `json:"input_tokens,omitempty"`
-	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
-	CacheWriteTokens  int64 `json:"cache_write_tokens,omitempty"`
-	OutputTokens      int64 `json:"output_tokens,omitempty"`
-	ReasoningTokens   int64 `json:"reasoning_tokens,omitempty"`
-	TotalTokens       int64 `json:"total_tokens,omitempty"`
+	Requests           int64 `json:"requests"`
+	PromptBytes        int64 `json:"prompt_bytes"`
+	UnreportedRequests int64 `json:"unreported_requests,omitempty"`
+	IncompleteRequests int64 `json:"incomplete_requests,omitempty"`
+	InputTokens        int64 `json:"input_tokens,omitempty"`
+	CachedInputTokens  int64 `json:"cached_input_tokens,omitempty"`
+	CacheWriteTokens   int64 `json:"cache_write_tokens,omitempty"`
+	OutputTokens       int64 `json:"output_tokens,omitempty"`
+	ReasoningTokens    int64 `json:"reasoning_tokens,omitempty"`
+	TotalTokens        int64 `json:"total_tokens,omitempty"`
 }
 
 func (u TokenUsage) Empty() bool {
 	return u.Requests == 0 && u.PromptBytes == 0 && u.InputTokens == 0 &&
+		u.UnreportedRequests == 0 && u.IncompleteRequests == 0 &&
 		u.CachedInputTokens == 0 && u.CacheWriteTokens == 0 &&
 		u.OutputTokens == 0 && u.ReasoningTokens == 0 && u.TotalTokens == 0
 }
@@ -136,6 +139,8 @@ func (u TokenUsage) Empty() bool {
 func (u *TokenUsage) Add(turn TokenUsage) {
 	u.Requests += turn.Requests
 	u.PromptBytes += turn.PromptBytes
+	u.UnreportedRequests += turn.UnreportedRequests
+	u.IncompleteRequests += turn.IncompleteRequests
 	u.InputTokens += turn.InputTokens
 	u.CachedInputTokens += turn.CachedInputTokens
 	u.CacheWriteTokens += turn.CacheWriteTokens
@@ -194,6 +199,15 @@ type RetryState struct {
 	CreatedAt        time.Time   `json:"created_at"`
 }
 
+type ReviewPolicy struct {
+	MaxRounds int `json:"max_rounds"`
+}
+
+type ReviewProgress struct {
+	Kind   string `json:"kind"`
+	Status string `json:"status"`
+}
+
 // State is the durable task record. Scope and its exact baseline are first
 // established atomically by the first implement invocation.
 type State struct {
@@ -213,6 +227,8 @@ type State struct {
 	IntegrationReview    bool       `json:"integration_review,omitempty"`
 	WorkGraph            bool       `json:"work_graph,omitempty"`
 	WorkUnits            []WorkUnit `json:"work_units,omitempty"`
+	Complexity           string     `json:"complexity,omitempty"`
+	DirectImplementation bool       `json:"direct_implementation,omitempty"`
 
 	PlannerSessionID      string `json:"planner_session_id,omitempty"`
 	PlanReviewerSessionID string `json:"plan_reviewer_session_id,omitempty"`
@@ -235,11 +251,14 @@ type State struct {
 	ReviewCheckpoint         []FileEntry                `json:"review_checkpoint_manifest,omitempty"`
 	ReviewCheckpointHash     string                     `json:"review_checkpoint_manifest_hash,omitempty"`
 	ReviewCheckpointFindings []Finding                  `json:"review_checkpoint_findings,omitempty"`
+	PlanReviewCheckpointHash string                     `json:"plan_review_checkpoint_hash,omitempty"`
 	ProfilesSnapshot         map[string]ProfileSnapshot `json:"profiles_snapshot,omitempty"`
 	RuntimeSnapshot          map[string]RuntimeSnapshot `json:"runtime_snapshot,omitempty"`
 	MaxRounds                int                        `json:"max_rounds,omitempty"`
 	PlanRound                int                        `json:"plan_round,omitempty"`
 	CodeRound                int                        `json:"code_round,omitempty"`
+	ReviewPolicy             *ReviewPolicy              `json:"review_policy,omitempty"`
+	ReviewProgress           *ReviewProgress            `json:"review_progress,omitempty"`
 	PendingQuestion          string                     `json:"pending_question,omitempty"`
 	PendingQuestionSource    string                     `json:"pending_question_source,omitempty"`
 	PendingAnswer            string                     `json:"pending_answer,omitempty"`

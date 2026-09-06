@@ -74,6 +74,30 @@ type Event struct {
 	Raw       json.RawMessage `json:"raw,omitempty"`
 }
 
+type UsageStatus string
+
+const (
+	UsageComplete   UsageStatus = "complete"
+	UsageIncomplete UsageStatus = "incomplete"
+	UsageUnreported UsageStatus = "unreported"
+
+	// UsageStatus* aliases keep the field-oriented names convenient for
+	// callers while Usage* follows the package's other typed-constant APIs.
+	UsageStatusComplete   = UsageComplete
+	UsageStatusIncomplete = UsageIncomplete
+	UsageStatusUnreported = UsageUnreported
+)
+
+func usageStatus(reported, terminal bool) UsageStatus {
+	if !reported {
+		return UsageStatusUnreported
+	}
+	if terminal {
+		return UsageStatusComplete
+	}
+	return UsageStatusIncomplete
+}
+
 type Response struct {
 	Text           string          `json:"text,omitempty"`
 	SessionID      string          `json:"session_id"`
@@ -82,6 +106,7 @@ type Response struct {
 	Envelope       *Envelope       `json:"envelope,omitempty"`
 	Raw            json.RawMessage `json:"raw,omitempty"`
 	Usage          task.TokenUsage `json:"usage,omitempty"`
+	UsageStatus    UsageStatus     `json:"usage_status,omitempty"`
 	// UsageCumulative means token counters cover the whole resumed provider
 	// conversation rather than only this invocation.
 	UsageCumulative bool `json:"usage_cumulative,omitempty"`
@@ -91,72 +116,181 @@ type Response struct {
 // and Copilot, cached tokens are a subset of input tokens; Anthropic reports
 // cache read/write tokens separately, so callers select the correct total.
 func UsageFromMap(values map[string]any, inputIncludesCache bool) task.TokenUsage {
+	usage, _ := UsageFromMapWithPresence(values, inputIncludesCache)
+	return usage
+}
+
+// UsageFromMapWithPresence is UsageFromMap plus whether values contained at
+// least one recognized numeric usage counter. Presence is deliberately
+// independent from the counter values so an explicitly reported zero remains
+// distinguishable from an absent usage report.
+func UsageFromMapWithPresence(values map[string]any, inputIncludesCache bool) (task.TokenUsage, bool) {
+	if values == nil {
+		return task.TokenUsage{}, false
+	}
 	if nested, ok := values["usage"].(map[string]any); ok {
 		values = nested
 	}
-	usage := task.TokenUsage{
-		InputTokens:       number(values, "input_tokens", "inputTokens"),
-		CachedInputTokens: number(values, "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
-		CacheWriteTokens:  number(values, "cache_creation_input_tokens", "cacheWriteTokens"),
-		OutputTokens:      number(values, "output_tokens", "outputTokens"),
-		ReasoningTokens:   number(values, "reasoning_tokens", "reasoningTokens"),
-		TotalTokens:       number(values, "total_tokens", "totalTokens"),
+	var usage task.TokenUsage
+	var reported bool
+	var present bool
+	if usage.InputTokens, present = numberWithPresence(values, "input_tokens", "inputTokens"); present {
+		reported = true
 	}
-	if details, ok := values["input_tokens_details"].(map[string]any); ok && usage.CachedInputTokens == 0 {
-		usage.CachedInputTokens = number(details, "cached_tokens")
+	if usage.CachedInputTokens, present = numberWithPresence(values, "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"); present {
+		reported = true
 	}
-	if details, ok := values["output_tokens_details"].(map[string]any); ok && usage.ReasoningTokens == 0 {
-		usage.ReasoningTokens = number(details, "reasoning_tokens")
+	if usage.CacheWriteTokens, present = numberWithPresence(values, "cache_creation_input_tokens", "cache_write_tokens", "cacheWriteTokens"); present {
+		reported = true
 	}
-	if usage.TotalTokens == 0 {
+	if usage.OutputTokens, present = numberWithPresence(values, "output_tokens", "outputTokens"); present {
+		reported = true
+	}
+	if usage.ReasoningTokens, present = numberWithPresence(values, "reasoning_tokens", "reasoningTokens"); present {
+		reported = true
+	}
+	if usage.TotalTokens, present = numberWithPresence(values, "total_tokens", "totalTokens"); present {
+		reported = true
+	}
+	if details, ok := values["input_tokens_details"].(map[string]any); ok {
+		if cached, detailsPresent := numberWithPresence(details, "cached_tokens", "cachedTokens"); detailsPresent && usage.CachedInputTokens == 0 {
+			if _, explicit := numberWithPresence(values, "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"); !explicit {
+				usage.CachedInputTokens = cached
+			}
+			reported = true
+		}
+	}
+	if details, ok := values["inputTokensDetails"].(map[string]any); ok {
+		if cached, detailsPresent := numberWithPresence(details, "cached_tokens", "cachedTokens"); detailsPresent && usage.CachedInputTokens == 0 {
+			if _, explicit := numberWithPresence(values, "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"); !explicit {
+				usage.CachedInputTokens = cached
+			}
+			reported = true
+		}
+	}
+	if details, ok := values["output_tokens_details"].(map[string]any); ok {
+		if reasoning, detailsPresent := numberWithPresence(details, "reasoning_tokens", "reasoningTokens"); detailsPresent && usage.ReasoningTokens == 0 {
+			if _, explicit := numberWithPresence(values, "reasoning_tokens", "reasoningTokens"); !explicit {
+				usage.ReasoningTokens = reasoning
+			}
+			reported = true
+		}
+	}
+	if details, ok := values["outputTokensDetails"].(map[string]any); ok {
+		if reasoning, detailsPresent := numberWithPresence(details, "reasoning_tokens", "reasoningTokens"); detailsPresent && usage.ReasoningTokens == 0 {
+			if _, explicit := numberWithPresence(values, "reasoning_tokens", "reasoningTokens"); !explicit {
+				usage.ReasoningTokens = reasoning
+			}
+			reported = true
+		}
+	}
+	if !reported {
+		return usage, false
+	}
+	if !hasNumericField(values, "total_tokens", "totalTokens") {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 		if !inputIncludesCache {
 			usage.TotalTokens += usage.CachedInputTokens + usage.CacheWriteTokens
 		}
 	}
-	return usage
+	return usage, true
 }
 
 func number(values map[string]any, keys ...string) int64 {
+	value, _ := numberWithPresence(values, keys...)
+	return value
+}
+
+func numberWithPresence(values map[string]any, keys ...string) (int64, bool) {
+	if values == nil {
+		return 0, false
+	}
 	for _, key := range keys {
-		switch value := values[key].(type) {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
 		case float64:
-			return int64(value)
+			return int64(typed), true
+		case float32:
+			return int64(typed), true
 		case int64:
-			return value
+			return typed, true
 		case int:
-			return int64(value)
+			return int64(typed), true
+		case int32:
+			return int64(typed), true
+		case int16:
+			return int64(typed), true
+		case int8:
+			return int64(typed), true
+		case uint:
+			return int64(typed), true
+		case uint64:
+			return int64(typed), true
+		case uint32:
+			return int64(typed), true
+		case uint16:
+			return int64(typed), true
+		case uint8:
+			return int64(typed), true
 		case json.Number:
-			n, _ := value.Int64()
-			return n
+			if n, err := typed.Int64(); err == nil {
+				return n, true
+			}
+			if n, err := typed.Float64(); err == nil {
+				return int64(n), true
+			}
 		}
 	}
-	return 0
+	return 0, false
+}
+
+func hasNumericField(values map[string]any, keys ...string) bool {
+	_, ok := numberWithPresence(values, keys...)
+	return ok
 }
 
 func usageFromJSONDocument(data []byte, inputIncludesCache bool) TokenUsage {
+	usage, _ := usageFromJSONDocumentWithPresence(data, inputIncludesCache)
+	return usage
+}
+
+func usageFromJSONDocumentWithPresence(data []byte, inputIncludesCache bool) (TokenUsage, bool) {
 	var values map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	if err := decoder.Decode(&values); err != nil {
-		return TokenUsage{}
+		return TokenUsage{}, false
 	}
-	return UsageFromMap(values, inputIncludesCache)
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return TokenUsage{}, false
+	}
+	return UsageFromMapWithPresence(values, inputIncludesCache)
 }
 
 func usageFromJSONLines(data []byte, inputIncludesCache bool) TokenUsage {
+	usage, _ := usageFromJSONLinesWithPresence(data, inputIncludesCache)
+	return usage
+}
+
+func usageFromJSONLinesWithPresence(data []byte, inputIncludesCache bool) (TokenUsage, bool) {
 	var latest TokenUsage
+	present := false
 	for _, line := range bytes.Split(data, []byte{'\n'}) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
-		usage := usageFromJSONDocument(line, inputIncludesCache)
-		if !usage.Empty() {
+		usage, linePresent := usageFromJSONDocumentWithPresence(line, inputIncludesCache)
+		if linePresent {
 			latest = usage
+			present = true
 		}
 	}
-	return latest
+	return latest, present
 }
 
 type ModelInfo struct {

@@ -34,6 +34,8 @@ var (
 )
 
 const (
+	DefaultReviewMaxRounds = 5
+
 	RolePlanner      = "planner"
 	RoleImplementer  = "implementer"
 	RoleReviewer     = "reviewer"
@@ -145,10 +147,12 @@ type Config struct {
 	Models                     map[string]map[string]CustomModel `toml:"models" json:"models"`
 	CatalogTTLSeconds          int                               `toml:"catalog_ttl_seconds,omitempty" json:"catalog_ttl_seconds,omitempty"`
 	ProviderTurnTimeoutSeconds int                               `toml:"provider_turn_timeout_seconds,omitempty" json:"provider_turn_timeout_seconds,omitempty"`
+	ReviewMaxRounds            *int                              `toml:"review_max_rounds,omitempty" json:"review_max_rounds,omitempty"`
 	Raw                        map[string]any                    `toml:"-" json:"-"`
 }
 
 func Default() Config {
+	reviewMaxRounds := DefaultReviewMaxRounds
 	return Config{
 		Profiles: map[string]Profile{
 			RolePlanner:     {Provider: "codex"},
@@ -157,7 +161,15 @@ func Default() Config {
 		},
 		Providers: map[string]Provider{}, Models: map[string]map[string]CustomModel{},
 		CatalogTTLSeconds: 86400, ProviderTurnTimeoutSeconds: 900,
+		ReviewMaxRounds: &reviewMaxRounds,
 	}
+}
+
+func (c Config) EffectiveReviewMaxRounds() int {
+	if c.ReviewMaxRounds == nil {
+		return DefaultReviewMaxRounds
+	}
+	return *c.ReviewMaxRounds
 }
 
 func CanonicalRole(role string) (string, error) {
@@ -302,13 +314,18 @@ func ConfigPaths(repoRoot string, environ []string) (global, project string) {
 	return global, project
 }
 
+// ExplicitConfigPath returns the replacement configuration path selected by
+// ROLEMUX_CONFIG, or an empty string when no replacement is configured.
+func ExplicitConfigPath(environ []string) string {
+	return strings.TrimSpace(envMap(environ)["ROLEMUX_CONFIG"])
+}
+
 func Load(repoRoot string) (Config, error) { return LoadWithEnv(repoRoot, os.Environ()) }
 
 func LoadWithEnv(repoRoot string, environ []string) (Config, error) {
 	cfg := Default()
-	env := envMap(environ)
 	paths := []string{}
-	if explicit := strings.TrimSpace(env["ROLEMUX_CONFIG"]); explicit != "" {
+	if explicit := ExplicitConfigPath(environ); explicit != "" {
 		paths = append(paths, explicit)
 	} else {
 		global, project := ConfigPaths(repoRoot, environ)
@@ -322,6 +339,7 @@ func LoadWithEnv(repoRoot string, environ []string) (Config, error) {
 			return Config{}, err
 		}
 	}
+	env := envMap(environ)
 	applyEnvironment(&cfg, env)
 	if err := Validate(cfg); err != nil {
 		return Config{}, err
@@ -397,6 +415,10 @@ func merge(dst *Config, src Config) {
 	}
 	if src.ProviderTurnTimeoutSeconds != 0 {
 		dst.ProviderTurnTimeoutSeconds = src.ProviderTurnTimeoutSeconds
+	}
+	if src.ReviewMaxRounds != nil {
+		reviewMaxRounds := *src.ReviewMaxRounds
+		dst.ReviewMaxRounds = &reviewMaxRounds
 	}
 }
 
@@ -569,6 +591,9 @@ func Validate(c Config) error {
 	}
 	if c.ProviderTurnTimeoutSeconds != 0 && (c.ProviderTurnTimeoutSeconds < 30 || c.ProviderTurnTimeoutSeconds > 7200) {
 		return errors.New("provider_turn_timeout_seconds must be between 30 and 7200")
+	}
+	if c.ReviewMaxRounds != nil && *c.ReviewMaxRounds < 0 {
+		return errors.New("review_max_rounds must not be negative")
 	}
 	for name, p := range c.Providers {
 		if !providerNamePattern.MatchString(name) {
@@ -934,29 +959,7 @@ func ConfigureProfile(name, role string, profile Profile, beforeHash string) err
 	if err := ValidateProfile(profile); err != nil {
 		return err
 	}
-	cfg, raw, err := readForUpdate(name)
-	if err != nil {
-		return err
-	}
-	if current, err := FileHash(name); err != nil {
-		return err
-	} else if current != beforeHash {
-		return ErrConfigConflict
-	}
-	if raw == nil {
-		raw = map[string]any{}
-	}
-	profiles := mapFrom(raw["profiles"])
-	profiles[canonical] = map[string]any{"provider": profile.Provider, "model": profile.Model}
-	if profile.Effort != "" {
-		profiles[canonical].(map[string]any)["effort"] = profile.Effort
-	}
-	if profile.Speed != "" {
-		profiles[canonical].(map[string]any)["speed"] = profile.Speed
-	}
-	raw["profiles"] = profiles
-	_ = cfg
-	return WriteRawAtomic(name, raw, beforeHash)
+	return ConfigureSettingsAtomic(name, map[string]Profile{canonical: profile}, nil, beforeHash)
 }
 
 // ConfigureProfilesAtomic updates a set of profiles in one compare-and-swap
@@ -965,14 +968,16 @@ func ConfigureProfilesAtomic(name string, profilesToSet map[string]Profile, befo
 	if len(profilesToSet) == 0 {
 		return errors.New("at least one profile is required")
 	}
-	_, raw, err := readForUpdate(name)
-	if err != nil {
-		return err
+	return ConfigureSettingsAtomic(name, profilesToSet, nil, beforeHash)
+}
+
+// ConfigureSettingsAtomic updates profiles and/or the review safety limit in
+// one compare-and-swap write while preserving all unrelated TOML keys.
+func ConfigureSettingsAtomic(name string, profilesToSet map[string]Profile, reviewMaxRounds *int, beforeHash string) error {
+	if len(profilesToSet) == 0 && reviewMaxRounds == nil {
+		return errors.New("at least one setting is required")
 	}
-	if raw == nil {
-		raw = map[string]any{}
-	}
-	profiles := mapFrom(raw["profiles"])
+	validatedProfiles := make(map[string]Profile, len(profilesToSet))
 	for role, profile := range profilesToSet {
 		canonical, err := CanonicalRole(role)
 		if err != nil {
@@ -981,16 +986,36 @@ func ConfigureProfilesAtomic(name string, profilesToSet map[string]Profile, befo
 		if err := ValidateProfile(profile); err != nil {
 			return fmt.Errorf("profile %s: %w", canonical, err)
 		}
-		value := map[string]any{"provider": profile.Provider, "model": profile.Model}
-		if profile.Effort != "" {
-			value["effort"] = profile.Effort
-		}
-		if profile.Speed != "" {
-			value["speed"] = profile.Speed
-		}
-		profiles[canonical] = value
+		validatedProfiles[canonical] = profile
 	}
-	raw["profiles"] = profiles
+	if reviewMaxRounds != nil && *reviewMaxRounds < 0 {
+		return errors.New("review_max_rounds must not be negative")
+	}
+
+	_, raw, err := readForUpdate(name)
+	if err != nil {
+		return err
+	}
+	if raw == nil {
+		raw = map[string]any{}
+	}
+	if len(validatedProfiles) > 0 {
+		profiles := mapFrom(raw["profiles"])
+		for role, profile := range validatedProfiles {
+			value := map[string]any{"provider": profile.Provider, "model": profile.Model}
+			if profile.Effort != "" {
+				value["effort"] = profile.Effort
+			}
+			if profile.Speed != "" {
+				value["speed"] = profile.Speed
+			}
+			profiles[role] = value
+		}
+		raw["profiles"] = profiles
+	}
+	if reviewMaxRounds != nil {
+		raw["review_max_rounds"] = *reviewMaxRounds
+	}
 	return WriteRawAtomic(name, raw, beforeHash)
 }
 
@@ -1030,6 +1055,9 @@ func ImportConfigAtomic(name string, data []byte, beforeHash string) error {
 	}
 	if _, ok := source["provider_turn_timeout_seconds"]; ok {
 		destination["provider_turn_timeout_seconds"] = fragment.ProviderTurnTimeoutSeconds
+	}
+	if _, ok := source["review_max_rounds"]; ok && fragment.ReviewMaxRounds != nil {
+		destination["review_max_rounds"] = *fragment.ReviewMaxRounds
 	}
 	return WriteRawAtomic(name, destination, beforeHash)
 }
@@ -1073,6 +1101,9 @@ func WriteConfigAtomic(name string, cfg Config, beforeHash string) error {
 	}
 	if cfg.ProviderTurnTimeoutSeconds != 0 {
 		raw["provider_turn_timeout_seconds"] = cfg.ProviderTurnTimeoutSeconds
+	}
+	if cfg.ReviewMaxRounds != nil {
+		raw["review_max_rounds"] = *cfg.ReviewMaxRounds
 	}
 	return WriteRawAtomic(name, raw, beforeHash)
 }

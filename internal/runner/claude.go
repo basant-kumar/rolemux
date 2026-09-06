@@ -83,8 +83,8 @@ func (c *Claude) Run(ctx context.Context, req Request, callbacks Callbacks) (Res
 	spec := ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes}
 	result, processErr := c.runClaudeTask(ctx, req, spec, callbacks)
 	outerID, nested, model, effort, parseErr := parseClaudeResult(result.Stdout, req.SessionID, req.Role)
-	usage := usageFromJSONDocument(result.Stdout, false)
-	response := Response{SessionID: outerID, Text: string(nested), ReportedModel: model, ReportedEffort: effort, Usage: usage}
+	usage, usageReported := usageFromJSONDocumentWithPresence(result.Stdout, false)
+	response := Response{SessionID: outerID, Text: string(nested), ReportedModel: model, ReportedEffort: effort, Usage: usage, UsageStatus: usageStatus(usageReported, usageReported)}
 	// A fresh Claude session ID is assigned and persisted before launch. Once
 	// the OS accepts the task process, an error must retry that exact ID rather
 	// than risk replaying the turn in a new conversation.

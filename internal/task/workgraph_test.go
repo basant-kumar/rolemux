@@ -46,3 +46,36 @@ func TestWorkUnitFallbackAndDerivedIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestPlannerScopesRejectProseAndAnnotations(t *testing.T) {
+	base := WorkUnit{ID: "T1", Objective: "change", ExecutionPacket: "packet", AcceptanceCriteria: []string{"done"}, ValidationCommands: []string{"test"}}
+	for _, scope := range []string{"Write only internal/a.go", "internal/a.go (new)", "internal/a.go,and internal/b.go", "internal/a.go."} {
+		unit := base
+		unit.Scope = scope
+		if _, err := NormalizeWorkUnits([]WorkUnit{unit}, "plan"); err == nil || !strings.Contains(err.Error(), "bare repository paths") {
+			t.Fatalf("scope %q err=%v", scope, err)
+		}
+	}
+}
+
+func TestComplexityBoundsWorkGraphSize(t *testing.T) {
+	unit := func(id string) WorkUnit {
+		return WorkUnit{ID: id, Objective: id, Scope: id + ".go", ExecutionPacket: id, AcceptanceCriteria: []string{"done"}, ValidationCommands: []string{"test"}}
+	}
+	for _, tc := range []struct {
+		complexity string
+		units      []WorkUnit
+		wantError  bool
+	}{
+		{ComplexityTrivial, []WorkUnit{unit("T1")}, false},
+		{ComplexityTrivial, []WorkUnit{unit("T1"), unit("T2")}, true},
+		{ComplexitySmall, []WorkUnit{unit("T1"), unit("T2")}, false},
+		{ComplexitySmall, []WorkUnit{unit("T1"), unit("T2"), unit("T3")}, true},
+		{ComplexityLarge, []WorkUnit{unit("T1"), unit("T2"), unit("T3")}, false},
+	} {
+		err := ValidateWorkUnitsForComplexity(tc.complexity, tc.units)
+		if (err != nil) != tc.wantError {
+			t.Fatalf("complexity=%s units=%d err=%v", tc.complexity, len(tc.units), err)
+		}
+	}
+}

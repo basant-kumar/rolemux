@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,11 +37,15 @@ Usage:
   rolemux models [--refresh] [--runner PROVIDER] [--json]
   rolemux configure [--global|--project] [--from PATH|-]
                     [--role planner|implementer|reviewer|plan-reviewer|code-reviewer]
-                    [--runner PROVIDER] [--model MODEL] [--effort EFFORT] [--speed SPEED] [--json]
+                    [--runner PROVIDER] [--model MODEL] [--effort EFFORT] [--speed SPEED]
+                    [--review-max-rounds N] [--json]
+  Review safety limit: --review-max-rounds N defaults to 5, accepts 0 for unlimited,
+  and applies to newly created tasks.
   rolemux plan start --task TEXT [--id TASK-ID] [--json]
   rolemux plan answer TASK-ID --answer TEXT [--json]
   rolemux plan review TASK-ID [--json]
   rolemux plan graph TASK-ID [--json]
+  rolemux quick start --task TEXT --scope PATH[,PATH...] [--id TASK-ID] [--json]
   rolemux work start TASK-ID UNIT-ID [--json]
   rolemux work integrate TASK-ID [--json]
   rolemux implement TASK-ID [--scope PATH[,PATH...]] [--json]
@@ -100,6 +105,8 @@ func (a *app) run(args []string) int {
 		return a.runConfigure(args[1:])
 	case "plan":
 		return a.runPlan(args[1:])
+	case "quick":
+		return a.runQuick(args[1:])
 	case "work":
 		return a.runWork(args[1:])
 	case "implement":
@@ -121,6 +128,26 @@ func (a *app) run(args []string) int {
 	default:
 		return a.fail(args[0], usage("unknown command %q", args[0]), jsonMode, workflow.Result{})
 	}
+}
+
+func (a *app) runQuick(args []string) int {
+	jsonMode := containsFlag(args, "--json")
+	if len(args) == 0 || args[0] != "start" {
+		return a.fail("quick", usage("quick requires start"), jsonMode, workflow.Result{})
+	}
+	opts, err := parse(args[1:], map[string]bool{"--json": false, "--task": true, "--scope": true, "--id": true})
+	if err != nil || len(opts.positionals) != 0 || !opts.present("--task") || !opts.present("--scope") {
+		if err == nil {
+			err = usage("quick start requires --task, --scope, and no positional arguments")
+		}
+		return a.fail("quick-start", err, opts.json(), workflow.Result{})
+	}
+	service, err := a.workflowServiceForTask(opts.value("--id"))
+	if err != nil {
+		return a.fail("quick-start", err, opts.json(), workflow.Result{})
+	}
+	result, callErr := service.StartQuick(opts.value("--task"), opts.value("--scope"), opts.value("--id"))
+	return a.workflowResult("quick-start", result, callErr, opts.json())
 }
 
 func (a *app) runVersion(args []string) int {
@@ -206,85 +233,109 @@ func (a *app) runModels(args []string) int {
 }
 
 func (a *app) runConfigure(args []string) int {
+	jsonMode := containsFlag(args, "--json")
 	opts, err := parse(args, map[string]bool{
 		"--json": false, "--global": false, "--project": false, "--from": true,
 		"--role": true, "--runner": true, "--model": true, "--effort": true, "--speed": true,
+		"--review-max-rounds": true,
 	})
 	if err != nil || len(opts.positionals) != 0 {
 		if err == nil {
 			err = usage("configure accepts no positional arguments")
 		}
-		return a.fail("configure", err, opts.json(), workflow.Result{})
+		return a.fail("configure", err, jsonMode, workflow.Result{})
 	}
 	if opts.bool("--global") && opts.bool("--project") {
-		return a.fail("configure", usage("--global and --project are mutually exclusive"), opts.json(), workflow.Result{})
+		return a.fail("configure", usage("--global and --project are mutually exclusive"), jsonMode, workflow.Result{})
 	}
-	direct := opts.present("--role") || opts.present("--runner") || opts.present("--model") || opts.present("--effort") || opts.present("--speed")
+	profileDirect := opts.present("--role") || opts.present("--runner") || opts.present("--model") || opts.present("--effort") || opts.present("--speed")
+	limitDirect := opts.present("--review-max-rounds")
+	direct := profileDirect || limitDirect
 	from := opts.present("--from")
 	if from && direct {
-		return a.fail("configure", usage("--from is mutually exclusive with role selection flags"), opts.json(), workflow.Result{})
+		return a.fail("configure", usage("--from is mutually exclusive with direct settings flags"), jsonMode, workflow.Result{})
 	}
 	interactive := !from && !direct
-	if opts.json() && interactive {
+	if jsonMode && interactive {
 		return a.fail("configure", usage("--json requires --from or explicit role selection"), true, workflow.Result{})
 	}
 	if !opts.bool("--global") && !opts.bool("--project") && !interactive {
-		return a.fail("configure", usage("select exactly one of --global or --project"), opts.json(), workflow.Result{})
+		return a.fail("configure", usage("select exactly one of --global or --project"), jsonMode, workflow.Result{})
 	}
 	if interactive && !isInteractive(a.in) {
-		return a.fail("configure", usage("interactive configure requires a terminal, or pass --role/--from and a target"), opts.json(), workflow.Result{})
+		return a.fail("configure", usage("interactive configure requires a terminal, or pass --role/--from and a target"), jsonMode, workflow.Result{})
+	}
+	var reviewMaxRounds *int
+	if limitDirect {
+		value, parseErr := parseReviewMaxRounds(opts.value("--review-max-rounds"))
+		if parseErr != nil {
+			return a.fail("configure", parseErr, jsonMode, workflow.Result{})
+		}
+		reviewMaxRounds = &value
 	}
 	root := a.optionalRepo()
 	if interactive {
-		target, profiles, before, pickErr := a.pickInteractiveConfiguration(root, opts.bool("--global"), opts.bool("--project"))
+		target, draft, before, pickErr := a.pickInteractiveConfiguration(root, opts.bool("--global"), opts.bool("--project"))
 		if pickErr != nil {
 			return a.fail("configure", pickErr, false, workflow.Result{})
 		}
-		if err := config.ConfigureProfilesAtomic(target, profiles, before); err != nil {
+		if err := config.ConfigureSettingsAtomic(target, draft.profiles, draft.reviewMaxRounds, before); err != nil {
 			return a.fail("configure", configProblem(err), false, workflow.Result{})
 		}
 		return a.configureSuccess(target, "updated", false)
 	}
 	target, err := configTarget(root, opts.bool("--global"), opts.bool("--project"), a.environ)
 	if err != nil {
-		return a.fail("configure", usage("%v", err), opts.json(), workflow.Result{})
+		return a.fail("configure", usage("%v", err), jsonMode, workflow.Result{})
 	}
 	before, err := config.FileHash(target)
 	if err != nil {
-		return a.fail("configure", configProblem(err), opts.json(), workflow.Result{})
+		return a.fail("configure", configProblem(err), jsonMode, workflow.Result{})
 	}
 	if from {
 		data, readErr := a.readConfigSource(opts.value("--from"))
 		if readErr != nil {
-			return a.fail("configure", configProblem(readErr), opts.json(), workflow.Result{})
+			return a.fail("configure", configProblem(readErr), jsonMode, workflow.Result{})
 		}
 		if err := config.ImportConfigAtomic(target, data, before); err != nil {
-			return a.fail("configure", configProblem(err), opts.json(), workflow.Result{})
+			return a.fail("configure", configProblem(err), jsonMode, workflow.Result{})
 		}
-		return a.configureSuccess(target, "imported", opts.json())
+		return a.configureSuccess(target, "imported", jsonMode)
 	}
 	if direct {
-		role, roleErr := config.CanonicalRole(opts.value("--role"))
-		if roleErr != nil || !opts.present("--runner") || !opts.present("--model") {
-			if roleErr == nil {
-				roleErr = usage("--role, --runner, and --model are required together")
+		profiles := map[string]config.Profile(nil)
+		if profileDirect {
+			if !opts.present("--role") || !opts.present("--runner") || !opts.present("--model") {
+				return a.fail("configure", usage("--role, --runner, and --model are required together"), jsonMode, workflow.Result{})
 			}
-			return a.fail("configure", roleErr, opts.json(), workflow.Result{})
+			role, roleErr := config.CanonicalRole(opts.value("--role"))
+			if roleErr != nil {
+				return a.fail("configure", configProblem(roleErr), jsonMode, workflow.Result{})
+			}
+			profile := config.Profile{Provider: strings.ToLower(opts.value("--runner")), Model: opts.value("--model"), Effort: opts.value("--effort"), Speed: opts.value("--speed")}
+			cfg, loadErr := config.LoadWithEnv(root, a.environ)
+			if loadErr != nil {
+				return a.fail("configure", configProblem(loadErr), jsonMode, workflow.Result{})
+			}
+			if selectionErr := a.validateProfileSelection(root, cfg, role, profile); selectionErr != nil {
+				return a.fail("configure", configProblem(selectionErr), jsonMode, workflow.Result{})
+			}
+			profiles = map[string]config.Profile{role: profile}
 		}
-		profile := config.Profile{Provider: strings.ToLower(opts.value("--runner")), Model: opts.value("--model"), Effort: opts.value("--effort"), Speed: opts.value("--speed")}
-		cfg, loadErr := config.LoadWithEnv(root, a.environ)
-		if loadErr != nil {
-			return a.fail("configure", configProblem(loadErr), opts.json(), workflow.Result{})
+		if err := config.ConfigureSettingsAtomic(target, profiles, reviewMaxRounds, before); err != nil {
+			return a.fail("configure", configProblem(err), jsonMode, workflow.Result{})
 		}
-		if selectionErr := a.validateProfileSelection(root, cfg, role, profile); selectionErr != nil {
-			return a.fail("configure", configProblem(selectionErr), opts.json(), workflow.Result{})
-		}
-		if err := config.ConfigureProfile(target, role, profile, before); err != nil {
-			return a.fail("configure", configProblem(err), opts.json(), workflow.Result{})
-		}
-		return a.configureSuccess(target, "updated", opts.json())
+		return a.configureSuccess(target, "updated", jsonMode)
 	}
 	return a.fail("configure", usage("configuration mode is required"), false, workflow.Result{})
+}
+
+func parseReviewMaxRounds(raw string) (int, error) {
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, usage("--review-max-rounds must be a nonnegative integer")
+	}
+	return value, nil
 }
 
 func (a *app) validateProfileSelection(root string, cfg config.Config, role string, profile config.Profile) error {
@@ -316,42 +367,57 @@ func (a *app) configureSuccess(path, status string, jsonMode bool) int {
 	return workflow.ExitOK
 }
 
-func (a *app) pickInteractiveConfiguration(root string, global, project bool) (string, map[string]config.Profile, string, error) {
+type settingsDraft struct {
+	profiles        map[string]config.Profile
+	reviewMaxRounds *int
+}
+
+func (a *app) pickInteractiveConfiguration(root string, global, project bool) (string, settingsDraft, string, error) {
 	screen := picker.NewScreen(a.out)
 	screen.Enter()
 	defer screen.Leave()
 
-	if !global && !project {
+	target := config.ExplicitConfigPath(a.environ)
+	if target == "" && !global && !project {
 		if root == "" {
-			return "", nil, "", usage("interactive project configuration requires a Git worktree")
+			return "", settingsDraft{}, "", usage("interactive project configuration requires a Git worktree")
+		}
+		projectTarget, err := configTarget(root, false, true, a.environ)
+		if err != nil {
+			return "", settingsDraft{}, "", usage("%v", err)
 		}
 		choice, action, err := picker.Select(a.ctx, a.in, a.out, yesNoOptions("Cancel", "Configure this project"), picker.View{
-			Title: "Configure RoleMux", Subtitle: fmt.Sprintf("Configure this project (%s)?", root), FullScreen: true,
+			Title: "Configure RoleMux", Step: "Project", Subtitle: fmt.Sprintf("Configure this project (%s)?", projectTarget), FullScreen: true,
 		})
 		if err != nil {
-			return "", nil, "", err
+			return "", settingsDraft{}, "", err
 		}
 		if action != picker.ActionSelected || choice.ID != "yes" {
-			return "", nil, "", usage("configuration cancelled")
+			return "", settingsDraft{}, "", usage("configuration cancelled")
 		}
 		project = true
+		target = projectTarget
 	}
-	target, err := configTarget(root, global, project, a.environ)
-	if err != nil {
-		return "", nil, "", usage("%v", err)
+	if target == "" {
+		var err error
+		target, err = configTarget(root, global, project, a.environ)
+		if err != nil {
+			return "", settingsDraft{}, "", usage("%v", err)
+		}
 	}
 	before, err := config.FileHash(target)
 	if err != nil {
-		return "", nil, "", configProblem(err)
+		return "", settingsDraft{}, "", configProblem(err)
 	}
-	profiles, err := a.pickProfiles(root, screen)
-	return target, profiles, before, err
+	draft, err := a.pickProfiles(root, screen)
+	return target, draft, before, err
 }
 
 type wizardScreenKind int
 
 const (
 	wizardRole wizardScreenKind = iota
+	wizardReviewMaxRounds
 	wizardProvider
 	wizardModel
 	wizardVerifyModel
@@ -384,13 +450,14 @@ type providerReadiness struct {
 	message       string
 }
 
-func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]config.Profile, error) {
+func (a *app) pickProfiles(root string, terminal *picker.Screen) (settingsDraft, error) {
 	cfg, err := config.LoadWithEnv(root, a.environ)
 	if err != nil {
-		return nil, configProblem(err)
+		return settingsDraft{}, configProblem(err)
 	}
-	cfg, adapters, adapterErrors := prepareAdapters(cfg, root, a.runnerRegistry())
-	cat := catalog.New(adapters, cfg, catalog.DefaultCachePath(a.environ))
+	var adapters map[string]runner.Adapter
+	var adapterErrors map[string]error
+	var cat *catalog.Catalog
 	var readiness map[string]providerReadiness
 	drafts := map[string]*profileDraft{}
 	modelsByProvider := map[string][]runner.ModelInfo{}
@@ -399,6 +466,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 	current := wizardScreen{kind: wizardRole}
 	selection := "all"
 	notice := ""
+	var reviewMaxRounds *int
 
 	goBack := func() bool {
 		if len(history) == 0 {
@@ -422,6 +490,8 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 		switch current.kind {
 		case wizardRole:
 			options = wizardRoleOptions()
+		case wizardReviewMaxRounds:
+			options = reviewMaxRoundsOptions(cfg.EffectiveReviewMaxRounds())
 		case wizardProvider:
 			options = providerWizardOptions(a.runnerRegistry().Names(), readiness)
 		case wizardModel:
@@ -437,14 +507,14 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 		}
 		choice, pickAction, pickErr := picker.Select(a.ctx, a.in, a.out, options, view)
 		if pickErr != nil {
-			return nil, pickErr
+			return settingsDraft{}, pickErr
 		}
 		if pickAction == picker.ActionCancel {
-			return nil, usage("configuration cancelled")
+			return settingsDraft{}, usage("configuration cancelled")
 		}
 		if pickAction == picker.ActionBack {
 			if !goBack() {
-				return nil, usage("configuration cancelled")
+				return settingsDraft{}, usage("configuration cancelled")
 			}
 			continue
 		}
@@ -452,6 +522,14 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 		switch current.kind {
 		case wizardRole:
 			selection = choice.ID
+			if selection == "review-max-rounds" {
+				advance(wizardScreen{kind: wizardReviewMaxRounds})
+				continue
+			}
+			if adapters == nil {
+				cfg, adapters, adapterErrors = prepareAdapters(cfg, root, a.runnerRegistry())
+				cat = catalog.New(adapters, cfg, catalog.DefaultCachePath(a.environ))
+			}
 			role := choice.ID
 			if selection == "all" {
 				role = config.RolePlanner
@@ -460,6 +538,14 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 				readiness = a.installedProviders(cfg, adapters, adapterErrors)
 			}
 			advance(wizardScreen{kind: wizardProvider, role: role})
+
+		case wizardReviewMaxRounds:
+			value, parseErr := strconv.Atoi(choice.ID)
+			if parseErr != nil || value < 0 {
+				return settingsDraft{}, usage("invalid review safety limit %q", choice.ID)
+			}
+			reviewMaxRounds = &value
+			return settingsDraft{reviewMaxRounds: reviewMaxRounds}, nil
 
 		case wizardProvider:
 			ready := readiness[choice.ID]
@@ -479,8 +565,9 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 				ready = providerReadiness{adapter: adapter, status: "installed"}
 				readiness[choice.ID] = ready
 			}
+			statusView := wizardProviderStatusView(current, len(history) > 0, notice, drafts, choice.ID)
 			if !ready.checked {
-				terminal.ShowStatus("Configure RoleMux", "Checking "+providerDisplayName(choice.ID)+" sign-in…")
+				terminal.ShowViewStatus(statusView, "Checking "+providerDisplayName(choice.ID)+" sign-in…")
 				ready = a.inspectProvider(choice.ID, cfg, ready.adapter, nil)
 				readiness[choice.ID] = ready
 			}
@@ -495,7 +582,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 				}
 			}
 			if !ready.authenticated && !ready.externalAuth {
-				loginErr := a.loginProvider(choice.ID, ready.adapter, root, terminal)
+				loginErr := a.loginProvider(choice.ID, ready.adapter, root, terminal, statusView)
 				if loginErr != nil {
 					ready.status = "login required"
 					ready.message = fmt.Sprintf("Login did not complete: %v", loginErr)
@@ -524,7 +611,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 					models = cached
 					a.refreshModelCatalog(cfg, cat.CachePath, choice.ID, ready.adapter, request)
 				} else {
-					terminal.ShowStatus("Configure RoleMux", "Discovering "+providerDisplayName(choice.ID)+" models for the first time…")
+					terminal.ShowViewStatus(statusView, "Discovering "+providerDisplayName(choice.ID)+" models for the first time…")
 					var modelErr error
 					models, modelErr = cat.Models(a.ctx, choice.ID, true, request)
 					if modelErr != nil {
@@ -547,7 +634,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			} else if len(draft.model.SpeedOptions) > 0 {
 				advance(wizardScreen{kind: wizardSpeed, role: current.role})
 			} else if next, done := selectedNextProfileScreen(selection, current.role); done {
-				return selectedProfiles(selection, drafts, separate), nil
+				return settingsDraft{profiles: selectedProfiles(selection, drafts, separate), reviewMaxRounds: reviewMaxRounds}, nil
 			} else {
 				advance(next)
 			}
@@ -563,7 +650,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			} else if len(draft.model.SpeedOptions) > 0 {
 				advance(wizardScreen{kind: wizardSpeed, role: current.role})
 			} else if next, done := selectedNextProfileScreen(selection, current.role); done {
-				return selectedProfiles(selection, drafts, separate), nil
+				return settingsDraft{profiles: selectedProfiles(selection, drafts, separate), reviewMaxRounds: reviewMaxRounds}, nil
 			} else {
 				advance(next)
 			}
@@ -573,7 +660,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			if len(drafts[current.role].model.SpeedOptions) > 0 {
 				advance(wizardScreen{kind: wizardSpeed, role: current.role})
 			} else if next, done := selectedNextProfileScreen(selection, current.role); done {
-				return selectedProfiles(selection, drafts, separate), nil
+				return settingsDraft{profiles: selectedProfiles(selection, drafts, separate), reviewMaxRounds: reviewMaxRounds}, nil
 			} else {
 				advance(next)
 			}
@@ -581,7 +668,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 		case wizardSpeed:
 			drafts[current.role].speed = choice.ID
 			if next, done := selectedNextProfileScreen(selection, current.role); done {
-				return selectedProfiles(selection, drafts, separate), nil
+				return settingsDraft{profiles: selectedProfiles(selection, drafts, separate), reviewMaxRounds: reviewMaxRounds}, nil
 			} else {
 				advance(next)
 			}
@@ -599,7 +686,7 @@ func (a *app) pickProfiles(root string, terminal *picker.Screen) (map[string]con
 			if choice.ID == "yes" {
 				advance(wizardScreen{kind: wizardProvider, role: config.RoleCodeReviewer})
 			} else {
-				return selectedProfiles(selection, drafts, separate), nil
+				return settingsDraft{profiles: selectedProfiles(selection, drafts, separate), reviewMaxRounds: reviewMaxRounds}, nil
 			}
 		}
 	}
@@ -614,6 +701,8 @@ func wizardInitialID(screen wizardScreen, cfg config.Config, drafts map[string]*
 	switch screen.kind {
 	case wizardRole:
 		return "all"
+	case wizardReviewMaxRounds:
+		return strconv.Itoa(cfg.EffectiveReviewMaxRounds())
 	case wizardProvider:
 		if draft != nil && draft.provider != "" {
 			return draft.provider
@@ -749,43 +838,21 @@ func (a *app) refreshModelCatalog(cfg config.Config, cachePath, provider string,
 	}()
 }
 
-func (a *app) loginProvider(name string, adapter runner.Adapter, root string, terminal *picker.Screen) error {
+func (a *app) loginProvider(name string, adapter runner.Adapter, root string, terminal *picker.Screen, view picker.View) error {
 	authenticator, ok := adapter.(runner.Authenticator)
 	if !ok {
 		return fmt.Errorf("%s adapter does not support interactive login; run %s", providerDisplayName(name), providerLoginCommand(name))
 	}
 	terminal.Leave()
-	fmt.Fprintf(a.out, "RoleMux: %s login required; starting `%s`.\n\n", providerDisplayName(name), providerLoginCommand(name))
+	role := roleDisplayName(view.ActiveRole)
+	if strings.TrimSpace(view.ActiveRole) == "" {
+		fmt.Fprintf(a.out, "RoleMux: %s login required; starting `%s`.\n\n", providerDisplayName(name), providerLoginCommand(name))
+	} else {
+		fmt.Fprintf(a.out, "RoleMux: %s login required for %s; starting `%s`.\n\n", providerDisplayName(name), role, providerLoginCommand(name))
+	}
 	err := authenticator.Login(a.ctx, runner.LoginRequest{RepoRoot: root, Stdin: a.in, Stdout: a.out, Stderr: a.errOut})
 	terminal.Enter()
 	return err
-}
-
-func wizardView(screen wizardScreen, canBack bool, notice string, drafts map[string]*profileDraft) picker.View {
-	view := picker.View{Title: "Configure RoleMux", CanBack: canBack, FullScreen: true}
-	role := roleDisplayName(screen.role)
-	switch screen.kind {
-	case wizardRole:
-		view.Subtitle = "Choose which role to configure"
-	case wizardProvider:
-		view.Subtitle, view.Search = role+" · Select provider", true
-	case wizardModel:
-		view.Subtitle, view.Search = role+" · Select "+providerDisplayName(drafts[screen.role].provider)+" model", true
-	case wizardVerifyModel:
-		view.Subtitle = fmt.Sprintf("%s is not provider-verified. Select it anyway?", drafts[screen.role].model.ID)
-	case wizardEffort:
-		view.Subtitle = role + " · Select reasoning effort for " + drafts[screen.role].model.Label
-	case wizardSpeed:
-		view.Subtitle = role + " · Select speed for " + drafts[screen.role].model.Label
-	case wizardSplitPlanReview:
-		view.Subtitle = "Use a separate model for plan review?"
-	case wizardSplitCodeReview:
-		view.Subtitle = "Use a separate model for code review?"
-	}
-	if notice != "" {
-		view.Subtitle = notice
-	}
-	return view
 }
 
 func wizardRoleOptions() []picker.Option {
@@ -796,7 +863,41 @@ func wizardRoleOptions() []picker.Option {
 		{ID: config.RoleReviewer, Label: "Shared reviewer", Description: "Default for both plan and code review"},
 		{ID: config.RolePlanReviewer, Label: "Plan reviewer"},
 		{ID: config.RoleCodeReviewer, Label: "Code reviewer"},
+		{ID: "review-max-rounds", Label: "Review safety limit", Description: "Use --review-max-rounds N for an arbitrary nonnegative value"},
 	}
+}
+
+func reviewMaxRoundsOptions(current int) []picker.Option {
+	options := make([]picker.Option, 0, 4)
+	seen := map[int]bool{}
+	add := func(value int, label, description string) {
+		if seen[value] {
+			for i := range options {
+				if options[i].ID != strconv.Itoa(value) {
+					continue
+				}
+				if !strings.Contains(options[i].Label, label) {
+					options[i].Label += " / " + label
+				}
+				if description != "" && !strings.Contains(options[i].Description, description) {
+					options[i].Description += "; " + description
+				}
+				break
+			}
+			return
+		}
+		seen[value] = true
+		options = append(options, picker.Option{ID: strconv.Itoa(value), Label: label, Description: description})
+	}
+	currentLabel := fmt.Sprintf("Current (%d)", current)
+	if current == 0 {
+		currentLabel = "Current (Unlimited)"
+	}
+	add(current, currentLabel, "Keep the current effective review safety limit")
+	add(config.DefaultReviewMaxRounds, "Default (5)", "Use the default review safety limit")
+	add(10, "10", "Allow up to ten accepted reviewer verdicts")
+	add(0, "Unlimited", "Set 0 for no review-round ceiling")
+	return options
 }
 
 func selectedNextProfileScreen(selection, role string) (wizardScreen, bool) {
@@ -881,14 +982,6 @@ func providerDisplayName(name string) string {
 	return name
 }
 
-func roleDisplayName(role string) string {
-	label := strings.ReplaceAll(role, "_", " ")
-	if label == "" {
-		return "Review roles"
-	}
-	return strings.ToUpper(label[:1]) + label[1:]
-}
-
 func providerLoginCommand(name string) string {
 	if command := map[string]string{"codex": "codex login", "claude": "claude auth login", "copilot": "copilot login", "antigravity": "agy"}[name]; command != "" {
 		return command
@@ -952,7 +1045,7 @@ func (a *app) runPlan(args []string) int {
 			}
 			return a.fail("plan-start", err, opts.json(), workflow.Result{})
 		}
-		service, err := a.workflowService()
+		service, err := a.workflowServiceForTask(opts.value("--id"))
 		if err != nil {
 			return a.fail("plan-start", err, opts.json(), workflow.Result{})
 		}
@@ -966,7 +1059,7 @@ func (a *app) runPlan(args []string) int {
 			}
 			return a.fail("plan-answer", err, opts.json(), workflow.Result{})
 		}
-		service, err := a.workflowService()
+		service, err := a.workflowServiceForTask(opts.positionals[0])
 		if err != nil {
 			return a.fail("plan-answer", err, opts.json(), workflow.Result{})
 		}
@@ -980,7 +1073,7 @@ func (a *app) runPlan(args []string) int {
 			}
 			return a.fail("plan-review", err, opts.json(), workflow.Result{})
 		}
-		service, err := a.workflowService()
+		service, err := a.workflowServiceForTask(opts.positionals[0])
 		if err != nil {
 			return a.fail("plan-review", err, opts.json(), workflow.Result{})
 		}
@@ -994,7 +1087,7 @@ func (a *app) runPlan(args []string) int {
 			}
 			return a.fail("plan-graph", err, opts.json(), workflow.Result{})
 		}
-		service, err := a.workflowService()
+		service, err := a.workflowServiceForTask(opts.positionals[0])
 		if err != nil {
 			return a.fail("plan-graph", err, opts.json(), workflow.Result{})
 		}
@@ -1026,7 +1119,7 @@ func (a *app) runWork(args []string) int {
 			}
 			return a.fail("work-start", err, opts.json(), workflow.Result{})
 		}
-		service, err := a.workflowService()
+		service, err := a.workflowServiceForTask(opts.positionals[0])
 		if err != nil {
 			return a.fail("work-start", err, opts.json(), workflow.Result{})
 		}
@@ -1040,7 +1133,7 @@ func (a *app) runWork(args []string) int {
 			}
 			return a.fail("work-integrate", err, opts.json(), workflow.Result{})
 		}
-		service, err := a.workflowService()
+		service, err := a.workflowServiceForIntegration(opts.positionals[0])
 		if err != nil {
 			return a.fail("work-integrate", err, opts.json(), workflow.Result{})
 		}
@@ -1060,7 +1153,7 @@ func (a *app) runImplement(args []string) int {
 			}
 			return a.fail("implement-answer", err, opts.json(), workflow.Result{})
 		}
-		service, err := a.workflowService()
+		service, err := a.workflowServiceForTask(opts.positionals[0])
 		if err != nil {
 			return a.fail("implement-answer", err, opts.json(), workflow.Result{})
 		}
@@ -1074,7 +1167,7 @@ func (a *app) runImplement(args []string) int {
 		}
 		return a.fail("implement", err, opts.json(), workflow.Result{})
 	}
-	service, err := a.workflowService()
+	service, err := a.workflowServiceForTask(opts.positionals[0])
 	if err != nil {
 		return a.fail("implement", err, opts.json(), workflow.Result{})
 	}
@@ -1094,7 +1187,7 @@ func (a *app) runCode(args []string) int {
 		}
 		return a.fail("code-review", err, opts.json(), workflow.Result{})
 	}
-	service, err := a.workflowService()
+	service, err := a.workflowServiceForTask(opts.positionals[0])
 	if err != nil {
 		return a.fail("code-review", err, opts.json(), workflow.Result{})
 	}
@@ -1110,7 +1203,7 @@ func (a *app) runStatus(args []string) int {
 		}
 		return a.fail("status", err, opts.json(), workflow.Result{})
 	}
-	service, err := a.workflowService()
+	service, err := a.workflowServiceForTask(opts.positionals[0])
 	if err != nil {
 		return a.fail("status", err, opts.json(), workflow.Result{})
 	}
@@ -1137,7 +1230,7 @@ func (a *app) runUsage(args []string) int {
 		}
 		return a.fail("usage", err, opts.json(), workflow.Result{})
 	}
-	service, err := a.workflowService()
+	service, err := a.workflowServiceForTask(opts.positionals[0])
 	if err != nil {
 		return a.fail("usage", err, opts.json(), workflow.Result{})
 	}
@@ -1161,7 +1254,7 @@ func (a *app) runRetry(args []string) int {
 		}
 		return a.fail("retry", err, opts.json(), workflow.Result{})
 	}
-	service, err := a.workflowService()
+	service, err := a.workflowServiceForTask(opts.positionals[0])
 	if err != nil {
 		return a.fail("retry", err, opts.json(), workflow.Result{})
 	}
@@ -1399,6 +1492,35 @@ func (a *app) workflowService() (*workflow.Service, error) {
 	return service, nil
 }
 
+// workflowServiceForTask preserves a command's task ID when service setup
+// fails before the workflow can return a Result. fail then uses that ID only
+// to attempt a read-only task-store recovery; it never invents task state.
+func (a *app) workflowServiceForTask(taskID string) (*workflow.Service, error) {
+	service, err := a.workflowService()
+	if err != nil && strings.TrimSpace(taskID) != "" {
+		return nil, &taskIDError{err: err, taskID: taskID}
+	}
+	return service, err
+}
+
+// workflowServiceForIntegration keeps recovery attached to the durable
+// integration task once ReviewIntegration has created it. Before that point,
+// the parent task is the only useful fallback identifier.
+func (a *app) workflowServiceForIntegration(parentID string) (*workflow.Service, error) {
+	service, err := a.workflowService()
+	if err == nil || strings.TrimSpace(parentID) == "" {
+		return service, err
+	}
+	taskID := parentID
+	if root, discoverErr := task.DiscoverRepository(a.cwd); discoverErr == nil {
+		integrationID := task.IntegrationTaskID(parentID)
+		if _, loadErr := task.NewStore(root).Load(integrationID); loadErr == nil || !errors.Is(loadErr, task.ErrNotFound) {
+			taskID = integrationID
+		}
+	}
+	return nil, &taskIDError{err: err, taskID: taskID}
+}
+
 func prepareAdapters(cfg config.Config, root string, registry *runner.Registry) (config.Config, map[string]runner.Adapter, map[string]error) {
 	if cfg.Providers == nil {
 		cfg.Providers = map[string]config.Provider{}
@@ -1479,6 +1601,14 @@ type commandError struct {
 
 func (e *commandError) Error() string { return e.text }
 
+type taskIDError struct {
+	err    error
+	taskID string
+}
+
+func (e *taskIDError) Error() string { return e.err.Error() }
+func (e *taskIDError) Unwrap() error { return e.err }
+
 func usage(format string, args ...any) error {
 	return &commandError{code: "USAGE", text: fmt.Sprintf(format, args...), exit: workflow.ExitUsage}
 }
@@ -1502,6 +1632,7 @@ type taskSummary struct {
 	ID                    string `json:"id"`
 	Phase                 string `json:"phase"`
 	Round                 int    `json:"round"`
+	MaxRounds             int    `json:"max_rounds"`
 	PlanRound             int    `json:"plan_round,omitempty"`
 	CodeRound             int    `json:"code_round,omitempty"`
 	Scope                 string `json:"scope,omitempty"`
@@ -1511,6 +1642,8 @@ type taskSummary struct {
 	WorkUnitID            string `json:"work_unit_id,omitempty"`
 	IntegrationReview     bool   `json:"integration_review,omitempty"`
 	WorkGraph             bool   `json:"work_graph,omitempty"`
+	Complexity            string `json:"complexity,omitempty"`
+	DirectImplementation  bool   `json:"direct_implementation,omitempty"`
 }
 
 type operationSummary struct {
@@ -1524,11 +1657,11 @@ type operationSummary struct {
 }
 
 type statusSummary struct {
+	workflow.Control
 	ID                    string                          `json:"id"`
 	Phase                 string                          `json:"phase"`
 	PlanRound             int                             `json:"plan_round,omitempty"`
 	CodeRound             int                             `json:"code_round,omitempty"`
-	MaxRounds             int                             `json:"max_rounds,omitempty"`
 	Scope                 string                          `json:"scope,omitempty"`
 	PendingQuestion       string                          `json:"pending_question,omitempty"`
 	PendingQuestionSource string                          `json:"pending_question_source,omitempty"`
@@ -1542,14 +1675,18 @@ type statusSummary struct {
 	WorkUnitID            string                          `json:"work_unit_id,omitempty"`
 	IntegrationReview     bool                            `json:"integration_review,omitempty"`
 	WorkGraph             bool                            `json:"work_graph,omitempty"`
+	Complexity            string                          `json:"complexity,omitempty"`
+	DirectImplementation  bool                            `json:"direct_implementation,omitempty"`
 }
 
 func compactStatus(st task.State) statusSummary {
 	result := statusSummary{
-		ID: st.ID, Phase: st.Phase, PlanRound: st.PlanRound, CodeRound: st.CodeRound, MaxRounds: st.MaxRounds,
+		Control: workflow.ControlFor(st),
+		ID:      st.ID, Phase: st.Phase, PlanRound: st.PlanRound, CodeRound: st.CodeRound,
 		Scope: st.Scope, PendingQuestion: st.PendingQuestion, PendingQuestionSource: st.PendingQuestionSource,
 		Findings: st.Findings, Profiles: st.ProfilesSnapshot, Usage: st.Usage, UpdatedAt: st.UpdatedAt,
 		ParentTaskID: st.ParentTaskID, WorkUnitID: st.WorkUnitID, IntegrationReview: st.IntegrationReview, WorkGraph: st.WorkGraph,
+		Complexity: st.Complexity, DirectImplementation: st.DirectImplementation,
 	}
 	if st.InFlight != nil {
 		result.InFlight = &operationSummary{Operation: st.InFlight.Operation, Role: st.InFlight.Role, OwnerPID: st.InFlight.OwnerPID, StartedAt: st.InFlight.StartedAt, KnownSession: st.InFlight.KnownSession, SessionID: st.InFlight.SessionID, Loop: st.InFlight.Loop}
@@ -1622,6 +1759,16 @@ func usageNumbersFor(u task.TokenUsage, provider string) usageNumbers {
 	return usageNumbers{TokenUsage: u, UncachedInputTokens: uncached}
 }
 
+func usageLabel(u task.TokenUsage) string {
+	if u.UnreportedRequests > 0 && u.IncompleteRequests == 0 && u.UnreportedRequests >= u.Requests {
+		return "tokens are unreported"
+	}
+	if u.UnreportedRequests > 0 || u.IncompleteRequests > 0 {
+		return "incomplete reported totals"
+	}
+	return ""
+}
+
 type errorOutput struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
@@ -1642,7 +1789,7 @@ func summarize(st task.State) *taskSummary {
 	if st.ID == "" {
 		return nil
 	}
-	return &taskSummary{ID: st.ID, Phase: st.Phase, Round: st.Round, PlanRound: st.PlanRound, CodeRound: st.CodeRound, Scope: st.Scope, PendingQuestion: st.PendingQuestion, PendingQuestionSource: st.PendingQuestionSource, ParentTaskID: st.ParentTaskID, WorkUnitID: st.WorkUnitID, IntegrationReview: st.IntegrationReview, WorkGraph: st.WorkGraph}
+	return &taskSummary{ID: st.ID, Phase: st.Phase, Round: st.Round, MaxRounds: workflow.ControlFor(st).MaxRounds, PlanRound: st.PlanRound, CodeRound: st.CodeRound, Scope: st.Scope, PendingQuestion: st.PendingQuestion, PendingQuestionSource: st.PendingQuestionSource, ParentTaskID: st.ParentTaskID, WorkUnitID: st.WorkUnitID, IntegrationReview: st.IntegrationReview, WorkGraph: st.WorkGraph, Complexity: st.Complexity, DirectImplementation: st.DirectImplementation}
 }
 
 func (a *app) workflowResult(command string, result workflow.Result, err error, jsonMode bool) int {
@@ -1650,7 +1797,7 @@ func (a *app) workflowResult(command string, result workflow.Result, err error, 
 		return a.fail(command, err, jsonMode, result)
 	}
 	if jsonMode {
-		return a.success(command, map[string]string{"status": result.Status}, &result.State, result.State.Advisories, true)
+		return a.success(command, compactWorkflowResult(result, nil), &result.State, result.State.Advisories, true)
 	}
 	fmt.Fprintf(a.out, "%s\t%s\t%s\n", result.State.ID, result.State.Phase, result.Status)
 	for _, advisory := range result.State.Advisories {
@@ -1685,14 +1832,15 @@ func (a *app) fail(command string, err error, jsonMode bool, result workflow.Res
 	if taskID == "" {
 		taskID = result.State.ID
 	}
+	if result.State.ID == "" && taskID != "" {
+		result = a.loadFailureState(result, taskID)
+	}
 	if jsonMode {
 		payload := commandOutput{OK: false, Command: command, Error: &errorOutput{Code: code, Message: message, Retryable: retryable, TaskID: taskID}}
 		if result.State.ID != "" {
 			payload.Task = summarize(result.State)
 			payload.Advisories = result.State.Advisories
-			if code == "NEEDS_INPUT" {
-				payload.Result = map[string]string{"status": "needs_input", "question": result.State.PendingQuestion, "source": result.State.PendingQuestionSource}
-			}
+			payload.Result = compactWorkflowResult(result, err)
 		}
 		if encodeErr := encodeOne(a.out, payload); encodeErr != nil {
 			fmt.Fprintf(a.errOut, "rolemux: encode error: %v\n", encodeErr)
@@ -1707,7 +1855,71 @@ func (a *app) fail(command string, err error, jsonMode bool, result workflow.Res
 	return exit
 }
 
+func compactWorkflowResult(result workflow.Result, err error) workflow.Control {
+	control := workflow.ControlFor(result.State)
+	if err != nil {
+		status := statusForError(err)
+		if status == "" {
+			status = "failed"
+		}
+		control.Status = status
+		return control
+	}
+	if result.Status != "" {
+		control.Status = result.Status
+	}
+	return control
+}
+
+func statusForError(err error) string {
+	code, _, _, _, exit := classifyError(err)
+	switch code {
+	case "NEEDS_INPUT":
+		return "needs_input"
+	case "REVIEW_NEEDED":
+		return "review_needed"
+	case "REVIEW_NO_PROGRESS":
+		return "no_progress"
+	case "REVIEW_EXHAUSTED":
+		return "exhausted"
+	case "OPERATION_IN_FLIGHT":
+		return "in_flight"
+	}
+	switch exit {
+	case workflow.ExitNeedsInput:
+		return "needs_input"
+	case workflow.ExitReviewNeeded:
+		return "review_needed"
+	case workflow.ExitInFlight:
+		return "in_flight"
+	case workflow.ExitExhausted:
+		return "exhausted"
+	case workflow.ExitAction:
+		return "failed"
+	default:
+		return ""
+	}
+}
+
+func (a *app) loadFailureState(result workflow.Result, taskID string) workflow.Result {
+	root, err := task.DiscoverRepository(a.cwd)
+	if err != nil {
+		return result
+	}
+	state, err := task.NewStore(root).Load(taskID)
+	if err != nil {
+		return result
+	}
+	result.State = state
+	return result
+}
+
 func classifyError(err error) (code, message string, retryable bool, taskID string, exit int) {
+	var taskErr *taskIDError
+	if errors.As(err, &taskErr) {
+		code, message, retryable, _, exit := classifyError(taskErr.err)
+		return code, message, retryable, taskErr.taskID, exit
+	}
 	var workflowErr *workflow.Error
 	if errors.As(err, &workflowErr) {
 		return workflowErr.Code, workflowErr.Error(), workflowErr.Retryable, workflowErr.TaskID, workflow.ExitCode(err)
@@ -1726,7 +1938,15 @@ func encodeOne(out io.Writer, value any) error {
 }
 
 func printState(out io.Writer, st task.State) {
-	fmt.Fprintf(out, "task: %s\nphase: %s\nplan rounds: %d/%d\ncode rounds: %d/%d\n", st.ID, st.Phase, st.PlanRound, st.MaxRounds, st.CodeRound, st.MaxRounds)
+	control := workflow.ControlFor(st)
+	maxRounds := strconv.Itoa(control.MaxRounds)
+	if control.MaxRounds == 0 {
+		maxRounds = "unlimited"
+	}
+	fmt.Fprintf(out, "task: %s\nphase: %s\nplan rounds: %d/%s\ncode rounds: %d/%s\nnext action: %s\n", st.ID, st.Phase, st.PlanRound, maxRounds, st.CodeRound, maxRounds, control.NextAction)
+	if st.Complexity != "" {
+		fmt.Fprintf(out, "complexity: %s\n", st.Complexity)
+	}
 	if st.ParentTaskID != "" {
 		fmt.Fprintf(out, "parent: %s\n", st.ParentTaskID)
 	}
@@ -1759,12 +1979,19 @@ func printState(out io.Writer, st task.State) {
 	sort.Strings(roles)
 	for _, role := range roles {
 		u := st.Usage[role]
-		fmt.Fprintf(out, "usage %s: requests=%d prompt_bytes=%d input=%d cached=%d cache_write=%d output=%d reasoning=%d total=%d\n", role, u.Requests, u.PromptBytes, u.InputTokens, u.CachedInputTokens, u.CacheWriteTokens, u.OutputTokens, u.ReasoningTokens, u.TotalTokens)
+		fmt.Fprintf(out, "usage %s: requests=%d prompt_bytes=%d input=%d cached=%d cache_write=%d output=%d reasoning=%d total=%d unreported=%d incomplete=%d", role, u.Requests, u.PromptBytes, u.InputTokens, u.CachedInputTokens, u.CacheWriteTokens, u.OutputTokens, u.ReasoningTokens, u.TotalTokens, u.UnreportedRequests, u.IncompleteRequests)
+		if label := usageLabel(u); label != "" {
+			fmt.Fprintf(out, " (%s)", label)
+		}
+		fmt.Fprintln(out)
 	}
 }
 
 func printWorkGraph(out io.Writer, graph workflow.WorkGraph) {
 	fmt.Fprintf(out, "task: %s\nphase: %s\n", graph.TaskID, graph.Phase)
+	if graph.Complexity != "" {
+		fmt.Fprintf(out, "complexity: %s\n", graph.Complexity)
+	}
 	for index, wave := range graph.Waves {
 		fmt.Fprintf(out, "wave %d: %s\n", index+1, strings.Join(wave, ", "))
 	}
@@ -1790,15 +2017,23 @@ func printUsage(out io.Writer, summary usageSummary) {
 		if role.Speed != "" {
 			profile += " [" + role.Speed + "]"
 		}
-		fmt.Fprintf(out, "%s [%s]: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d\n",
+		fmt.Fprintf(out, "%s [%s]: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d unreported=%d incomplete=%d",
 			role.Role, profile, role.Requests, role.InputTokens, role.CachedInputTokens,
 			role.UncachedInputTokens, role.OutputTokens, role.ReasoningTokens,
-			role.TotalTokens, role.PromptBytes)
+			role.TotalTokens, role.PromptBytes, role.UnreportedRequests, role.IncompleteRequests)
+		if label := usageLabel(role.TokenUsage); label != "" {
+			fmt.Fprintf(out, " (%s)", label)
+		}
+		fmt.Fprintln(out)
 	}
 	t := summary.Totals
-	fmt.Fprintf(out, "total: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d\n",
+	fmt.Fprintf(out, "total: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d unreported=%d incomplete=%d",
 		t.Requests, t.InputTokens, t.CachedInputTokens, t.UncachedInputTokens,
-		t.OutputTokens, t.ReasoningTokens, t.TotalTokens, t.PromptBytes)
+		t.OutputTokens, t.ReasoningTokens, t.TotalTokens, t.PromptBytes, t.UnreportedRequests, t.IncompleteRequests)
+	if label := usageLabel(t.TokenUsage); label != "" {
+		fmt.Fprintf(out, " (%s)", label)
+	}
+	fmt.Fprintln(out)
 }
 
 func (a *app) optionalRepo() string {
@@ -1810,6 +2045,9 @@ func (a *app) optionalRepo() string {
 }
 
 func configTarget(root string, global, project bool, environ []string) (string, error) {
+	if explicit := config.ExplicitConfigPath(environ); explicit != "" {
+		return explicit, nil
+	}
 	globalPath, projectPath := config.ConfigPaths(root, environ)
 	if global {
 		if globalPath == "" {

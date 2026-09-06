@@ -10,6 +10,11 @@ import (
 const (
 	defaultWorkUnitID = "T1"
 	maxWorkUnitIDLen  = 32
+	ComplexityTrivial = "trivial"
+	ComplexitySmall   = "small"
+	ComplexityMedium  = "medium"
+	ComplexityLarge   = "large"
+	ComplexitySystem  = "system"
 )
 
 // WorkUnit is an execution-ready node in a planner-produced dependency graph.
@@ -45,6 +50,9 @@ func NormalizeWorkUnits(units []WorkUnit, plan string) ([]WorkUnit, error) {
 		result[i].DependsOn = cleanStrings(unit.DependsOn)
 		result[i].AcceptanceCriteria = cleanStrings(unit.AcceptanceCriteria)
 		result[i].ValidationCommands = cleanStrings(unit.ValidationCommands)
+		if err := validatePlannerScope(unit.Scope); err != nil {
+			return nil, fmt.Errorf("work unit %s scope: %w", result[i].ID, err)
+		}
 		scope, err := CanonicalScope(unit.Scope)
 		if err != nil {
 			return nil, fmt.Errorf("work unit %s scope: %w", result[i].ID, err)
@@ -55,6 +63,59 @@ func NormalizeWorkUnits(units []WorkUnit, plan string) ([]WorkUnit, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// ValidateComplexity keeps planner sizing machine-readable and stable across
+// providers. Empty remains valid for durable tasks created before sizing was
+// introduced.
+func ValidateComplexity(complexity string) error {
+	switch strings.ToLower(strings.TrimSpace(complexity)) {
+	case "", ComplexityTrivial, ComplexitySmall, ComplexityMedium, ComplexityLarge, ComplexitySystem:
+		return nil
+	default:
+		return fmt.Errorf("invalid task complexity %q", complexity)
+	}
+}
+
+func NormalizeComplexity(complexity string) string {
+	return strings.ToLower(strings.TrimSpace(complexity))
+}
+
+// ValidateWorkUnitsForComplexity prevents a planner from turning a local change into
+// a miniature program. Large plans remain free to use the graph they need.
+func ValidateWorkUnitsForComplexity(complexity string, units []WorkUnit) error {
+	complexity = NormalizeComplexity(complexity)
+	if err := ValidateComplexity(complexity); err != nil {
+		return err
+	}
+	limit := 0
+	switch complexity {
+	case ComplexityTrivial:
+		limit = 1
+	case ComplexitySmall:
+		limit = 2
+	case ComplexityMedium:
+		limit = 6
+	}
+	if limit > 0 && len(units) > limit {
+		return fmt.Errorf("task complexity %s allows at most %d work unit(s), got %d", complexity, limit, len(units))
+	}
+	return nil
+}
+
+// Planner scopes are data, not prose. CanonicalScope intentionally accepts
+// legitimate paths containing spaces; this narrower check rejects common
+// model annotations that silently destroy manifest coverage.
+func validatePlannerScope(raw string) error {
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '\n' || r == '\r' }) {
+		part = strings.TrimSpace(part)
+		lower := strings.ToLower(part)
+		if strings.HasPrefix(lower, "write ") || strings.HasPrefix(lower, "and ") ||
+			strings.HasSuffix(lower, " (new)") || strings.HasSuffix(part, ".") {
+			return fmt.Errorf("scope entries must be bare repository paths or globs, got %q", part)
+		}
+	}
+	return nil
 }
 
 func ValidateWorkUnits(units []WorkUnit) error {

@@ -271,6 +271,39 @@ func stringMapSetting(m map[string]any, key string) map[string]string {
 	return result
 }
 
+type copilotUsageAccumulator struct {
+	usage    TokenUsage
+	reported bool
+}
+
+func (a *copilotUsageAccumulator) Add(data *copilot.AssistantUsageData) {
+	turn, reported := copilotUsageTurn(data)
+	if !reported {
+		return
+	}
+	a.usage.Add(turn)
+	a.reported = true
+}
+
+func (a copilotUsageAccumulator) Snapshot() (TokenUsage, bool) {
+	return a.usage, a.reported
+}
+
+func copilotUsageTurn(data *copilot.AssistantUsageData) (TokenUsage, bool) {
+	if data == nil || (data.InputTokens == nil && data.CacheReadTokens == nil && data.CacheWriteTokens == nil && data.OutputTokens == nil && data.ReasoningTokens == nil) {
+		return TokenUsage{}, false
+	}
+	turn := TokenUsage{
+		InputTokens:       int64Value(data.InputTokens),
+		CachedInputTokens: int64Value(data.CacheReadTokens),
+		CacheWriteTokens:  int64Value(data.CacheWriteTokens),
+		OutputTokens:      int64Value(data.OutputTokens),
+		ReasoningTokens:   int64Value(data.ReasoningTokens),
+	}
+	turn.TotalTokens = turn.InputTokens + turn.OutputTokens
+	return turn, true
+}
+
 func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Response, error) {
 	if req.Speed != "" && req.Speed != "standard" {
 		return Response{}, providerError("COPILOT_SPEED", fmt.Sprintf("Copilot model %q does not advertise speed modes", req.Model), false, false, req.SessionID, ErrUnsupportedProvider)
@@ -311,40 +344,42 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 		}
 	}
 	var usageMu sync.Mutex
-	var usage TokenUsage
+	var usage copilotUsageAccumulator
 	unsubscribe := session.On(func(event copilot.SessionEvent) {
 		data, ok := event.Data.(*copilot.AssistantUsageData)
 		if !ok || data == nil {
 			return
 		}
-		turn := TokenUsage{InputTokens: int64Value(data.InputTokens), CachedInputTokens: int64Value(data.CacheReadTokens), CacheWriteTokens: int64Value(data.CacheWriteTokens), OutputTokens: int64Value(data.OutputTokens), ReasoningTokens: int64Value(data.ReasoningTokens)}
-		turn.TotalTokens = turn.InputTokens + turn.OutputTokens
 		usageMu.Lock()
-		usage.Add(turn)
+		usage.Add(data)
 		usageMu.Unlock()
 	})
 	defer unsubscribe()
-	usageSnapshot := func() TokenUsage {
+	usageSnapshot := func(terminal bool) Response {
 		usageMu.Lock()
 		defer usageMu.Unlock()
-		return usage
+		counters, reported := usage.Snapshot()
+		return Response{SessionID: session.SessionID, Usage: counters, UsageStatus: usageStatus(reported, terminal)}
 	}
 	result, err := session.SendAndWait(ctx, copilot.MessageOptions{Prompt: CopilotEnvelopePrompt(req.Role) + "\n\n" + req.Prompt})
 	if err != nil {
-		return Response{SessionID: session.SessionID, Usage: usageSnapshot()}, providerProcessError("copilot", err, true, session.SessionID)
+		return usageSnapshot(false), providerProcessError("copilot", err, true, session.SessionID)
 	}
 	if result == nil {
-		return Response{SessionID: session.SessionID, Usage: usageSnapshot()}, providerError("COPILOT_OUTPUT", "Copilot produced no terminal assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
+		return usageSnapshot(true), providerError("COPILOT_OUTPUT", "Copilot produced no terminal assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
 	}
 	data, ok := result.Data.(*copilot.AssistantMessageData)
 	if !ok || data == nil {
-		return Response{SessionID: session.SessionID, Usage: usageSnapshot()}, providerError("COPILOT_OUTPUT", "Copilot terminal event was not an assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
+		return usageSnapshot(true), providerError("COPILOT_OUTPUT", "Copilot terminal event was not an assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
 	}
 	env, err := DecodeEnvelope([]byte(data.Content), req.Role)
 	if err != nil {
-		return Response{SessionID: session.SessionID, Text: data.Content, Usage: usageSnapshot()}, providerError("COPILOT_ENVELOPE", err.Error(), true, true, session.SessionID, err)
+		response := usageSnapshot(true)
+		response.Text = data.Content
+		return response, providerError("COPILOT_ENVELOPE", err.Error(), true, true, session.SessionID, err)
 	}
-	response := Response{SessionID: session.SessionID, Text: data.Content, Envelope: &env, Usage: usageSnapshot()}
+	response := usageSnapshot(true)
+	response.Text, response.Envelope = data.Content, &env
 	if data.Model != nil {
 		response.ReportedModel = *data.Model
 	}

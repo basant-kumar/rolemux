@@ -17,3 +17,5 @@ func inputReady(reader io.Reader, _ time.Duration) (bool, error) {
 }
 
 func terminalWidth(io.Writer) int { return 0 }
+
+func terminalHeight(io.Writer) int { return 0 }

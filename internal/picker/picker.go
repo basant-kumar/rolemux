@@ -38,6 +38,10 @@ type View struct {
 	Search     bool
 	CanBack    bool
 	FullScreen bool
+	ActiveRole string
+	Step       string
+	Context    string
+	Notice     string
 }
 
 // Screen owns the alternate terminal buffer used by the configure wizard.
@@ -69,11 +73,20 @@ func (s *Screen) Leave() {
 // bounded work between interactive screens. This avoids presenting a blank
 // terminal during provider authentication probes or model discovery.
 func (s *Screen) ShowStatus(title, message string) {
+	s.ShowViewStatus(View{Title: title}, message)
+}
+
+// ShowViewStatus replaces the alternate-screen contents while a wizard
+// performs bounded work between interactive screens. The view header is
+// shared with Select so contextual status screens keep the active role and
+// wizard step visible.
+func (s *Screen) ShowViewStatus(view View, message string) {
 	if s == nil || s.out == nil {
 		return
 	}
 	s.Enter()
-	_, _ = fmt.Fprintf(s.out, "\x1b[?2026h\x1b[2J\x1b[H\r\x1b[2K%s\n\r\x1b[2K\n\r\x1b[2K%s\x1b[?2026l", title, message)
+	frame := renderStatusFrame(view, message, terminalWidth(s.out), terminalHeight(s.out))
+	_, _ = io.WriteString(s.out, frame)
 }
 
 type State struct {
@@ -221,85 +234,15 @@ func Select(ctx context.Context, in io.Reader, out io.Writer, options []Option, 
 		if out == nil {
 			return
 		}
-		lines := []string{}
-		if view.Title != "" {
-			lines = append(lines, view.Title)
-		}
-		if view.Subtitle != "" {
-			lines = append(lines, view.Subtitle)
-		}
-		if view.Title != "" || view.Subtitle != "" {
-			lines = append(lines, "")
-		}
-		if view.Search {
-			lines = append(lines, "Search: "+state.Query)
-		}
 		filtered := state.Filtered()
-		start := 0
-		const visible = 6
-		if state.Cursor >= visible {
-			start = state.Cursor - visible + 1
-		}
-		end := start + visible
-		if end > len(filtered) {
-			end = len(filtered)
-		}
-		for i := start; i < end; i++ {
-			marker := "  "
-			if i == state.Cursor {
-				marker = "> "
-			}
-			label := filtered[i].Label
-			if label == "" {
-				label = filtered[i].ID
-			}
-			lines = append(lines, marker+label)
-			if filtered[i].Description != "" {
-				lines = append(lines, "    "+filtered[i].Description)
-			}
-			if filtered[i].Meta != "" {
-				lines = append(lines, "    "+filtered[i].Meta)
-			}
-		}
-		if len(filtered) == 0 {
-			lines = append(lines, "  No matches")
-		}
-		footer := "↑/↓ move  enter select  esc/ctrl+c cancel"
-		if view.CanBack {
-			footer = "↑/↓ move  enter select  esc back  ctrl+c cancel"
-		}
-		lines = append(lines, "", footer)
-		lines = wrapLines(lines, terminalWidth(out))
+		frame, nextRenderedLines := renderFrame(view, filtered, state.Query, state.Cursor, terminalWidth(out), terminalHeight(out), renderedLines)
 
 		// Build and write one synchronized frame. The cursor is left on the
 		// previous frame's final line, so reaching its first line requires
 		// renderedLines-1 upward moves. Using renderedLines here makes every
 		// keypress drift upward and leaves stale footer lines behind.
-		var frame strings.Builder
-		frame.WriteString("\x1b[?2026h")
-		if renderedLines == 0 && view.FullScreen {
-			frame.WriteString("\x1b[2J\x1b[H")
-		} else if renderedLines > 0 {
-			frame.WriteByte('\r')
-			if renderedLines > 1 {
-				_, _ = fmt.Fprintf(&frame, "\x1b[%dA", renderedLines-1)
-			}
-		}
-		for i, line := range lines {
-			_, _ = fmt.Fprintf(&frame, "\r\x1b[2K%s", line)
-			if i < len(lines)-1 {
-				frame.WriteByte('\n')
-			}
-		}
-		for i := len(lines); i < renderedLines; i++ {
-			frame.WriteString("\n\r\x1b[2K")
-		}
-		if renderedLines > len(lines) {
-			_, _ = fmt.Fprintf(&frame, "\x1b[%dA", renderedLines-len(lines))
-		}
-		frame.WriteString("\x1b[?2026l")
-		_, _ = io.WriteString(out, frame.String())
-		renderedLines = len(lines)
+		_, _ = io.WriteString(out, frame)
+		renderedLines = nextRenderedLines
 	}
 	if out != nil {
 		_, _ = io.WriteString(out, "\x1b[?25l")
@@ -385,38 +328,6 @@ func Select(ctx context.Context, in io.Reader, out io.Writer, options []Option, 
 		}
 		render()
 	}
-}
-
-func wrapLines(lines []string, width int) []string {
-	if width < 20 {
-		return lines
-	}
-	// Avoid writing in the terminal's final column; terminals differ in when
-	// they materialize an automatic wrap there.
-	limit := width - 1
-	result := make([]string, 0, len(lines))
-	for _, line := range lines {
-		runes := []rune(line)
-		indentLength := 0
-		for indentLength < len(runes) && runes[indentLength] == ' ' {
-			indentLength++
-		}
-		indent := string(runes[:indentLength])
-		for len(runes) > limit {
-			cut := limit
-			for i := limit; i > indentLength+8; i-- {
-				if runes[i] == ' ' {
-					cut = i
-					break
-				}
-			}
-			result = append(result, strings.TrimRight(string(runes[:cut]), " "))
-			remainder := strings.TrimLeft(string(runes[cut:]), " ")
-			runes = []rune(indent + remainder)
-		}
-		result = append(result, string(runes))
-	}
-	return result
 }
 
 func ModelOptions(models []runner.ModelInfo) []Option {

@@ -64,6 +64,44 @@ rolemux configure --global --role reviewer
 Plan and code reviewers share the reviewer profile unless you configure
 `plan-reviewer` or `code-reviewer` separately. Global configuration lives at
 `~/.rolemux/config.toml`; a repository can override it with `.rolemux.toml`.
+Every provider, model, effort, speed, verification, login, and discovery screen
+keeps a highlighted `Role: …` badge visible, plus the current step and selected
+upstream settings.
+
+Review continuation is host-controlled. Each `plan review`, `code review`, or
+integration review command performs one reviewer turn and, when changes are
+requested, at most one revision or fix before returning control. Run another
+explicit review command to review that revised or fixed result. `plan answer`,
+`implement answer`, and `retry` also return after their completed operation;
+they do not start another review automatically. Integration is one logical,
+broad review gate with dedicated durable reviewer and fixer sessions, so it
+may span multiple host invocations.
+
+The review safety limit is a top-level setting. The default is five accepted
+reviewer verdicts per review task:
+
+```toml
+review_max_rounds = 5
+```
+
+Set it from the CLI for future tasks with
+`rolemux configure --global --review-max-rounds N` (or `--project`); any
+nonnegative integer is accepted:
+
+```bash
+rolemux configure --global --review-max-rounds 0   # unlimited ceiling
+rolemux configure --project --review-max-rounds 12 # custom positive limit
+```
+
+Zero removes the ceiling but not the one-reviewer-turn/one-fix boundary of a
+single invocation. Interactive `rolemux configure` includes a `Review safety
+limit` entry with current, default (5), 10, and unlimited choices. When
+`ROLEMUX_CONFIG` is set, RoleMux uses that file alone and skips normal
+project/global discovery. When it is unset, project `.rolemux.toml` overlays
+global `~/.rolemux/config.toml`. Its effective value is snapshotted into each
+new task; work units and the derived integration task inherit that snapshot,
+and later configuration edits do not change existing tasks. Historical tasks
+keep a positive saved `max_rounds`; older tasks without one default to five.
 
 ## Use it
 
@@ -75,11 +113,30 @@ Use RoleMux to implement resumable uploads.
 
 The orchestrator then drives the workflow:
 
-1. The planner produces an implementation plan and dependency graph.
-2. Plan review loops until approval or the five-round limit.
+1. For a local change with a known scope, use the planner-free fast path below.
+   Otherwise, the planner classifies complexity and produces the smallest valid
+   dependency graph; trivial work is one implementation-and-test unit.
+2. Each review command makes one reviewer turn and at most one requested
+   revision or fix, then returns control for an explicit next review.
 3. Independent work units may run concurrently in the shared checkout.
 4. Each implementer and reviewer resumes its own provider session.
-5. One deep integration review runs after all work units pass.
+5. One logical deep integration review runs after all work units pass; its
+   durable reviewer/fixer sessions can continue across host invocations.
+
+For an obvious local fix, skip the planner and plan-reviewer calls:
+
+```bash
+rolemux quick start --task "Keep the active role visible in configure" \
+  --scope 'internal/cli/configure_view.go,internal/cli/configure_view_test.go' --json
+rolemux implement <task-id> --json
+rolemux code review <task-id> --json
+```
+
+`quick start` performs no provider/model discovery and requires an explicit
+narrow scope. Full plans expose `complexity` as `trivial`, `small`, `medium`,
+`large`, or `system`; RoleMux rejects over-decomposed graphs and prose-like
+scope entries. A one-unit trivial/small plan does not repeat its focused code
+review as a broad integration-model call.
 
 RoleMux never silently changes the selected provider, model, effort, or speed.
 If a provider is unavailable or rate-limited, it returns control to the
@@ -101,10 +158,13 @@ starts that provider's login flow and discovers models after login completes.
 
 RoleMux keeps context useful and small: the planner sends self-contained work
 packets, resumed turns send only new answers or diffs, task reviews inspect the
-change and its blast radius, and the full integration review runs once.
+change and its blast radius, and one logical full integration review gate runs
+across the approved work units. Review results expose compact status,
+review-kind, round, limit, reviewability, and next-action fields; exit 0 means
+the operation completed, not that the review approved.
 `rolemux usage <task-id> --json` reports measured usage when providers expose
 it. If [pxpipe](https://github.com/teamchong/pxpipe) is installed and eligible,
-RoleMux can use it automatically and prints the temporary dashboard URL.
+RoleMux can use it automatically to try to save more tokens.
 
 ## Useful commands
 

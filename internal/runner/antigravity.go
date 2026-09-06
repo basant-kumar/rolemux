@@ -156,8 +156,13 @@ func antigravitySessionFromLine(line []byte) (string, error) {
 	return firstString(event, "conversation_id", "conversationId", "session_id", "sessionId"), nil
 }
 
-func parseAntigravityOutput(data []byte, role Role, callbacks Callbacks) (Response, error) {
-	response := Response{UsageCumulative: true}
+func parseAntigravityOutput(data []byte, role Role, callbacks Callbacks) (response Response, err error) {
+	response = Response{UsageCumulative: true}
+	usageReported := false
+	terminalUsage := false
+	defer func() {
+		response.UsageStatus = usageStatus(usageReported, terminalUsage)
+	}()
 	var providerMessage string
 	for _, rawLine := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(rawLine)
@@ -212,7 +217,13 @@ func parseAntigravityOutput(data []byte, role Role, callbacks Callbacks) (Respon
 			response.Text = text
 		}
 		if usageMap, ok := payload["usage"].(map[string]any); ok {
-			response.Usage = antigravityUsage(usageMap)
+			if usage, present := antigravityUsageWithPresence(usageMap); present {
+				response.Usage = usage
+				usageReported = true
+				if strings.EqualFold(typ, "result") || strings.EqualFold(typ, "turn.completed") {
+					terminalUsage = true
+				}
+			}
 		}
 		if callbacks.Event != nil {
 			encoded, _ := json.Marshal(event)
@@ -300,17 +311,35 @@ func canonicalAntigravityEnvelope(value any, role Role) string {
 }
 
 func antigravityUsage(values map[string]any) TokenUsage {
-	usage := TokenUsage{
-		InputTokens:       number(values, "input_tokens", "input"),
-		CachedInputTokens: number(values, "cached_input_tokens", "cache_read_tokens", "cache_read"),
-		OutputTokens:      number(values, "output_tokens", "output"),
-		ReasoningTokens:   number(values, "reasoning_tokens", "thinking_tokens", "thinking"),
-		TotalTokens:       number(values, "total_tokens", "total"),
+	usage, _ := antigravityUsageWithPresence(values)
+	return usage
+}
+
+func antigravityUsageWithPresence(values map[string]any) (TokenUsage, bool) {
+	var usage TokenUsage
+	var reported bool
+	var totalReported bool
+	usage.InputTokens, reported = numberWithPresence(values, "input_tokens", "input")
+	anyReported := reported
+	if usage.CachedInputTokens, reported = numberWithPresence(values, "cached_input_tokens", "cache_read_tokens", "cache_read"); reported {
+		anyReported = true
 	}
-	if usage.TotalTokens == 0 {
+	if usage.OutputTokens, reported = numberWithPresence(values, "output_tokens", "output"); reported {
+		anyReported = true
+	}
+	if usage.ReasoningTokens, reported = numberWithPresence(values, "reasoning_tokens", "thinking_tokens", "thinking"); reported {
+		anyReported = true
+	}
+	if usage.TotalTokens, totalReported = numberWithPresence(values, "total_tokens", "total"); totalReported {
+		anyReported = true
+	}
+	if !anyReported {
+		return usage, false
+	}
+	if !totalReported {
 		usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 	}
-	return usage
+	return usage, true
 }
 
 func firstString(values map[string]any, keys ...string) string {

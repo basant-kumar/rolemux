@@ -14,13 +14,14 @@ import (
 // intentionally small: natural-language prose cannot substitute for status or
 // verdict, and strict decoding rejects additions that could be misinterpreted.
 type Envelope struct {
-	Role      string          `json:"role"`
-	Status    string          `json:"status,omitempty"`
-	Verdict   string          `json:"verdict,omitempty"`
-	Plan      string          `json:"plan,omitempty"`
-	Question  string          `json:"question,omitempty"`
-	WorkUnits []task.WorkUnit `json:"work_units,omitempty"`
-	Findings  []task.Finding  `json:"findings,omitempty"`
+	Role       string          `json:"role"`
+	Status     string          `json:"status,omitempty"`
+	Verdict    string          `json:"verdict,omitempty"`
+	Plan       string          `json:"plan,omitempty"`
+	Question   string          `json:"question,omitempty"`
+	Complexity string          `json:"complexity,omitempty"`
+	WorkUnits  []task.WorkUnit `json:"work_units,omitempty"`
+	Findings   []task.Finding  `json:"findings,omitempty"`
 }
 
 func DecodeEnvelope(data []byte, expected Role) (Envelope, error) {
@@ -62,6 +63,11 @@ func ValidateEnvelope(env Envelope, expected Role) error {
 		if env.Status == "ready" && expected == RolePlanner && strings.TrimSpace(env.Plan) == "" {
 			return fmt.Errorf("%w: planner ready response has no plan", ErrInvalidEnvelope)
 		}
+		if expected == RolePlanner && env.Status == "ready" {
+			if err := task.ValidateComplexity(env.Complexity); err != nil {
+				return fmt.Errorf("%w: %v", ErrInvalidEnvelope, err)
+			}
+		}
 		if env.Status == "ready" && env.Question != "" {
 			return fmt.Errorf("%w: ready response has question", ErrInvalidEnvelope)
 		}
@@ -69,7 +75,11 @@ func ValidateEnvelope(env Envelope, expected Role) error {
 			return fmt.Errorf("%w: question is empty", ErrInvalidEnvelope)
 		}
 		if expected == RolePlanner && env.Status == "ready" && len(env.WorkUnits) > 0 {
-			if _, err := task.NormalizeWorkUnits(env.WorkUnits, env.Plan); err != nil {
+			units, err := task.NormalizeWorkUnits(env.WorkUnits, env.Plan)
+			if err != nil {
+				return fmt.Errorf("%w: %v", ErrInvalidEnvelope, err)
+			}
+			if err := task.ValidateWorkUnitsForComplexity(env.Complexity, units); err != nil {
 				return fmt.Errorf("%w: %v", ErrInvalidEnvelope, err)
 			}
 		}
@@ -116,8 +126,8 @@ func NativeSchema(role Role) string {
 		required = []string{"role", "status", "plan", "question"}
 		properties += `,"status":{"type":"string","enum":["ready","needs_input"]},"plan":{"type":"string"},"question":{"type":"string"}`
 		if role == RolePlanner {
-			required = append(required, "work_units")
-			properties += `,"work_units":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","objective","scope","depends_on","execution_packet","acceptance_criteria","validation_commands"],"properties":{"id":{"type":"string"},"objective":{"type":"string"},"scope":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"execution_packet":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"validation_commands":{"type":"array","items":{"type":"string"}}}}}`
+			required = append(required, "complexity", "work_units")
+			properties += `,"complexity":{"type":"string","enum":["trivial","small","medium","large","system"]},"work_units":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","objective","scope","depends_on","execution_packet","acceptance_criteria","validation_commands"],"properties":{"id":{"type":"string"},"objective":{"type":"string"},"scope":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}},"execution_packet":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"validation_commands":{"type":"array","items":{"type":"string"}}}}}`
 		}
 	} else {
 		required = []string{"role", "verdict", "findings"}

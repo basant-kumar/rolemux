@@ -1,6 +1,7 @@
 package task
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -331,6 +332,103 @@ func TestStoreTokenCASAndPersistentFlock(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.Dir, st.ID+".lock")); err != nil {
 		t.Fatalf("lock file must persist: %v", err)
+	}
+}
+
+func TestReviewMetadataStoreRoundTrip(t *testing.T) {
+	s := NewStoreAt(filepath.Join(t.TempDir(), "state"))
+	legacy := State{ID: "legacy", RepoRoot: "/repo", Phase: PhasePlanned, MaxRounds: 3}
+	if err := s.Create(legacy); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(s.Dir, legacy.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"review_policy", "review_progress", "plan_review_checkpoint_hash"} {
+		if _, ok := encoded[key]; ok {
+			t.Fatalf("absent metadata was serialized under %q", key)
+		}
+	}
+	got, err := s.Load(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReviewPolicy != nil || got.ReviewProgress != nil || got.PlanReviewCheckpointHash != "" {
+		t.Fatalf("absent metadata changed after round trip: %#v", got)
+	}
+	if got.MaxRounds != legacy.MaxRounds {
+		t.Fatalf("legacy MaxRounds was not retained: got %d", got.MaxRounds)
+	}
+
+	withMetadata := State{
+		ID:                       "metadata",
+		RepoRoot:                 "/repo",
+		Phase:                    PhaseReviewNeeded,
+		MaxRounds:                5,
+		PlanRound:                2,
+		CodeRound:                4,
+		ReviewPolicy:             &ReviewPolicy{MaxRounds: 0},
+		ReviewProgress:           &ReviewProgress{Kind: "plan", Status: "pending"},
+		PlanReviewCheckpointHash: "pre-fix-fingerprint",
+		PlanReviewerSessionID:    "plan-session",
+		CodeReviewerSessionID:    "code-session",
+		Retry: &RetryState{
+			Token:        "retry-token",
+			Operation:    "review",
+			Role:         "reviewer",
+			KnownSession: true,
+			SessionID:    "retry-session",
+		},
+		Usage: map[string]TokenUsage{
+			"review": {Requests: 2, PromptBytes: 128, OutputTokens: 64},
+		},
+	}
+	if err := s.Create(withMetadata); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Load(withMetadata.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReviewPolicy == nil || got.ReviewPolicy.MaxRounds != 0 {
+		t.Fatalf("nested zero max_rounds was not retained: %#v", got.ReviewPolicy)
+	}
+	if got.ReviewProgress == nil || got.ReviewProgress.Kind != "plan" || got.ReviewProgress.Status != "pending" {
+		t.Fatalf("review progress was not retained: %#v", got.ReviewProgress)
+	}
+	if got.PlanReviewCheckpointHash != withMetadata.PlanReviewCheckpointHash {
+		t.Fatalf("plan review checkpoint was not retained: %q", got.PlanReviewCheckpointHash)
+	}
+	if got.MaxRounds != withMetadata.MaxRounds || got.PlanRound != withMetadata.PlanRound || got.CodeRound != withMetadata.CodeRound {
+		t.Fatalf("round compatibility fields changed: max=%d plan=%d code=%d", got.MaxRounds, got.PlanRound, got.CodeRound)
+	}
+	if got.PlanReviewerSessionID != withMetadata.PlanReviewerSessionID || got.CodeReviewerSessionID != withMetadata.CodeReviewerSessionID {
+		t.Fatalf("review sessions were not retained: plan=%q code=%q", got.PlanReviewerSessionID, got.CodeReviewerSessionID)
+	}
+	if got.Retry == nil || got.Retry.SessionID != withMetadata.Retry.SessionID || !got.Retry.KnownSession {
+		t.Fatalf("retry state was not retained: %#v", got.Retry)
+	}
+	if got.Usage["review"] != withMetadata.Usage["review"] {
+		t.Fatalf("usage was not retained: %#v", got.Usage)
+	}
+	raw, err = os.ReadFile(filepath.Join(s.Dir, withMetadata.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policy map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded["review_policy"], &policy); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := policy["max_rounds"]; !ok {
+		t.Fatal("nested zero max_rounds was omitted")
 	}
 }
 

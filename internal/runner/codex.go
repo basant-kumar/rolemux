@@ -2,10 +2,12 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -110,8 +112,8 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 	parseCallbacks := callbacks
 	parseCallbacks.SessionStarted = notifySession
 	threadID, text, reportedModel, reportedEffort, parseErr := parseCodexOutput(result.Stdout, req.Role, parseCallbacks)
-	usage := usageFromJSONLines(result.Stdout, true)
-	response := Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort, Usage: usage}
+	usage, usageReported, terminalUsage := codexUsageFromJSONLines(result.Stdout)
+	response := Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort, Usage: usage, UsageStatus: usageStatus(usageReported, terminalUsage)}
 	known := threadID != ""
 	if req.Resume && threadID == "" {
 		threadID = req.SessionID
@@ -142,6 +144,35 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 	}
 	response.Envelope, response.Raw = &envelope, result.Stdout
 	return response, nil
+}
+
+func codexUsageFromJSONLines(data []byte) (usage TokenUsage, reported, terminal bool) {
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var event map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(line))
+		decoder.UseNumber()
+		if err := decoder.Decode(&event); err != nil {
+			continue
+		}
+		var extra any
+		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+			continue
+		}
+		lineUsage, present := UsageFromMapWithPresence(event, true)
+		if !present {
+			continue
+		}
+		usage, reported = lineUsage, true
+		typ, _ := event["type"].(string)
+		if typ == "turn.completed" {
+			terminal = true
+		}
+	}
+	return usage, reported, terminal
 }
 
 func codexSessionFromLine(line []byte) (string, error) {

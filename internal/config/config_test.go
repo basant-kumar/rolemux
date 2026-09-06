@@ -52,6 +52,67 @@ func TestLoadLayersAndSharedReviewerExpansion(t *testing.T) {
 	}
 }
 
+func TestReviewMaxRoundsDefaultIsPresenceAware(t *testing.T) {
+	first, second := Default(), Default()
+	if first.ReviewMaxRounds == nil || first.EffectiveReviewMaxRounds() != DefaultReviewMaxRounds {
+		t.Fatalf("default review max rounds = %#v", first.ReviewMaxRounds)
+	}
+	if second.ReviewMaxRounds == nil || first.ReviewMaxRounds == second.ReviewMaxRounds {
+		t.Fatal("defaults share review max rounds pointer")
+	}
+	*first.ReviewMaxRounds = 0
+	if got := first.EffectiveReviewMaxRounds(); got != 0 {
+		t.Fatalf("explicit zero effective review max rounds = %d", got)
+	}
+	if got := second.EffectiveReviewMaxRounds(); got != DefaultReviewMaxRounds {
+		t.Fatalf("independent default review max rounds = %d", got)
+	}
+	second.ReviewMaxRounds = nil
+	if got := second.EffectiveReviewMaxRounds(); got != DefaultReviewMaxRounds {
+		t.Fatalf("nil review max rounds = %d", got)
+	}
+	negative := -1
+	second.ReviewMaxRounds = &negative
+	if err := Validate(second); err == nil || !strings.Contains(err.Error(), "review_max_rounds") {
+		t.Fatalf("negative review max rounds accepted: %v", err)
+	}
+}
+
+func TestLoadReviewMaxRoundsPreservesExplicitZeroAcrossLayers(t *testing.T) {
+	root, home, explicit := t.TempDir(), t.TempDir(), filepath.Join(t.TempDir(), "explicit.toml")
+	global := filepath.Join(home, ".rolemux", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(global), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(global, []byte("review_max_rounds = 4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(root, ".rolemux.toml")
+	if err := os.WriteFile(project, []byte("review_max_rounds = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadWithEnv(root, []string{"HOME=" + home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReviewMaxRounds == nil || cfg.EffectiveReviewMaxRounds() != 0 {
+		t.Fatalf("project explicit zero lost: %#v", cfg.ReviewMaxRounds)
+	}
+	if err := os.WriteFile(project, []byte("review_max_rounds = 4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(explicit, []byte("review_max_rounds = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadWithEnv(root, []string{"HOME=" + home, "ROLEMUX_CONFIG=" + explicit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReviewMaxRounds == nil || cfg.EffectiveReviewMaxRounds() != 0 {
+		t.Fatalf("explicit replacement zero lost: %#v", cfg.ReviewMaxRounds)
+	}
+}
+
 func TestProviderTurnTimeoutDefaultsAndValidates(t *testing.T) {
 	if got := Default().ProviderTurnTimeoutSeconds; got != 900 {
 		t.Fatalf("default provider timeout = %d", got)
@@ -148,6 +209,55 @@ func TestConfigureProfileDetectsOnlyHashDrift(t *testing.T) {
 	}
 }
 
+func TestConfigureSettingsAtomicUpdatesProfilesAndReviewMaxRounds(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "config.toml")
+	original := "title='keep'\nreview_max_rounds=3\n[unrelated]\nkey='value'\n[profiles.planner]\nprovider='codex'\nmodel='old'\n[profiles.implementer]\nprovider='codex'\nmodel='other'\n"
+	if err := os.WriteFile(name, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := FileHash(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	if err := ConfigureSettingsAtomic(name, map[string]Profile{
+		RolePlanner: {Provider: "codex", Model: "new"},
+	}, &zero, before); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{"title = \"keep\"", "key = \"value\"", "review_max_rounds = 0", "model = \"new\"", "model = \"other\""} {
+		if !strings.Contains(text, want) {
+			t.Errorf("combined update missing %q:\n%s", want, text)
+		}
+	}
+
+	before, err = FileHash(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureSettingsAtomic(name, nil, nil, before); err == nil {
+		t.Fatal("empty settings update was accepted")
+	}
+	negative := -1
+	if err := ConfigureSettingsAtomic(name, map[string]Profile{
+		RoleImplementer: {Provider: "codex", Model: "valid"},
+	}, &negative, before); err == nil {
+		t.Fatal("negative review max rounds was accepted")
+	}
+	after, err := FileHash(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatal("invalid settings update changed the file")
+	}
+}
+
 func TestValidateRejectsSecretsAndUnsafeAuthCommand(t *testing.T) {
 	if err := ValidateEnvRef("not-an-env"); err == nil {
 		t.Fatal("invalid env ref accepted")
@@ -194,6 +304,74 @@ func TestImportConfigReplacesOwnedTablesAndPreservesUnrelatedKeys(t *testing.T) 
 	}
 	if strings.Contains(text, "/old/codex") || strings.Contains(text, "model = \"old\"") {
 		t.Fatalf("owned tables were not replaced:\n%s", text)
+	}
+}
+
+func TestImportAndWriteReviewMaxRoundsPreservePresence(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(name, []byte("title='keep'\nreview_max_rounds=7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := FileHash(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ImportConfigAtomic(name, []byte("title='replace attempt'\n"), before); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "review_max_rounds = 7") || !strings.Contains(string(data), "title = \"keep\"") {
+		t.Fatalf("absent imported setting or unrelated key was not preserved:\n%s", data)
+	}
+
+	before, err = FileHash(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ImportConfigAtomic(name, []byte("review_max_rounds=0\n"), before); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "review_max_rounds = 0") {
+		t.Fatalf("explicit zero was not imported:\n%s", data)
+	}
+
+	before, err = FileHash(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Raw: map[string]any{"title": "keep", "review_max_rounds": 9}}
+	if err := WriteConfigAtomic(name, cfg, before); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "review_max_rounds = 9") {
+		t.Fatalf("nil review max rounds did not preserve existing setting:\n%s", data)
+	}
+	zero := 0
+	before, err = FileHash(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ReviewMaxRounds = &zero
+	if err := WriteConfigAtomic(name, cfg, before); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "review_max_rounds = 0") {
+		t.Fatalf("explicit zero was not written:\n%s", data)
 	}
 }
 

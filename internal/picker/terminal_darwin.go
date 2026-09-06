@@ -20,13 +20,20 @@ func inputReady(reader io.Reader, wait time.Duration) (bool, error) {
 	if !ok {
 		return true, nil
 	}
-	timeout := int(wait / time.Millisecond)
-	if timeout < 1 {
-		timeout = 1
+	deadline := time.Now().Add(wait)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, nil
+		}
+		timeout := int((remaining + time.Millisecond - 1) / time.Millisecond)
+		fds := []unix.PollFd{{Fd: int32(file.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, timeout)
+		if err == unix.EINTR {
+			continue
+		}
+		return n > 0, err
 	}
-	fds := []unix.PollFd{{Fd: int32(file.Fd()), Events: unix.POLLIN}}
-	n, err := unix.Poll(fds, timeout)
-	return n > 0, err
 }
 
 func terminalWidth(writer io.Writer) int {
@@ -39,6 +46,18 @@ func terminalWidth(writer io.Writer) int {
 		return 0
 	}
 	return int(size.Col)
+}
+
+func terminalHeight(writer io.Writer) int {
+	file, ok := writer.(*os.File)
+	if !ok {
+		return 0
+	}
+	size, err := unix.IoctlGetWinsize(int(file.Fd()), unix.TIOCGWINSZ)
+	if err != nil {
+		return 0
+	}
+	return int(size.Row)
 }
 
 func enterRawMode(reader io.Reader) (func(), error) {

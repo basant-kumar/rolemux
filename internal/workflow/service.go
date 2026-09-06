@@ -21,13 +21,249 @@ import (
 	"github.com/basant-kumar/rolemux/internal/task"
 )
 
-const MaxRounds = 5
+// MaxRounds is retained for embedders that used the old workflow package
+// constant. New tasks resolve their limit from config and persist it in the
+// task policy snapshot.
+const MaxRounds = config.DefaultReviewMaxRounds
 
 const abandonedOperationGrace = 5 * time.Second
 
 type Result struct {
 	State  task.State
 	Status string
+}
+
+// Control is the durable host-action view of a task. It intentionally carries
+// only workflow coordination data; provider prompts, findings, and usage stay
+// in task.State.
+type Control struct {
+	Status      string `json:"status"`
+	ReviewKind  string `json:"review_kind,omitempty"`
+	ReviewRound int    `json:"review_round"`
+	MaxRounds   int    `json:"max_rounds"`
+	CanReview   bool   `json:"can_review"`
+	NextAction  string `json:"next_action"`
+	Question    string `json:"question,omitempty"`
+	Source      string `json:"source,omitempty"`
+}
+
+// ControlFor derives the next safe host action from durable state. In-flight
+// and question state are checked before completed review metadata so a stale
+// outcome can never mask a live recovery action.
+func ControlFor(st task.State) Control {
+	kind := reviewKind(st)
+	control := Control{
+		ReviewKind:  kind,
+		ReviewRound: reviewRound(st, kind),
+		MaxRounds:   maxRounds(&st),
+		NextAction:  "inspect",
+	}
+	if st.InFlight != nil {
+		control.Status = "in_flight"
+		control.NextAction = "wait"
+		return control
+	}
+	if st.Phase == task.PhaseNeedsInput || st.PendingQuestion != "" {
+		control.Status = "needs_input"
+		control.NextAction = answerAction(kind, st.PendingQuestionSource)
+		control.Question = st.PendingQuestion
+		control.Source = st.PendingQuestionSource
+		return control
+	}
+	if isExhaustedState(st) {
+		control.Status = "exhausted"
+		control.NextAction = "stop"
+		return control
+	}
+	if st.ReviewProgress != nil {
+		switch st.ReviewProgress.Status {
+		case "approved":
+			control.Status = "approved"
+			control.NextAction = "advance"
+			return control
+		case "revised", "fixed":
+			control.Status = st.ReviewProgress.Status
+			control.NextAction = reviewAction(kind)
+			control.CanReview = true
+			return control
+		case "no_progress":
+			control.Status = "no_progress"
+			control.NextAction = "inspect"
+			control.CanReview = true
+			return control
+		case "needs_input":
+			control.Status = "needs_input"
+			control.NextAction = answerAction(kind, st.PendingQuestionSource)
+			control.Question = st.PendingQuestion
+			control.Source = st.PendingQuestionSource
+			return control
+		case "review_needed":
+			control.Status = "review_needed"
+			control.NextAction = "retry"
+			return control
+		case "failed":
+			control.Status = "failed"
+			if retryResumable(st.Retry) {
+				control.NextAction = "retry"
+			} else {
+				control.NextAction = "inspect"
+			}
+			return control
+		}
+	}
+	switch st.Phase {
+	case task.PhasePlanned:
+		control.Status = "planned"
+		control.NextAction = "plan_review"
+		control.CanReview = true
+	case task.PhasePlanApproved:
+		if isImplementationReadyPlan(st) {
+			control.Status = "ready"
+			control.NextAction = "implement"
+		} else {
+			control.Status = "approved"
+			control.NextAction = "advance"
+		}
+	case task.PhaseImplementationReady:
+		control.Status = "implementation_ready"
+		control.NextAction = reviewAction(kind)
+		control.CanReview = true
+	case task.PhaseApproved:
+		control.Status = "approved"
+		control.NextAction = "advance"
+	case task.PhaseReviewNeeded:
+		control.Status = "review_needed"
+		control.NextAction = "retry"
+	case task.PhaseFailed:
+		control.Status = "failed"
+		if retryResumable(st.Retry) {
+			control.NextAction = "retry"
+		}
+	case task.PhasePlanReviewing, task.PhaseCodeReviewing, task.PhaseImplementing:
+		control.Status = "in_flight"
+		control.NextAction = "wait"
+	default:
+		control.Status = st.Phase
+	}
+	return control
+}
+
+func answerAction(kind, source string) string {
+	if source == string(runner.RoleImplementer) || kind == "code" || kind == "integration" {
+		return "implement_answer"
+	}
+	return "plan_answer"
+}
+
+func reviewAction(kind string) string {
+	switch kind {
+	case "plan":
+		return "plan_review"
+	case "integration":
+		return "work_integrate"
+	default:
+		return "code_review"
+	}
+}
+
+func reviewKind(st task.State) string {
+	if st.InFlight != nil {
+		if kind := kindForRoleLoop(st.InFlight.Role, st.InFlight.Loop, st.IntegrationReview); kind != "" {
+			return kind
+		}
+	}
+	if st.Phase == task.PhaseNeedsInput && st.PendingQuestionSource != "" {
+		if kind := kindForRoleLoop(st.PendingQuestionSource, st.InterruptedLoop, st.IntegrationReview); kind != "" {
+			return kind
+		}
+	}
+	if st.Retry != nil {
+		if kind := kindForRoleLoop(st.Retry.Role, st.Retry.Loop, st.IntegrationReview); kind != "" {
+			return kind
+		}
+	}
+	if st.ReviewProgress != nil && st.ReviewProgress.Kind != "" {
+		return st.ReviewProgress.Kind
+	}
+	if st.IntegrationReview {
+		return "integration"
+	}
+	switch st.Phase {
+	case task.PhasePlanned, task.PhasePlanReviewing:
+		return "plan"
+	case task.PhasePlanApproved:
+		if isImplementationReadyPlan(st) {
+			return ""
+		}
+		return "plan"
+	case task.PhaseImplementationReady, task.PhaseImplementing, task.PhaseCodeReviewing, task.PhaseApproved, task.PhaseReviewNeeded:
+		return "code"
+	case task.PhaseFailed:
+		if (st.PlanRound > 0 || (st.Round > 0 && st.CodeRound == 0 && st.Scope == "")) && st.CodeRound == 0 {
+			return "plan"
+		}
+		if st.CodeRound > 0 || (st.Round > 0 && st.Scope != "") {
+			return "code"
+		}
+	}
+	return ""
+}
+
+func isMaterializedWorkUnitChild(st task.State) bool {
+	return st.ParentTaskID != "" && st.WorkUnitID != "" && !st.IntegrationReview
+}
+
+func isImplementationReadyPlan(st task.State) bool {
+	return st.DirectImplementation || isMaterializedWorkUnitChild(st)
+}
+
+func kindForRoleLoop(role, loop string, integration bool) string {
+	if integration {
+		return "integration"
+	}
+	switch runner.Role(role) {
+	case runner.RolePlanner, runner.RolePlanReviewer:
+		return "plan"
+	case runner.RoleImplementer, runner.RoleCodeReviewer:
+		return "code"
+	}
+	if strings.HasPrefix(loop, "plan") {
+		return "plan"
+	}
+	if strings.HasPrefix(loop, "code") || loop == "implement" {
+		return "code"
+	}
+	return ""
+}
+
+func reviewRound(st task.State, kind string) int {
+	// A task with either the durable policy snapshot or one of the split
+	// counters is on the new accounting scheme. Its compatibility Round field
+	// may still contain the plan count while code review has not started.
+	splitRounds := st.ReviewPolicy != nil || st.PlanRound != 0 || st.CodeRound != 0
+	switch kind {
+	case "plan":
+		if splitRounds {
+			return st.PlanRound
+		}
+	case "code", "integration":
+		if splitRounds {
+			return st.CodeRound
+		}
+	}
+	return st.Round
+}
+
+func acceptReviewRound(st *task.State, kind string) int {
+	round := reviewRound(*st, kind) + 1
+	switch kind {
+	case "plan":
+		st.PlanRound = round
+	case "code", "integration":
+		st.CodeRound = round
+	}
+	st.Round = round
+	return round
 }
 
 type Service struct {
@@ -90,15 +326,57 @@ func (s *Service) StartPlan(ctx context.Context, text, id string) (Result, error
 	token := s.newToken()
 	prompt := plannerPrompt(text, nil)
 	now := s.now()
+	limit := s.Config.EffectiveReviewMaxRounds()
 	st := task.State{
 		ID: id, RepoRoot: s.RepoRoot, Phase: task.PhasePlanned, Task: text, Prompt: prompt,
-		ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: MaxRounds,
-		UpdatedAt: now, InFlight: s.ownedFlight(task.InFlight{Token: token, Operation: "plan_start", Role: string(runner.RolePlanner), StartedAt: now, PreviousPhase: task.PhasePlanned, Prompt: prompt, Loop: "plan_initial"}),
+		ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: limit,
+		ReviewPolicy: &task.ReviewPolicy{MaxRounds: limit},
+		UpdatedAt:    now, InFlight: s.ownedFlight(task.InFlight{Token: token, Operation: "plan_start", Role: string(runner.RolePlanner), StartedAt: now, PreviousPhase: task.PhasePlanned, Prompt: prompt, Loop: "plan_initial"}),
 	}
 	if err := s.Store.Create(st); err != nil {
 		return Result{}, classify(id, err)
 	}
 	return s.runPlanner(ctx, id, token, "plan_initial")
+}
+
+// StartQuick creates a reviewed-code workflow without spending planner or
+// plan-reviewer turns. The host orchestrator owns the execution packet for
+// this deliberately small, exact-scope task.
+func (s *Service) StartQuick(text, rawScope, id string) (Result, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return Result{}, problem("USAGE", "--task must not be empty", id, ExitUsage, false, nil)
+	}
+	canonical, err := task.CanonicalScope(rawScope)
+	if err != nil {
+		return Result{}, problem("INVALID_SCOPE", err.Error(), id, ExitUsage, false, err)
+	}
+	if strings.TrimSpace(rawScope) == "" || canonical == "**" {
+		return Result{}, problem("INVALID_SCOPE", "quick start requires an explicit narrow --scope", id, ExitUsage, false, nil)
+	}
+	profiles, runtimes, err := s.configuredSnapshots(runner.RoleImplementer, runner.RoleCodeReviewer)
+	if err != nil {
+		return Result{}, problem("CONFIGURATION", err.Error(), id, ExitUsage, false, err)
+	}
+	if id == "" {
+		id = s.generatedID()
+	}
+	planHash := hash(text)
+	limit := s.Config.EffectiveReviewMaxRounds()
+	st := task.State{
+		ID: id, RepoRoot: s.RepoRoot, Phase: task.PhasePlanApproved,
+		Task: text, Plan: text, PlanHash: planHash, ApprovedPlanHash: planHash,
+		PlannedScope: canonical, Complexity: task.ComplexityTrivial, DirectImplementation: true,
+		ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: limit,
+		ReviewPolicy: &task.ReviewPolicy{MaxRounds: limit}, UpdatedAt: s.now(),
+	}
+	if err := s.Store.Create(st); err != nil {
+		return Result{}, classify(id, err)
+	}
+	if err := s.WritePlan(id, st.Plan); err != nil {
+		return Result{State: st}, problem("PLAN_WRITE", err.Error(), id, ExitAction, false, err)
+	}
+	return Result{State: st, Status: "ready"}, nil
 }
 
 func (s *Service) AnswerPlan(ctx context.Context, id, answer string) (Result, error) {
@@ -123,6 +401,11 @@ func (s *Service) AnswerPlan(ctx context.Context, id, answer string) (Result, er
 		if st.Phase == "" {
 			st.Phase = task.PhasePlanned
 		}
+		if loop == "plan_review" {
+			setReviewProgress(st, "plan", "pending")
+		} else {
+			st.ReviewProgress = nil
+		}
 		token := s.newToken()
 		prompt := plannerAnswerPrompt(st.PendingQuestion, answer, loop == "plan_review", st.Findings)
 		st.InFlight = s.ownedFlight(task.InFlight{Token: token, Operation: "plan_answer", Role: string(runner.RolePlanner), StartedAt: s.now(), KnownSession: st.PlannerSessionID != "", SessionID: st.PlannerSessionID, PreviousPhase: st.Phase, Prompt: prompt, Findings: cloneFindings(st.Findings), Loop: loop})
@@ -136,6 +419,26 @@ func (s *Service) AnswerPlan(ctx context.Context, id, answer string) (Result, er
 }
 
 func (s *Service) ReviewPlan(ctx context.Context, id string) (Result, error) {
+	current, err := s.Store.Load(id)
+	if err != nil {
+		return Result{}, classify(id, err)
+	}
+	if current.InFlight != nil {
+		return Result{State: current, Status: ControlFor(current).Status}, classify(id, task.ErrOperationInFlight)
+	}
+	if isExhaustedState(current) {
+		return exhaustedResult(current)
+	}
+	if current.Phase == task.PhaseNeedsInput {
+		return needsInputResult(current)
+	}
+	if current.Phase == task.PhaseFailed || current.Phase == task.PhaseReviewNeeded {
+		return existingWorkflowResult(current)
+	}
+	if current.Phase != task.PhasePlanned || strings.TrimSpace(current.Plan) == "" || current.PlanHash != hash(current.Plan) {
+		return Result{}, classify(id, task.ErrInvalidPhase)
+	}
+	var exhausted bool
 	st, err := s.Store.Update(id, func(st *task.State) error {
 		if st.InFlight != nil {
 			return task.ErrOperationInFlight
@@ -143,14 +446,25 @@ func (s *Service) ReviewPlan(ctx context.Context, id string) (Result, error) {
 		if st.Phase != task.PhasePlanned || strings.TrimSpace(st.Plan) == "" || st.PlanHash != hash(st.Plan) {
 			return task.ErrInvalidPhase
 		}
+		if limit := maxRounds(st); limit > 0 && reviewRound(*st, "plan") >= limit {
+			exhausted = true
+			st.Phase = task.PhaseFailed
+			st.InFlight, st.Retry = nil, nil
+			setReviewProgress(st, "plan", "exhausted")
+			return nil
+		}
 		token := s.newToken()
-		prompt := planReviewPrompt(st.Task, st.Plan, st.WorkUnits, st.PlanReviewerSessionID != "")
+		prompt := planReviewPrompt(st.Task, st.Plan, st.Complexity, st.WorkUnits, st.PlanReviewerSessionID != "")
 		st.Phase = task.PhasePlanReviewing
+		setReviewProgress(st, "plan", "pending")
 		st.InFlight = s.ownedFlight(task.InFlight{Token: token, Operation: "plan_review", Role: string(runner.RolePlanReviewer), StartedAt: s.now(), KnownSession: st.PlanReviewerSessionID != "", SessionID: st.PlanReviewerSessionID, PreviousPhase: task.PhasePlanned, Prompt: prompt, Loop: "plan_review"})
 		return nil
 	})
 	if err != nil {
-		return Result{}, classify(id, err)
+		return Result{State: current, Status: ControlFor(current).Status}, classify(id, err)
+	}
+	if exhausted {
+		return exhaustedResult(st)
 	}
 	return s.runPlanReviewer(ctx, id, st.InFlight.Token)
 }
@@ -212,6 +526,8 @@ func (s *Service) Implement(ctx context.Context, id, rawScope string) (Result, e
 		token := s.newToken()
 		prompt := implementPrompt(st.Task, st.Plan, canonical, nil)
 		st.Phase = task.PhaseImplementing
+		st.ReviewProgress = nil
+		st.PlanReviewCheckpointHash = ""
 		st.InFlight = s.ownedFlight(task.InFlight{Token: token, Operation: "implement", Role: string(runner.RoleImplementer), StartedAt: s.now(), KnownSession: st.ImplementerSessionID != "", SessionID: st.ImplementerSessionID, SnapshotManifest: cloneManifest(preAll), PreviousPhase: task.PhasePlanApproved, Prompt: prompt, Scope: canonical, Loop: "implement"})
 		return nil
 	})
@@ -243,6 +559,11 @@ func (s *Service) AnswerImplement(ctx context.Context, id, answer string) (Resul
 		}
 		st.PromptInputs = append(st.PromptInputs, "Question: "+st.PendingQuestion, "Answer: "+answer)
 		st.PendingAnswer = answer
+		if loop == "code_review" {
+			setReviewProgress(st, reviewKind(*st), "pending")
+		} else {
+			st.ReviewProgress = nil
+		}
 		token := s.newToken()
 		prompt := implementAnswerPrompt(st.PendingQuestion, answer, st.Findings)
 		st.Phase = task.PhaseImplementing
@@ -261,6 +582,18 @@ func (s *Service) ReviewCode(ctx context.Context, id string) (Result, error) {
 	if err != nil {
 		return Result{}, classify(id, err)
 	}
+	if current.InFlight != nil {
+		return Result{State: current, Status: ControlFor(current).Status}, classify(id, task.ErrOperationInFlight)
+	}
+	if isExhaustedState(current) {
+		return exhaustedResult(current)
+	}
+	if current.Phase == task.PhaseNeedsInput {
+		return needsInputResult(current)
+	}
+	if current.Phase == task.PhaseReviewNeeded || current.Phase == task.PhaseFailed {
+		return existingWorkflowResult(current)
+	}
 	if current.Phase != task.PhaseImplementationReady || current.Scope == "" {
 		return Result{}, classify(id, task.ErrInvalidPhase)
 	}
@@ -278,7 +611,10 @@ func (s *Service) ReviewCode(ctx context.Context, id string) (Result, error) {
 	}
 	st, err := s.beginCodeReview(id, before, candidate, "code_review", "")
 	if err != nil {
-		return Result{}, err
+		if st.ID != "" {
+			return Result{State: st, Status: ControlFor(st).Status}, err
+		}
+		return Result{State: current, Status: ControlFor(current).Status}, err
 	}
 	return s.runCodeReviewer(ctx, id, st.InFlight.Token)
 }
@@ -288,13 +624,19 @@ func (s *Service) Retry(ctx context.Context, id string) (Result, error) {
 	if err != nil {
 		return Result{}, classify(id, err)
 	}
+	if isExhaustedState(current) {
+		return exhaustedResult(current)
+	}
 	if current.InFlight != nil {
 		current, err = s.recoverAbandoned(id, current.InFlight.Token)
 		if err != nil {
-			return Result{}, err
+			return Result{State: current, Status: ControlFor(current).Status}, err
 		}
 	}
 	if current.Retry == nil || (current.Phase != task.PhaseFailed && current.Phase != task.PhaseReviewNeeded) {
+		if current.Phase == task.PhaseFailed {
+			return existingWorkflowResult(current)
+		}
 		return Result{}, classify(id, task.ErrInvalidPhase)
 	}
 	retry := *current.Retry
@@ -319,9 +661,23 @@ func (s *Service) Retry(ctx context.Context, id string) (Result, error) {
 	} else {
 		barrier = cloneManifest(retry.SnapshotManifest)
 	}
+	var exhausted bool
 	st, err := s.Store.Update(id, func(st *task.State) error {
-		if st.InFlight != nil || st.Retry == nil {
+		if st.InFlight != nil {
 			return task.ErrOperationInFlight
+		}
+		if st.Retry == nil || !sameRetry(*st.Retry, retry) {
+			return task.ErrStaleOperation
+		}
+		if isReviewerRole(retry.Role) {
+			kind := reviewKind(*st)
+			if limit := maxRounds(st); limit > 0 && reviewRound(*st, kind) >= limit {
+				exhausted = true
+				st.Phase = task.PhaseFailed
+				st.InFlight, st.Retry = nil, nil
+				setReviewProgress(st, kind, "exhausted")
+				return nil
+			}
 		}
 		token := s.newToken()
 		if retry.Role == string(runner.RoleCodeReviewer) {
@@ -338,12 +694,20 @@ func (s *Service) Retry(ctx context.Context, id string) (Result, error) {
 			}
 		}
 		st.Phase = retryPhase(retry)
+		if retry.Role == string(runner.RolePlanReviewer) || retry.Role == string(runner.RoleCodeReviewer) || retry.Loop == "plan_review" || retry.Loop == "code_review" {
+			setReviewProgress(st, reviewKind(*st), "pending")
+		} else {
+			st.ReviewProgress = nil
+		}
 		st.InFlight = s.ownedFlight(task.InFlight{Token: token, Operation: retry.Operation, Role: retry.Role, StartedAt: s.now(), KnownSession: retry.KnownSession, SessionID: retry.SessionID, SnapshotManifest: cloneManifest(barrier), PreviousPhase: retry.PreviousPhase, Prompt: retry.Prompt, Findings: cloneFindings(retry.Findings), Scope: retry.Scope, Loop: retry.Loop})
 		st.Retry = nil
 		return nil
 	})
 	if err != nil {
-		return Result{}, classify(id, err)
+		return s.errorResult(id, classify(id, err))
+	}
+	if exhausted {
+		return exhaustedResult(st)
 	}
 	switch runner.Role(retry.Role) {
 	case runner.RolePlanner:
@@ -375,11 +739,12 @@ type WorkNode struct {
 }
 
 type WorkGraph struct {
-	TaskID string     `json:"task_id"`
-	Phase  string     `json:"phase"`
-	Waves  [][]string `json:"waves"`
-	Ready  []string   `json:"ready"`
-	Nodes  []WorkNode `json:"nodes"`
+	TaskID     string     `json:"task_id"`
+	Phase      string     `json:"phase"`
+	Complexity string     `json:"complexity,omitempty"`
+	Waves      [][]string `json:"waves"`
+	Ready      []string   `json:"ready"`
+	Nodes      []WorkNode `json:"nodes"`
 }
 
 // Graph returns live scheduling state for a planner-produced DAG. It never
@@ -410,7 +775,7 @@ func (s *Service) Graph(id string) (WorkGraph, error) {
 			return WorkGraph{}, classify(childID, loadErr)
 		}
 	}
-	graph := WorkGraph{TaskID: parent.ID, Phase: parent.Phase, Waves: waves, Ready: []string{}, Nodes: make([]WorkNode, 0, len(units))}
+	graph := WorkGraph{TaskID: parent.ID, Phase: parent.Phase, Complexity: parent.Complexity, Waves: waves, Ready: []string{}, Nodes: make([]WorkNode, 0, len(units))}
 	for _, unit := range units {
 		node := WorkNode{WorkUnit: unit, TaskID: task.WorkTaskID(parent.ID, unit.ID), Status: "not_started"}
 		for _, dependency := range unit.DependsOn {
@@ -465,12 +830,14 @@ func (s *Service) StartWork(parentID, unitID string) (Result, error) {
 		return Result{}, classify(parentID, err)
 	}
 	planHash := hash(selected.ExecutionPacket)
+	policy := resolvedReviewPolicy(&parent)
 	child := task.State{
 		ID: selected.TaskID, RepoRoot: s.RepoRoot, Phase: task.PhasePlanApproved,
 		Task: selected.Objective, Plan: selected.ExecutionPacket, PlanHash: planHash, ApprovedPlanHash: planHash,
 		ParentTaskID: parentID, WorkUnitID: unitID, PlannedScope: selected.Scope,
+		Complexity:       parent.Complexity,
 		ProfilesSnapshot: parent.ProfilesSnapshot, RuntimeSnapshot: parent.RuntimeSnapshot,
-		MaxRounds: maxRounds(&parent), UpdatedAt: s.now(),
+		MaxRounds: policy.MaxRounds, ReviewPolicy: &policy, UpdatedAt: s.now(),
 	}
 	if err := s.Store.Create(child); err != nil {
 		if errors.Is(err, task.ErrTaskExists) {
@@ -500,7 +867,7 @@ func (s *Service) ReviewIntegration(ctx context.Context, parentID string) (Resul
 		case task.PhaseImplementationReady:
 			return s.ReviewCode(ctx, integrationID)
 		default:
-			return Result{State: existing}, problem("INTEGRATION_IN_PROGRESS", "continue the integration task with the standard answer, retry, status, or code review commands", integrationID, ExitUsage, true, nil)
+			return existingWorkflowResult(existing)
 		}
 	} else if !errors.Is(err, task.ErrNotFound) {
 		return Result{}, classify(integrationID, err)
@@ -517,6 +884,9 @@ func (s *Service) ReviewIntegration(ctx context.Context, parentID string) (Resul
 	parent, err := s.Store.Load(parentID)
 	if err != nil {
 		return Result{}, classify(parentID, err)
+	}
+	if (parent.Complexity == task.ComplexityTrivial || parent.Complexity == task.ComplexitySmall) && len(graph.Nodes) == 1 {
+		return Result{State: parent, Status: "approved"}, nil
 	}
 	var scopeParts []string
 	workUnits := make([]task.WorkUnit, 0, len(graph.Nodes))
@@ -561,14 +931,16 @@ func (s *Service) ReviewIntegration(ctx context.Context, parentID string) (Resul
 		return Result{}, classify(integrationID, err)
 	}
 	planHash := hash(parent.Plan)
+	policy := resolvedReviewPolicy(&parent)
 	integration := task.State{
 		ID: integrationID, RepoRoot: s.RepoRoot, Phase: task.PhaseImplementationReady,
 		Task: parent.Task, Plan: parent.Plan, PlanHash: planHash, ApprovedPlanHash: planHash,
 		ParentTaskID: parentID, IntegrationReview: true, WorkUnits: workUnits,
-		Scope: scope, ScopeSpecHash: task.ScopeSpecHash(scope), ScopedBaseline: baseline, ScopedBaselineHash: task.HashManifest(baseline),
+		Complexity: parent.Complexity,
+		Scope:      scope, ScopeSpecHash: task.ScopeSpecHash(scope), ScopedBaseline: baseline, ScopedBaselineHash: task.HashManifest(baseline),
 		CandidateManifest: candidate, CandidateManifestHash: task.HashManifest(candidate), ChangeManifest: changeEntries(baseline, candidate),
 		ProfilesSnapshot: parent.ProfilesSnapshot, RuntimeSnapshot: parent.RuntimeSnapshot,
-		MaxRounds: maxRounds(&parent), UpdatedAt: s.now(),
+		MaxRounds: policy.MaxRounds, ReviewPolicy: &policy, UpdatedAt: s.now(),
 	}
 	if err := s.Store.Create(integration); err != nil {
 		return Result{}, classify(integrationID, err)
@@ -582,11 +954,11 @@ func (s *Service) ReviewIntegration(ctx context.Context, parentID string) (Resul
 func (s *Service) runPlanner(ctx context.Context, id, token, loop string) (Result, error) {
 	resp, err := s.call(ctx, id, token, runner.RolePlanner)
 	if err != nil {
-		return Result{}, err
+		return s.errorResult(id, err)
 	}
 	env, err := envelope(resp, runner.RolePlanner)
 	if err != nil {
-		return Result{}, s.fail(id, token, err)
+		return s.errorResult(id, s.fail(id, token, err))
 	}
 	if env.Status == "needs_input" {
 		st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
@@ -599,47 +971,58 @@ func (s *Service) runPlanner(ctx context.Context, id, token, loop string) (Resul
 				st.ReturnPhase = task.PhasePlanned
 			}
 			st.InterruptedLoop = loop
+			setReviewProgress(st, "plan", "needs_input")
 			st.InFlight, st.Retry = nil, nil
 			return nil
 		})
 		if saveErr != nil {
-			return Result{}, classify(id, saveErr)
+			return s.errorResult(id, classify(id, saveErr))
 		}
 		return Result{State: st, Status: "needs_input"}, problem("NEEDS_INPUT", env.Question, id, ExitNeedsInput, true, nil)
 	}
 	workUnits, graphErr := task.NormalizeWorkUnits(env.WorkUnits, env.Plan)
 	if graphErr != nil {
-		return Result{}, s.fail(id, token, fmt.Errorf("invalid planner work graph: %w", graphErr))
+		return s.errorResult(id, s.fail(id, token, fmt.Errorf("invalid planner work graph: %w", graphErr)))
+	}
+	if err := task.ValidateWorkUnitsForComplexity(env.Complexity, workUnits); err != nil {
+		return s.errorResult(id, s.fail(id, token, fmt.Errorf("invalid planner task sizing: %w", err)))
 	}
 	if err := s.WritePlan(id, env.Plan); err != nil {
-		return Result{}, s.fail(id, token, err)
+		return s.errorResult(id, s.fail(id, token, err))
 	}
+	isRevision := loop == "plan_review"
+	var noProgress bool
 	st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
 		st.Plan, st.PlanHash = env.Plan, hash(env.Plan)
+		st.Complexity = task.NormalizeComplexity(env.Complexity)
 		st.WorkGraph = len(env.WorkUnits) > 0
 		st.WorkUnits = append([]task.WorkUnit(nil), workUnits...)
 		st.Prompt = st.InFlight.Prompt
 		st.PendingAnswer = ""
-		if loop == "plan_review" {
-			st.Phase = task.PhasePlanReviewing
-			st.InFlight.Operation = "plan_review"
-			st.InFlight.Role = string(runner.RolePlanReviewer)
-			st.InFlight.KnownSession = st.PlanReviewerSessionID != ""
-			st.InFlight.SessionID = st.PlanReviewerSessionID
-			st.InFlight.Prompt = planReviewPrompt(st.Task, st.Plan, st.WorkUnits, st.PlanReviewerSessionID != "")
-			st.InFlight.Findings = nil
-			st.InFlight.StartedAt = s.now()
+		if isRevision {
+			noProgress = st.PlanReviewCheckpointHash != "" && st.PlanReviewCheckpointHash == planReviewFingerprint(*st)
+			st.Phase = task.PhasePlanned
+			st.InFlight, st.Retry = nil, nil
+			if noProgress {
+				setReviewProgress(st, "plan", "no_progress")
+			} else {
+				setReviewProgress(st, "plan", "revised")
+			}
 		} else {
 			st.Phase = task.PhasePlanned
 			st.InFlight, st.Retry = nil, nil
+			st.ReviewProgress = nil
 		}
 		return nil
 	})
 	if saveErr != nil {
-		return Result{}, classify(id, saveErr)
+		return s.errorResult(id, classify(id, saveErr))
 	}
-	if loop == "plan_review" {
-		return s.runPlanReviewer(ctx, id, token)
+	if noProgress {
+		return Result{State: st, Status: "no_progress"}, problem("REVIEW_NO_PROGRESS", "plan revision did not change the reviewed plan", id, ExitAction, false, nil)
+	}
+	if isRevision {
+		return Result{State: st, Status: "revised"}, nil
 	}
 	return Result{State: st, Status: "planned"}, nil
 }
@@ -649,32 +1032,56 @@ func (s *Service) runPlanReviewer(ctx context.Context, id, token string) (Result
 	if err != nil {
 		return Result{}, classify(id, err)
 	}
-	reviewedHash := before.PlanHash
+	if before.InFlight == nil || before.InFlight.Token != token || before.InFlight.Role != string(runner.RolePlanReviewer) {
+		return s.errorResult(id, classify(id, task.ErrStaleOperation))
+	}
+	if limit := maxRounds(&before); limit > 0 && reviewRound(before, "plan") >= limit {
+		var exhausted bool
+		st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
+			if limit := maxRounds(st); limit > 0 && reviewRound(*st, "plan") >= limit {
+				exhausted = true
+				st.Phase = task.PhaseFailed
+				st.InFlight, st.Retry = nil, nil
+				setReviewProgress(st, "plan", "exhausted")
+			}
+			return nil
+		})
+		if saveErr != nil {
+			return s.errorResult(id, classify(id, saveErr))
+		}
+		if exhausted {
+			return exhaustedResult(st)
+		}
+	}
+	reviewedPlanHash := before.PlanHash
+	reviewedFingerprint := planReviewFingerprint(before)
 	resp, err := s.call(ctx, id, token, runner.RolePlanReviewer)
 	if err != nil {
-		return Result{}, err
+		return s.errorResult(id, err)
 	}
 	env, err := envelope(resp, runner.RolePlanReviewer)
 	if err != nil {
-		return Result{}, s.fail(id, token, err)
+		return s.errorResult(id, s.fail(id, token, err))
 	}
 	var exhausted bool
 	st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
-		if st.PlanHash != reviewedHash {
+		if st.PlanHash != reviewedPlanHash || planReviewFingerprint(*st) != reviewedFingerprint {
 			return task.ErrStaleOperation
 		}
-		st.PlanRound++
-		st.Round = st.PlanRound
+		acceptReviewRound(st, "plan")
 		st.Findings = cloneFindings(env.Findings)
 		if env.Verdict == "approved" {
 			st.ApprovedPlanHash = st.PlanHash
 			st.Phase = task.PhasePlanApproved
+			setReviewProgress(st, "plan", "approved")
 			st.InFlight, st.Retry = nil, nil
 			return nil
 		}
-		if st.PlanRound >= maxRounds(st) {
+		st.PlanReviewCheckpointHash = planReviewFingerprint(*st)
+		if limit := maxRounds(st); limit > 0 && reviewRound(*st, "plan") >= limit {
 			exhausted = true
 			st.Phase = task.PhaseFailed
+			setReviewProgress(st, "plan", "exhausted")
 			st.InFlight, st.Retry = nil, nil
 			return nil
 		}
@@ -686,13 +1093,14 @@ func (s *Service) runPlanReviewer(ctx context.Context, id, token string) (Result
 		st.InFlight.Prompt = plannerRevisionPrompt(st.Plan, env.Findings, st.PlannerSessionID != "")
 		st.InFlight.Findings = cloneFindings(env.Findings)
 		st.InFlight.StartedAt = s.now()
+		setReviewProgress(st, "plan", "pending")
 		return nil
 	})
 	if saveErr != nil {
-		return Result{}, classify(id, saveErr)
+		return s.errorResult(id, classify(id, saveErr))
 	}
 	if exhausted {
-		return Result{State: st, Status: "exhausted"}, problem("REVIEW_EXHAUSTED", "plan review exhausted five rounds", id, ExitExhausted, false, nil)
+		return Result{State: st, Status: "exhausted"}, reviewExhaustedError(st)
 	}
 	if env.Verdict == "approved" {
 		return Result{State: st, Status: "approved"}, nil
@@ -703,11 +1111,11 @@ func (s *Service) runPlanReviewer(ctx context.Context, id, token string) (Result
 func (s *Service) runImplementer(ctx context.Context, id, token, loop string) (Result, error) {
 	resp, err := s.call(ctx, id, token, runner.RoleImplementer)
 	if err != nil {
-		return Result{}, err
+		return s.errorResult(id, err)
 	}
 	env, err := envelope(resp, runner.RoleImplementer)
 	if err != nil {
-		return Result{}, s.fail(id, token, err)
+		return s.errorResult(id, s.fail(id, token, err))
 	}
 	if env.Status == "needs_input" {
 		st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
@@ -719,62 +1127,68 @@ func (s *Service) runImplementer(ctx context.Context, id, token, loop string) (R
 				st.ReturnPhase = task.PhaseImplementing
 			}
 			st.InterruptedLoop = loop
+			setReviewProgress(st, reviewKind(*st), "needs_input")
 			st.InFlight, st.Retry = nil, nil
 			return nil
 		})
 		if saveErr != nil {
-			return Result{}, classify(id, saveErr)
+			return s.errorResult(id, classify(id, saveErr))
 		}
 		return Result{State: st, Status: "needs_input"}, problem("NEEDS_INPUT", env.Question, id, ExitNeedsInput, true, nil)
 	}
 	current, loadErr := s.Store.Load(id)
 	if loadErr != nil {
-		return Result{}, classify(id, loadErr)
+		return s.errorResult(id, classify(id, loadErr))
 	}
 	candidate, observeErr := s.Observe(current.Scope)
 	if observeErr != nil {
-		return Result{}, s.fail(id, token, observeErr)
+		return s.errorResult(id, s.fail(id, token, observeErr))
 	}
 	label := "candidate-" + shortToken(token) + "-" + fmt.Sprint(current.CodeRound)
 	candidate, observeErr = s.Capture(candidate, label, id)
 	if observeErr != nil {
-		return Result{}, s.fail(id, token, observeErr)
+		return s.errorResult(id, s.fail(id, token, observeErr))
 	}
 	afterAll, observeErr := s.Observe("**")
 	if observeErr != nil {
-		return Result{}, s.fail(id, token, observeErr)
+		return s.errorResult(id, s.fail(id, token, observeErr))
 	}
 	preAll := cloneManifest(current.InFlight.SnapshotManifest)
-	outside := outsideScope(task.ManifestDelta(preAll, afterAll).Paths(), current.Scope)
+	outside := outsideScope(preAll, afterAll, current.Scope)
+	candidateHash := task.HashManifest(candidate)
+	var noProgress bool
 	st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
 		st.CandidateManifest = cloneManifest(candidate)
-		st.CandidateManifestHash = task.HashManifest(candidate)
+		st.CandidateManifestHash = candidateHash
 		st.ChangeManifest = changeEntries(st.ScopedBaseline, candidate)
 		if len(outside) > 0 {
 			st.Advisories = mergeDiagnostics(st.Advisories, []task.Diagnostic{{Code: "OUT_OF_SCOPE_CHANGE", Severity: "warning", Message: "files outside this task scope changed while the implementer was running", TaskID: id, Paths: outside}})
 		}
 		st.PendingAnswer = ""
 		if loop == "code_review" {
-			st.Phase = task.PhaseCodeReviewing
-			st.InFlight.Operation = "code_review"
-			st.InFlight.Role = string(runner.RoleCodeReviewer)
-			st.InFlight.KnownSession = st.CodeReviewerSessionID != ""
-			st.InFlight.SessionID = st.CodeReviewerSessionID
-			st.InFlight.SnapshotManifest = cloneManifest(candidate)
-			st.InFlight.Prompt = codeReviewPrompt(*st, st.CodeReviewerSessionID != "")
-			st.InFlight.Findings = nil
-			st.InFlight.StartedAt = s.now()
+			noProgress = st.ReviewCheckpointHash != "" && candidateHash == st.ReviewCheckpointHash
+			st.Phase = task.PhaseImplementationReady
+			st.InFlight, st.Retry = nil, nil
+			if noProgress {
+				setReviewProgress(st, reviewKind(*st), "no_progress")
+			} else {
+				setReviewProgress(st, reviewKind(*st), "fixed")
+			}
 		} else {
 			st.Phase = task.PhaseImplementationReady
 			st.InFlight, st.Retry = nil, nil
+			st.ReviewProgress = nil
 		}
 		return nil
 	})
 	if saveErr != nil {
-		return Result{}, classify(id, saveErr)
+		return s.errorResult(id, classify(id, saveErr))
+	}
+	if noProgress {
+		return Result{State: st, Status: "no_progress"}, problem("REVIEW_NO_PROGRESS", "code review fix did not change the scoped candidate", id, ExitAction, false, nil)
 	}
 	if loop == "code_review" {
-		return s.runCodeReviewer(ctx, id, token)
+		return Result{State: st, Status: "fixed"}, nil
 	}
 	return Result{State: st, Status: "implementation_ready"}, nil
 }
@@ -784,16 +1198,39 @@ func (s *Service) runCodeReviewer(ctx context.Context, id, token string) (Result
 	if err != nil {
 		return Result{}, classify(id, err)
 	}
+	if beforeState.InFlight == nil || beforeState.InFlight.Token != token || beforeState.InFlight.Role != string(runner.RoleCodeReviewer) {
+		return s.errorResult(id, classify(id, task.ErrStaleOperation))
+	}
+	kind := reviewKind(beforeState)
+	if limit := maxRounds(&beforeState); limit > 0 && reviewRound(beforeState, "code") >= limit {
+		var exhausted bool
+		st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
+			if limit := maxRounds(st); limit > 0 && reviewRound(*st, "code") >= limit {
+				exhausted = true
+				st.Phase = task.PhaseFailed
+				st.InFlight, st.Retry = nil, nil
+				setReviewProgress(st, kind, "exhausted")
+			}
+			return nil
+		})
+		if saveErr != nil {
+			return s.errorResult(id, classify(id, saveErr))
+		}
+		if exhausted {
+			return exhaustedResult(st)
+		}
+	}
 	barrier := cloneManifest(beforeState.InFlight.SnapshotManifest)
+	reviewedCandidateHash := beforeState.CandidateManifestHash
 	live, observeErr := s.Observe(beforeState.Scope)
 	if observeErr != nil {
-		return Result{}, s.fail(id, token, observeErr)
+		return s.errorResult(id, s.fail(id, token, observeErr))
 	}
 	if task.ManifestChanged(barrier, live) {
 		label := "candidate-review-refresh-" + shortToken(token) + "-" + fmt.Sprint(beforeState.CodeRound)
 		captured, captureErr := s.Capture(live, label, id)
 		if captureErr != nil {
-			return Result{}, s.fail(id, token, captureErr)
+			return s.errorResult(id, s.fail(id, token, captureErr))
 		}
 		beforeState, err = s.Store.UpdateOwned(id, token, func(st *task.State) error {
 			st.CandidateManifest = cloneManifest(captured)
@@ -804,23 +1241,24 @@ func (s *Service) runCodeReviewer(ctx context.Context, id, token string) (Result
 			return nil
 		})
 		if err != nil {
-			return Result{}, classify(id, err)
+			return s.errorResult(id, classify(id, err))
 		}
 		barrier = cloneManifest(live)
+		reviewedCandidateHash = beforeState.CandidateManifestHash
 	}
 	resp, callErr := s.call(ctx, id, token, runner.RoleCodeReviewer)
 	if callErr != nil {
-		return Result{}, callErr
+		return s.errorResult(id, callErr)
 	}
 	after, observeErr := s.Observe(beforeState.Scope)
 	if observeErr != nil {
-		return Result{}, s.fail(id, token, observeErr)
+		return s.errorResult(id, s.fail(id, token, observeErr))
 	}
 	if task.ManifestChanged(barrier, after) {
 		label := "candidate-review-change-" + shortToken(token) + "-" + fmt.Sprint(beforeState.CodeRound)
 		captured, captureErr := s.Capture(after, label, id)
 		if captureErr != nil {
-			return Result{}, s.fail(id, token, captureErr)
+			return s.errorResult(id, s.fail(id, token, captureErr))
 		}
 		st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
 			st.CandidateManifest = cloneManifest(captured)
@@ -829,39 +1267,44 @@ func (s *Service) runCodeReviewer(ctx context.Context, id, token string) (Result
 			retry := retryFrom(st, st.InFlight)
 			retry.Prompt = "The scoped candidate changed while your previous review was running. Discard that verdict and review this current candidate.\n" + codeReviewPrompt(*st, true)
 			st.Phase = task.PhaseReviewNeeded
+			setReviewProgress(st, kind, "review_needed")
 			st.Retry = retry
 			st.InFlight = nil
 			return nil
 		})
 		if saveErr != nil {
-			return Result{}, classify(id, saveErr)
+			return s.errorResult(id, classify(id, saveErr))
 		}
 		return Result{State: st, Status: "review_needed"}, problem("REVIEW_NEEDED", "scoped files changed during code review", id, ExitReviewNeeded, true, task.ErrScopeChanged)
 	}
 	env, envErr := envelope(resp, runner.RoleCodeReviewer)
 	if envErr != nil {
-		return Result{}, s.fail(id, token, envErr)
+		return s.errorResult(id, s.fail(id, token, envErr))
 	}
 	var exhausted bool
 	st, saveErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
-		st.CodeRound++
-		st.Round = st.CodeRound
+		if st.CandidateManifestHash != reviewedCandidateHash || task.HashManifest(st.CandidateManifest) != reviewedCandidateHash {
+			return task.ErrStaleOperation
+		}
+		acceptReviewRound(st, kind)
 		st.Findings = cloneFindings(env.Findings)
 		if env.Verdict == "approved" {
 			st.ApprovedManifestHash = task.HashManifest(after)
 			st.Phase = task.PhaseApproved
-			st.InFlight, st.Retry = nil, nil
-			return nil
-		}
-		if st.CodeRound >= maxRounds(st) {
-			exhausted = true
-			st.Phase = task.PhaseFailed
+			setReviewProgress(st, kind, "approved")
 			st.InFlight, st.Retry = nil, nil
 			return nil
 		}
 		st.ReviewCheckpoint = cloneManifest(st.CandidateManifest)
 		st.ReviewCheckpointHash = st.CandidateManifestHash
 		st.ReviewCheckpointFindings = cloneFindings(env.Findings)
+		if limit := maxRounds(st); limit > 0 && reviewRound(*st, kind) >= limit {
+			exhausted = true
+			st.Phase = task.PhaseFailed
+			setReviewProgress(st, kind, "exhausted")
+			st.InFlight, st.Retry = nil, nil
+			return nil
+		}
 		st.Phase = task.PhaseImplementing
 		st.InFlight.Operation = "code_revision"
 		st.InFlight.Role = string(runner.RoleImplementer)
@@ -871,38 +1314,51 @@ func (s *Service) runCodeReviewer(ctx context.Context, id, token string) (Result
 		st.InFlight.Prompt = implementReviewFixPrompt(*st, env.Findings)
 		st.InFlight.Findings = cloneFindings(env.Findings)
 		st.InFlight.StartedAt = s.now()
+		setReviewProgress(st, kind, "pending")
 		return nil
 	})
 	if saveErr != nil {
-		return Result{}, classify(id, saveErr)
+		return s.errorResult(id, classify(id, saveErr))
 	}
 	if exhausted {
-		return Result{State: st, Status: "exhausted"}, problem("REVIEW_EXHAUSTED", "code review exhausted five rounds", id, ExitExhausted, false, nil)
+		return Result{State: st, Status: "exhausted"}, reviewExhaustedError(st)
 	}
 	if env.Verdict == "approved" {
 		return Result{State: st, Status: "approved"}, nil
 	}
 	preAll, observeErr := s.Observe("**")
 	if observeErr != nil {
-		return Result{}, s.fail(id, token, observeErr)
+		return s.errorResult(id, s.fail(id, token, observeErr))
 	}
 	_, saveErr = s.Store.UpdateOwned(id, token, func(st *task.State) error {
 		st.InFlight.SnapshotManifest = cloneManifest(preAll)
 		return nil
 	})
 	if saveErr != nil {
-		return Result{}, classify(id, saveErr)
+		return s.errorResult(id, classify(id, saveErr))
 	}
 	return s.runImplementer(ctx, id, token, "code_review")
 }
 
 func (s *Service) beginCodeReview(id string, before, candidate []task.FileEntry, loop, prompt string) (task.State, error) {
+	var exhausted bool
 	st, err := s.Store.Update(id, func(st *task.State) error {
 		if st.InFlight != nil {
 			return task.ErrOperationInFlight
 		}
 		if st.Phase != task.PhaseImplementationReady || st.Scope == "" || st.CandidateManifestHash == "" {
 			return task.ErrInvalidPhase
+		}
+		kind := "code"
+		if st.IntegrationReview {
+			kind = "integration"
+		}
+		if limit := maxRounds(st); limit > 0 && reviewRound(*st, kind) >= limit {
+			exhausted = true
+			st.Phase = task.PhaseFailed
+			st.InFlight, st.Retry = nil, nil
+			setReviewProgress(st, kind, "exhausted")
+			return nil
 		}
 		st.CandidateManifest = cloneManifest(candidate)
 		st.CandidateManifestHash = task.HashManifest(candidate)
@@ -912,10 +1368,17 @@ func (s *Service) beginCodeReview(id string, before, candidate []task.FileEntry,
 		}
 		token := s.newToken()
 		st.Phase = task.PhaseCodeReviewing
+		setReviewProgress(st, kind, "pending")
 		st.InFlight = s.ownedFlight(task.InFlight{Token: token, Operation: "code_review", Role: string(runner.RoleCodeReviewer), StartedAt: s.now(), KnownSession: st.CodeReviewerSessionID != "", SessionID: st.CodeReviewerSessionID, SnapshotManifest: cloneManifest(before), PreviousPhase: task.PhaseImplementationReady, Prompt: prompt, Scope: st.Scope, Loop: loop})
 		return nil
 	})
-	return st, classify(id, err)
+	if err != nil {
+		return st, classify(id, err)
+	}
+	if exhausted {
+		return st, reviewExhaustedError(st)
+	}
+	return st, nil
 }
 
 func (s *Service) call(ctx context.Context, id, token string, role runner.Role) (runner.Response, error) {
@@ -964,14 +1427,26 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 		return updateErr
 	}, Diagnostic: s.Diagnostic})
 	turnUsage := resp.Usage
-	turnUsage.Requests++
-	turnUsage.PromptBytes += int64(len(request.Prompt))
+	// Requests and prompt bytes are host measurements. Keep provider token
+	// counters intact, but do not let provider-side aggregate fields inflate
+	// the host-owned counters.
+	turnUsage.Requests = 1
+	turnUsage.PromptBytes = int64(len(request.Prompt))
+	turnUsage.UnreportedRequests = 0
+	turnUsage.IncompleteRequests = 0
+	usageStatus, usageReported := classifyUsage(resp, callErr)
+	switch usageStatus {
+	case runner.UsageIncomplete:
+		turnUsage.IncompleteRequests = 1
+	case runner.UsageUnreported:
+		turnUsage.UnreportedRequests = 1
+	}
 	if _, updateErr := s.Store.UpdateOwned(id, token, func(st *task.State) error {
 		if st.Usage == nil {
 			st.Usage = map[string]task.TokenUsage{}
 		}
 		total := st.Usage[string(role)]
-		if resp.UsageCumulative {
+		if resp.UsageCumulative && usageReported {
 			if st.ProviderUsageCumulative == nil {
 				st.ProviderUsageCumulative = map[string]task.TokenUsage{}
 			}
@@ -1009,6 +1484,40 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 	return resp, nil
 }
 
+// classifyUsage resolves the explicit adapter status and retains a
+// conservative compatibility path for adapters written before UsageStatus
+// existed. Only token counters establish that a legacy adapter reported a
+// snapshot; host counters and aggregate availability metadata are ignored.
+func classifyUsage(resp runner.Response, callErr error) (runner.UsageStatus, bool) {
+	switch resp.UsageStatus {
+	case runner.UsageComplete:
+		return runner.UsageComplete, true
+	case runner.UsageIncomplete:
+		return runner.UsageIncomplete, true
+	case runner.UsageUnreported:
+		return runner.UsageUnreported, false
+	case "":
+		if !hasTokenUsage(resp.Usage) {
+			return runner.UsageUnreported, false
+		}
+		if callErr != nil {
+			return runner.UsageIncomplete, true
+		}
+		return runner.UsageComplete, true
+	default:
+		return runner.UsageUnreported, false
+	}
+}
+
+func hasTokenUsage(usage task.TokenUsage) bool {
+	return usage.InputTokens != 0 ||
+		usage.CachedInputTokens != 0 ||
+		usage.CacheWriteTokens != 0 ||
+		usage.OutputTokens != 0 ||
+		usage.ReasoningTokens != 0 ||
+		usage.TotalTokens != 0
+}
+
 func tokenDelta(current, previous int64) int64 {
 	if current < previous {
 		// Some CLIs reset counters when a resumed conversation starts in a
@@ -1029,6 +1538,7 @@ func (s *Service) fail(id, token string, cause error) error {
 		message, retryable, known, session = pe.Message, pe.Retryable, pe.KnownSession, pe.SessionID
 	}
 	_, err := s.Store.UpdateOwned(id, token, func(st *task.State) error {
+		kind := reviewKind(*st)
 		if session == "" && st.InFlight != nil {
 			session, known = st.InFlight.SessionID, st.InFlight.KnownSession
 		}
@@ -1040,6 +1550,7 @@ func (s *Service) fail(id, token string, cause error) error {
 			st.Retry = nil
 		}
 		st.Phase = task.PhaseFailed
+		setReviewProgress(st, kind, "failed")
 		st.InFlight = nil
 		return nil
 	})
@@ -1081,6 +1592,31 @@ func (s *Service) snapshots(ctx context.Context) (map[string]task.ProfileSnapsho
 		}
 		profiles[role] = task.ProfileSnapshot{Provider: p.Provider, Model: p.Model, Effort: p.Effort, Speed: p.Speed}
 		runtimes[role] = runtime
+	}
+	return profiles, runtimes, nil
+}
+
+// configuredSnapshots intentionally performs no model discovery. Quick tasks
+// use the already configured selections and let the actual provider call fail
+// closed if an account/model has since become unavailable.
+func (s *Service) configuredSnapshots(roles ...runner.Role) (map[string]task.ProfileSnapshot, map[string]task.RuntimeSnapshot, error) {
+	effective, err := s.Config.EffectiveProfiles()
+	if err != nil {
+		return nil, nil, err
+	}
+	profiles := map[string]task.ProfileSnapshot{}
+	runtimes := map[string]task.RuntimeSnapshot{}
+	for _, role := range roles {
+		name := string(role)
+		profile, providerConfig := s.Config.ResolveProfile(effective[name])
+		if err := config.ValidateProfile(profile); err != nil {
+			return nil, nil, fmt.Errorf("profile %s: %w", name, err)
+		}
+		if s.Adapters[profile.Provider] == nil {
+			return nil, nil, fmt.Errorf("profile %s: provider %s is unavailable", name, profile.Provider)
+		}
+		profiles[name] = task.ProfileSnapshot{Provider: profile.Provider, Model: profile.Model, Effort: profile.Effort, Speed: profile.Speed}
+		runtimes[name] = RuntimeSnapshot(profile.Provider, providerConfig)
 	}
 	return profiles, runtimes, nil
 }
@@ -1247,12 +1783,14 @@ func (s *Service) recoverAbandoned(id, token string) (task.State, error) {
 		if session == "" {
 			unrecoverable = true
 			st.Phase = task.PhaseFailed
+			setReviewProgress(st, reviewKind(*st), "failed")
 			st.InFlight, st.Retry = nil, nil
 			return nil
 		}
 		retry := retryFrom(st, st.InFlight)
 		retry.SessionID, retry.KnownSession, retry.CreatedAt = session, true, s.now()
 		st.Phase = task.PhaseFailed
+		setReviewProgress(st, reviewKind(*st), "failed")
 		st.Retry = retry
 		st.InFlight = nil
 		return nil
@@ -1271,11 +1809,155 @@ func hash(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 func maxRounds(st *task.State) int {
-	if st.MaxRounds > 0 {
+	if st != nil && st.ReviewPolicy != nil {
+		return st.ReviewPolicy.MaxRounds
+	}
+	if st != nil && st.MaxRounds > 0 {
 		return st.MaxRounds
 	}
-	return MaxRounds
+	return config.DefaultReviewMaxRounds
 }
+
+func resolvedReviewPolicy(st *task.State) task.ReviewPolicy {
+	return task.ReviewPolicy{MaxRounds: maxRounds(st)}
+}
+
+func setReviewProgress(st *task.State, kind, status string) {
+	if strings.TrimSpace(kind) == "" {
+		st.ReviewProgress = nil
+		return
+	}
+	st.ReviewProgress = &task.ReviewProgress{Kind: kind, Status: status}
+}
+
+func planReviewFingerprint(st task.State) string {
+	units, err := task.NormalizeWorkUnits(st.WorkUnits, st.Plan)
+	if err != nil {
+		units = cloneWorkUnits(st.WorkUnits)
+	}
+	return hash(mustJSON(struct {
+		Plan       string          `json:"plan"`
+		Complexity string          `json:"complexity"`
+		WorkGraph  bool            `json:"work_graph"`
+		WorkUnits  []task.WorkUnit `json:"work_units"`
+	}{Plan: st.Plan, Complexity: st.Complexity, WorkGraph: st.WorkGraph, WorkUnits: units}))
+}
+
+func cloneWorkUnits(units []task.WorkUnit) []task.WorkUnit {
+	if units == nil {
+		return nil
+	}
+	out := make([]task.WorkUnit, len(units))
+	for i, unit := range units {
+		out[i] = unit
+		out[i].DependsOn = append([]string(nil), unit.DependsOn...)
+		out[i].AcceptanceCriteria = append([]string(nil), unit.AcceptanceCriteria...)
+		out[i].ValidationCommands = append([]string(nil), unit.ValidationCommands...)
+	}
+	return out
+}
+
+func isReviewerRole(role string) bool {
+	return role == string(runner.RolePlanReviewer) || role == string(runner.RoleCodeReviewer)
+}
+
+func retryResumable(retry *task.RetryState) bool {
+	return retry != nil && retry.KnownSession && strings.TrimSpace(retry.SessionID) != ""
+}
+
+func sameRetry(left, right task.RetryState) bool {
+	return left.Token == right.Token &&
+		left.Operation == right.Operation &&
+		left.Role == right.Role &&
+		left.PreviousPhase == right.PreviousPhase &&
+		left.Scope == right.Scope &&
+		left.SessionID == right.SessionID &&
+		left.KnownSession == right.KnownSession &&
+		left.Loop == right.Loop &&
+		left.CreatedAt.Equal(right.CreatedAt)
+}
+
+func isExhaustedState(st task.State) bool {
+	if st.InFlight != nil || st.Phase == task.PhaseNeedsInput {
+		return false
+	}
+	if st.ReviewProgress != nil && st.ReviewProgress.Status == "exhausted" {
+		return true
+	}
+	// Older task files have no ReviewProgress. Only infer exhaustion for a
+	// failed, unapproved task with no resumable operation, preserving ordinary
+	// provider failures as retryable/inspectable failures.
+	if st.Phase != task.PhaseFailed || st.Retry != nil || st.ReviewProgress != nil {
+		return false
+	}
+	limit := maxRounds(&st)
+	if limit <= 0 {
+		return false
+	}
+	kind := reviewKind(st)
+	if kind == "plan" {
+		if st.ApprovedPlanHash != "" && st.ApprovedPlanHash == st.PlanHash {
+			return false
+		}
+	} else if st.ApprovedManifestHash != "" && st.ApprovedManifestHash == st.CandidateManifestHash {
+		return false
+	}
+	return reviewRound(st, kind) >= limit
+}
+
+func reviewExhaustedError(st task.State) error {
+	label := reviewKind(st)
+	if label == "" {
+		label = "task"
+	}
+	return problem("REVIEW_EXHAUSTED", fmt.Sprintf("%s review exhausted %d rounds", label, maxRounds(&st)), st.ID, ExitExhausted, false, nil)
+}
+
+func exhaustedResult(st task.State) (Result, error) {
+	return Result{State: st, Status: "exhausted"}, reviewExhaustedError(st)
+}
+
+func needsInputResult(st task.State) (Result, error) {
+	return Result{State: st, Status: "needs_input"}, problem("NEEDS_INPUT", st.PendingQuestion, st.ID, ExitNeedsInput, true, nil)
+}
+
+func existingWorkflowResult(st task.State) (Result, error) {
+	result := Result{State: st, Status: ControlFor(st).Status}
+	if isExhaustedState(st) {
+		return exhaustedResult(st)
+	}
+	if st.InFlight != nil {
+		return result, classify(st.ID, task.ErrOperationInFlight)
+	}
+	if st.Phase == task.PhaseNeedsInput {
+		return needsInputResult(st)
+	}
+	switch st.Phase {
+	case task.PhaseReviewNeeded:
+		return result, problem("REVIEW_NEEDED", "review must be retried before another review can start", st.ID, ExitReviewNeeded, true, task.ErrScopeChanged)
+	case task.PhasePlanReviewing, task.PhaseCodeReviewing, task.PhaseImplementing:
+		return result, classify(st.ID, task.ErrOperationInFlight)
+	case task.PhaseFailed:
+		return result, problem("OPERATION_FAILED", "the saved operation failed; inspect the task or retry its durable session", st.ID, ExitAction, retryResumable(st.Retry), nil)
+	default:
+		return result, classify(st.ID, task.ErrInvalidPhase)
+	}
+}
+
+// errorResult loads the state saved by fail before returning a provider-side
+// error. Successful paths return the state produced by their CAS directly and
+// therefore do not need this extra read.
+func (s *Service) errorResult(id string, err error) (Result, error) {
+	if err == nil {
+		return Result{}, nil
+	}
+	st, loadErr := s.Store.Load(id)
+	if loadErr != nil {
+		return Result{}, err
+	}
+	return Result{State: st, Status: ControlFor(st).Status}, err
+}
+
 func shortToken(token string) string {
 	if len(token) > 10 {
 		return token[:10]
@@ -1340,11 +2022,34 @@ func (s *Service) scopeAdvisories(id, scope string, entries []task.FileEntry) []
 	}
 	states, _ := s.Store.List()
 	for _, other := range states {
-		if other.ID != id && other.Scope != "" && task.ScopesOverlap(scope, other.Scope) {
+		if other.ID != id && other.Scope != "" && task.ScopesOverlap(scope, other.Scope) && scopeStateRelevant(other) {
 			out = append(out, task.Diagnostic{Code: "SCOPE_OVERLAP", Severity: "warning", Message: "scope may overlap another task; the orchestrator owns writer coordination", TaskID: other.ID})
 		}
 	}
 	return out
+}
+
+func scopeStateRelevant(st task.State) bool {
+	if st.InFlight != nil && scopedOperationRole(st.InFlight.Role) {
+		return true
+	}
+	if isExhaustedState(st) {
+		return false
+	}
+	switch st.Phase {
+	case task.PhaseApproved:
+		return false
+	case task.PhaseFailed, task.PhaseReviewNeeded:
+		return st.Retry != nil && scopedOperationRole(st.Retry.Role) && retryResumable(st.Retry)
+	case task.PhaseNeedsInput:
+		return st.PendingQuestionSource == string(runner.RoleImplementer)
+	default:
+		return true
+	}
+}
+
+func scopedOperationRole(role string) bool {
+	return role == string(runner.RoleImplementer) || role == string(runner.RoleCodeReviewer)
 }
 
 func cloneFindings(v []task.Finding) []task.Finding { return append([]task.Finding(nil), v...) }
@@ -1357,14 +2062,37 @@ func cloneManifest(v []task.FileEntry) []task.FileEntry {
 func mergeDiagnostics(a, b []task.Diagnostic) []task.Diagnostic {
 	return append(append([]task.Diagnostic(nil), a...), b...)
 }
-func outsideScope(paths []string, scope string) []string {
+func outsideScope(before, after []task.FileEntry, scope string) []string {
+	delta := task.ManifestDelta(filterDiagnosticEntries(before), filterDiagnosticEntries(after))
+	paths := delta.Paths()
+	seen := make(map[string]struct{}, len(paths))
 	var out []string
 	for _, p := range paths {
 		if !task.ScopeMatches(scope, p) {
+			if _, exists := seen[p]; exists {
+				continue
+			}
+			seen[p] = struct{}{}
 			out = append(out, p)
 		}
 	}
+	sort.Strings(out)
 	return out
+}
+
+func filterDiagnosticEntries(entries []task.FileEntry) []task.FileEntry {
+	filtered := make([]task.FileEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Kind == "directory" && !meaningfulIndexState(entry.Index) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func meaningfulIndexState(index task.IndexState) bool {
+	return index.Present || index.Mode != "" || index.Blob != "" || len(index.Stages) > 0 || index.Ref != nil || len(index.Entries) > 0
 }
 func changeEntries(before, after []task.FileEntry) []task.FileEntry {
 	d := task.ManifestDelta(before, after)
@@ -1403,7 +2131,7 @@ func isZero(v any) bool {
 const tokenDiscipline = "Use tokens deliberately without sacrificing correctness: start at the repository root, inspect only task-relevant files, combine related reads/searches, keep individual command output below 8 KiB, never inspect .git/rolemux or provider session logs except an explicitly listed immutable baseline reference, never reread unchanged evidence already present in this session, reuse session context, do not restate inputs, and keep the result concise but complete."
 
 func plannerPrompt(text string, inputs []string) string {
-	return tokenDiscipline + "\nYou are the primary research and architecture brain. Research the relevant repository and external contracts once, including each direct blast radius, then produce an execution-ready plan so implementers do not need to rediscover the system. Return a concise overall plan plus a machine-readable work_units dependency graph. Every node must have a stable ID, exact non-overlapping write scope, dependencies, a self-contained execution packet with named files/symbols/contracts/steps, acceptance criteria, and validation commands. Put independent nodes in the same dependency wave so the orchestrator can run them concurrently in one shared worktree; add a dependency edge whenever write scopes overlap. Resolve uncertainty now or return needs_input with an empty work_units array. Return only the required planner JSON envelope.\n\nTask:\n" + text + "\n\nAdditional context:\n" + strings.Join(inputs, "\n")
+	return tokenDiscipline + "\nYou are the primary research and architecture brain. First classify complexity as trivial, small, medium, large, or system, then make the smallest plan justified by that class. Trivial work must be exactly one unit containing implementation, tests, and validation. Small work may use at most two units and medium at most six; never create separate renderer, documentation, or validation-only units for a local change. Split only for a real dependency or material parallel wall-time benefit. Large/system work may use the full graph needed. Research relevant repository and external contracts once, including each direct blast radius, then produce an execution-ready plan so implementers do not rediscover the system. Every node needs a stable ID, exact non-overlapping write scope, dependencies, a self-contained execution packet with named files/symbols/contracts/steps, acceptance criteria, and validation commands. Scope is machine data: use only bare comma-separated repository paths or globs, never prose, punctuation, or annotations such as 'Write only' or '(new)'. Put truly independent nodes in the same dependency wave; add an edge when write scopes overlap. Resolve uncertainty now or return needs_input with an empty work_units array. Return only the required planner JSON envelope.\n\nTask:\n" + text + "\n\nAdditional context:\n" + strings.Join(inputs, "\n")
 }
 func plannerAnswerPrompt(question, answer string, reviewing bool, findings []task.Finding) string {
 	return fmt.Sprintf("Continue in this same planning session. Question: %s\nAnswer: %s\nReview loop: %t\nFindings: %s\nReturn only the planner JSON envelope.", question, answer, reviewing, mustJSON(findings))
@@ -1415,14 +2143,14 @@ func plannerRevisionPrompt(plan string, findings []task.Finding, resumed bool) s
 	}
 	return tokenDiscipline + "\n" + prompt + "\nCurrent plan:\n" + plan
 }
-func planReviewPrompt(text, plan string, units []task.WorkUnit, resumed bool) string {
+func planReviewPrompt(text, plan, complexity string, units []task.WorkUnit, resumed bool) string {
 	if resumed {
-		return "Review only the revision in this same review session; the task and previously validated evidence are unchanged. Verify that every prior finding is fixed and that each execution packet is implementation-ready. Validate the revised dependency graph, especially cycles and concurrent write-scope isolation. Do not repeat repository research or restate inputs. Return only the plan_reviewer JSON envelope.\nRevised plan:\n" + plan + "\nRevised work graph:\n" + mustJSON(units)
+		return "Review only the revision in this same review session; the task and previously validated evidence are unchanged. Verify that every prior finding is fixed and that each execution packet is implementation-ready. Validate the revised complexity and dependency graph, especially over-decomposition, cycles, and concurrent write-scope isolation. Do not repeat repository research or restate inputs. Return only the plan_reviewer JSON envelope.\nComplexity:\n" + complexity + "\nRevised plan:\n" + plan + "\nRevised work graph:\n" + mustJSON(units)
 	}
-	return tokenDiscipline + "\nReview this plan against the task. Reject it if an implementer would need to rediscover architecture, affected symbols, contracts, dependencies, blast radius, acceptance criteria, or validation commands. Verify that the dependency graph is acyclic and that units in the same wave have disjoint write scopes in the shared worktree. This is plan review, not code review. Return only the required plan_reviewer JSON envelope.\nTask:\n" + text + "\nPlan:\n" + plan + "\nWork graph:\n" + mustJSON(units)
+	return tokenDiscipline + "\nReview this plan against the task and its declared complexity. Reject over-decomposition: trivial work must have one unit with implementation and tests together; small work at most two; medium at most six; validation-only units are not justified for local changes. Reject scopes containing prose or annotations instead of bare repository paths/globs. Also reject if an implementer would need to rediscover architecture, affected symbols, contracts, dependencies, blast radius, acceptance criteria, or validation commands. Verify that the graph is acyclic and same-wave scopes are disjoint. This is plan review, not code review. Return only the required plan_reviewer JSON envelope.\nTask:\n" + text + "\nComplexity:\n" + complexity + "\nPlan:\n" + plan + "\nWork graph:\n" + mustJSON(units)
 }
 func implementPrompt(text, plan, scope string, findings []task.Finding) string {
-	return tokenDiscipline + "\nImplement the approved execution packet in this existing shared checkout. The planner owns architecture/research; validate only the named files/symbols and their immediate dependencies, then implement. Do not perform a broad repository survey. If essential context is absent or the worktree materially contradicts the packet, return one precise needs_input question for the orchestrator/planner instead of researching outward. You are the only source-code writer for this task. Other RoleMux tasks may run concurrently only in disjoint scopes. Change only the declared scope; do not run git mutation commands. Return only the implementer JSON envelope.\nTask:\n" + text + "\nExecution packet / approved plan:\n" + plan + "\nScope:\n" + scope + "\nFindings:\n" + mustJSON(findings)
+	return tokenDiscipline + "\nImplement the approved execution packet in this existing shared checkout. Treat its architecture and named evidence as authoritative. Before the first edit, use at most three combined read/search tool calls, batching exact named files and symbols. Do not run repository-wide searches, git status/diff/log, or inspect unrelated tests before editing. After the first edit, read more only to resolve a concrete compiler/test failure or a named direct dependency. If the packet is insufficient or the checkout contradicts it, return one precise needs_input question instead of researching outward. You are the only source-code writer for this task. Other RoleMux tasks may run concurrently only in disjoint scopes. Change only the declared scope; do not run git mutation commands. Return only the implementer JSON envelope.\nTask:\n" + text + "\nExecution packet / approved plan:\n" + plan + "\nScope:\n" + scope + "\nFindings:\n" + mustJSON(findings)
 }
 func implementAnswerPrompt(question, answer string, findings []task.Finding) string {
 	return "Continue in this same implementation session.\nQuestion: " + question + "\nAnswer: " + answer + "\nFindings:\n" + mustJSON(findings) + "\nReturn only the implementer JSON envelope."
@@ -1444,7 +2172,7 @@ func codeReviewPrompt(st task.State, resumed bool) string {
 	base := st.ScopedBaseline
 	label := "Task baseline-to-candidate delta"
 	findings := []task.Finding(nil)
-	if resumed && len(st.ReviewCheckpoint) > 0 {
+	if resumed && st.ReviewCheckpointHash != "" {
 		base = st.ReviewCheckpoint
 		label = "Fix delta since the previous completed review"
 		findings = st.ReviewCheckpointFindings
@@ -1452,13 +2180,13 @@ func codeReviewPrompt(st task.State, resumed bool) string {
 	delta := compactReviewDelta(base, st.CandidateManifest)
 	if st.IntegrationReview {
 		boundary := "Deep integration-review boundary: review the combined approved work-unit deltas as one system. Check cross-unit contracts, dependency assumptions, shared types/configuration, end-to-end behavior, regressions, and the union-scope validation. This is the single broad review for the approved plan, so follow relevant blast radius across work-unit boundaries without surveying unrelated repository areas."
-		if resumed && len(st.ReviewCheckpoint) > 0 {
+		if resumed && st.ReviewCheckpointHash != "" {
 			return boundary + "\nVerify every previous finding against the integration fix delta and check regressions caused by those fixes. Reuse this review session and do not repeat unchanged research. Return only the code_reviewer JSON envelope.\nPrevious findings:\n" + mustJSON(findings) + "\nWork graph:\n" + mustJSON(st.WorkUnits) + "\nScope:\n" + st.Scope + "\n" + label + ":\n" + mustJSON(delta)
 		}
 		return tokenDiscipline + "\n" + boundary + " Read current source files directly and use the immutable baseline references only when comparison is needed. Return only the code_reviewer JSON envelope.\nTask:\n" + st.Task + "\nApproved plan:\n" + st.Plan + "\nWork graph:\n" + mustJSON(st.WorkUnits) + "\nScope:\n" + st.Scope + "\n" + label + ":\n" + mustJSON(delta)
 	}
 	boundary := "Task-review boundary: review only the listed delta and its direct blast radius (direct callers, implemented interfaces, shared types/config consumers, and adjacent tests). Do not perform a whole-repository or cross-task integration audit. Do not browse external sources unless the approved plan names an external contract whose supplied evidence is insufficient. Reuse evidence already in this session and do not reread unchanged files. If a concern requires broader exploration, defer it to the one-time plan integration review rather than expanding this task review."
-	if resumed && len(st.ReviewCheckpoint) > 0 {
+	if resumed && st.ReviewCheckpointHash != "" {
 		return boundary + "\nVerify the previous findings against only the fix delta, plus regressions directly caused by those fixes. Do not restart the original review. Return only the code_reviewer JSON envelope.\nPrevious findings:\n" + mustJSON(findings) + "\nScope:\n" + st.Scope + "\n" + label + ":\n" + mustJSON(delta)
 	}
 	return tokenDiscipline + "\n" + boundary + " Read current source files directly; use only the explicitly listed immutable baseline references when comparison is needed. Do not inspect RoleMux task state. Ignore unrelated checkout changes. Return only the required code_reviewer JSON envelope.\nTask:\n" + st.Task + "\nApproved execution packet / plan:\n" + st.Plan + "\nScope:\n" + st.Scope + "\n" + label + ":\n" + mustJSON(delta)

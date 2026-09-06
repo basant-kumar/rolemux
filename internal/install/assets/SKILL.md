@@ -1,6 +1,6 @@
 ---
 name: rolemux
-description: Orchestrate planning, implementation, and review through RoleMux when a task should use configured models while preserving provider sessions and bounded review loops.
+description: Orchestrate planning, implementation, and review through RoleMux when a task should use configured models while preserving provider sessions and host-controlled review continuation.
 ---
 
 # RoleMux
@@ -11,28 +11,53 @@ persists the exact provider session used by that role.
 
 ## Run a task
 
-1. Run `rolemux doctor --json` when provider readiness is unknown. If it reports
+1. Classify the request before spending provider turns. For an obvious local
+   change with a self-contained task and exact narrow write scope, run
+   `rolemux quick start --task "<task>" --scope '<paths>' --json`, retain its
+   task ID, then go directly to `rolemux implement` and `rolemux code review`.
+   This path intentionally makes no planner, plan-reviewer, model-list, or auth
+   probe call. Never use it with `**` or when architecture/research is needed.
+2. Run `rolemux doctor --json` when provider readiness is unknown. If it reports
    a missing CLI or login, return that action to the user; do not silently choose
    another model.
-2. Start planning with `rolemux plan start --task "<task>" --json`. Retain the
+3. For non-trivial work, start planning with `rolemux plan start --task "<task>" --json`. Retain the
    returned task ID for every later command.
-3. When a command exits `3`, present its exact question to the user. Resume with
+4. When a command exits `3`, present its exact question to the user. Resume with
    `rolemux plan answer <task-id> --answer "<answer>" --json` or
    `rolemux implement answer <task-id> --answer "<answer>" --json`, according
    to `pending_question_source`.
-4. Run `rolemux plan review <task-id> --json`. RoleMux sends requested changes
-   back to the same planner session and reuses the same reviewer session, up to
-   its configured five-round limit.
-5. Read `rolemux plan graph <task-id> --json`. For every ID in `ready`, run
+5. Run `rolemux plan review <task-id> --json`. Each review command performs one
+   planner-reviewer turn and, if changes are requested, at most one planner
+   revision, then returns control. A `revised` result requires another explicit
+   `rolemux plan review` to review the new plan. The command reuses the durable
+   planner and reviewer sessions. `plan answer`, `implement answer`, and
+   `retry` also return after their completed operation without automatically
+   starting another review.
+6. Read `rolemux plan graph <task-id> --json`. The graph exposes semantic
+   `complexity`: trivial plans have one unit, small at most two, and medium at
+   most six. RoleMux rejects prose-like scope entries and graphs that exceed
+   their declared class. For every ID in `ready`, run
    `rolemux work start <task-id> <unit-id> --json`, then use the returned work
-   task ID with `rolemux implement <work-task-id> --json` and `rolemux code
-   review <work-task-id> --json`. Same-wave units may run concurrently; do not
-   start blocked units. Re-read the compact graph after approvals.
-6. After every graph node is approved, run `rolemux work integrate <task-id>
-   --json`. This starts one fresh deep reviewer and, only if needed, one fresh
-   integration fixer. RoleMux resumes those two sessions through the bounded
-   fix/review loop.
-7. Inspect `rolemux status <task-id> --json` whenever recovery is needed. Use
+   task ID with `rolemux implement <work-task-id> --json` and one
+   `rolemux code review <work-task-id> --json` command at a time. A code review
+   command performs one reviewer turn and, if needed, at most one implementer
+   fix, then returns control; explicitly review a `fixed` result again. Same-
+   wave units may run concurrently, but schedule only graph-ready units and do
+   not unlock dependencies on `revised` or `fixed`. Preserve every exact task
+   ID and re-read the compact graph after approvals.
+7. After every graph node is approved, run `rolemux work integrate <task-id>
+   --json`. This is one logical broad integration-review gate over the combined
+   approved changes. It creates or resumes dedicated durable integration
+   reviewer and fixer sessions; each invocation performs one reviewer turn and,
+   if needed, at most one fix before returning control. Continue it with the
+   explicit command named by the result, potentially across multiple host
+   invocations. `work integrate` expects the parent plan task ID on every
+   integration review; invoke it again with the original `<task-id>`. Use the
+   derived integration task ID returned by `work integrate` only for
+   `implement answer` and `retry`. A one-unit trivial/small graph returns
+   approval without another provider call because its focused review is already
+   the complete boundary.
+8. Inspect `rolemux status <task-id> --json` whenever recovery is needed. Use
    `rolemux retry <task-id> --json` when status reports a retryable saved
    operation, or when an in-flight operation's owning RoleMux process was
    terminated. RoleMux resumes only a durable provider session; it will not
@@ -51,6 +76,12 @@ Keep orchestration token-conscious: pass task IDs instead of replaying earlier
 provider output, rely on RoleMux's resumed sessions, and avoid calling `status`
 or refreshing `models` unless the workflow or recovery actually requires it.
 Never omit new user constraints or evidence needed for correctness.
+
+The implementer receives an explicit pre-edit discovery budget: at most three
+batched read/search calls over named files and symbols, with no repository-wide
+search or Git history/status/diff before editing. If the execution packet is not
+sufficient inside that budget, return `needs_input` instead of researching
+outward.
 
 RoleMux gives each fresh delegated role a bounded inventory of provider-native
 skills, provider tools, installed helpers, and skills that may exist only in a
@@ -77,18 +108,61 @@ Use `rolemux usage <task-id> --json` for a compact per-role token comparison.
 `rolemux status <task-id> --json` is compact by default; use `--full` only for
 deep diagnostics and never feed full state back into a model unnecessarily.
 
-## Interpret results
+## Review limits and host continuation
 
-- Treat JSON stdout as the sole machine-readable result; diagnostics are on
-  stderr.
-- Exit `0` means the command completed. Exit `3` requires a user answer. Exit
-  `4` means scoped files changed during review and the saved review should be
-  retried. Exit `5` requires orchestrator action, such as login or an available
-  configured provider. Exit `6` means the same task already has an operation in
-  flight. Exit `7` means the five-round plan or code-review limit was exhausted.
-- Never infer approval from prose or continue past a failed review gate.
-- RoleMux workers do not commit, push, stash, reset, rebase, or merge. Perform
-  repository and build commands separately, within the user's authorization.
+The top-level TOML setting `review_max_rounds = 5` is the default safety limit.
+The CLI form is `rolemux configure --global --review-max-rounds N` (or
+`--project`), where `N` is any nonnegative integer. Use
+`rolemux configure --global --review-max-rounds 0` for an unlimited ceiling
+or `rolemux configure --project --review-max-rounds 12` for a positive custom
+limit. The CLI accepts any nonnegative integer. Interactive configure has a
+`Review safety limit` entry with `Current`, `Default (5)`, `10`, and `Unlimited`
+choices. When `ROLEMUX_CONFIG` is set, RoleMux uses that file alone and replaces
+normal project/global discovery. When it is unset, project `.rolemux.toml`
+overlays global `~/.rolemux/config.toml`; `review_max_rounds` follows this
+selection.
+
+RoleMux snapshots the effective limit into each new task. Work units and the
+derived integration task inherit the parent snapshot, so later configuration
+edits do not change an existing task. Historical tasks retain a positive saved
+`max_rounds`; older task state without a positive saved value defaults to five.
+The limit counts accepted reviewer verdicts separately for the plan and for
+each code or integration task. Provider failures and stale-candidate retries do
+not consume a round. Approval at the ceiling succeeds; rejection at the ceiling
+returns `exhausted` without starting another fix. `0` removes the ceiling, not
+the single-invocation boundary.
+
+Compact review control results contain `status`, `review_kind`, `review_round`,
+`max_rounds`, `can_review`, and `next_action`, with optional `question` and
+`source` for host-mediated questions. For example, after one code fix:
+
+```json
+{"status":"fixed","review_kind":"code","review_round":1,"max_rounds":5,"can_review":true,"next_action":"code_review"}
+```
+
+Use the result as the host decision:
+
+| Status | Host action |
+|---|---|
+| `approved` | Advance the graph; only an approved node unlocks dependencies. |
+| `revised` / `fixed` | Issue the matching explicit review; keep dependencies locked. |
+| `needs_input` | Ask `question`, then use `source` with the matching `plan answer` or `implement answer` command. |
+| `review_needed` | Run `rolemux retry` using the exact task ID. |
+| `no_progress` | Inspect the saved candidate and return a deliberate host decision; do not repeat automatically. |
+| `failed` / `in_flight` | Follow recovery metadata: retry a durable failure or wait/inspect an in-flight owner. |
+| `exhausted` | Stop; the configured review ceiling has been reached. |
+
+Treat JSON stdout as the sole machine-readable result; diagnostics are on
+stderr. Exit `0` means the operation completed, not that it was approved. Exit
+`2` is a usage, configuration, or task-state error; exit `3` requires a user
+answer; exit `4` means scoped files changed during review and the saved review
+should be retried; exit `5` requires provider/orchestrator action, includes a
+failed-closed operation, or reports `no_progress`; exit `6` means the same task
+already has an operation in flight; exit `7` means the configured plan, code,
+or integration review limit was exhausted. Never infer approval from prose or
+continue past a failed review gate.
+RoleMux workers do not commit, push, stash, reset, rebase, or merge. Perform
+repository and build commands separately, within the user's authorization.
 
 Use `rolemux models --json` for agent-friendly discovery or `rolemux configure`
 in a terminal for the searchable model picker. The picker reads its

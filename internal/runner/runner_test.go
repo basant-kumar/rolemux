@@ -502,7 +502,7 @@ func TestUsageNormalizationPreservesProviderCacheSemantics(t *testing.T) {
 
 func TestNativeWorkerSchemaRequiresEveryProperty(t *testing.T) {
 	schema := NativeSchema(RolePlanner)
-	for _, required := range []string{`"required":["role","status","plan","question","work_units"]`, `"required":["id","objective","scope","depends_on","execution_packet","acceptance_criteria","validation_commands"]`, `"additionalProperties":false`, `"enum":["planner"]`} {
+	for _, required := range []string{`"required":["role","status","plan","question","complexity","work_units"]`, `"complexity":{"type":"string","enum":["trivial","small","medium","large","system"]}`, `"required":["id","objective","scope","depends_on","execution_packet","acceptance_criteria","validation_commands"]`, `"additionalProperties":false`, `"enum":["planner"]`} {
 		if !strings.Contains(schema, required) {
 			t.Fatalf("schema missing %s: %s", required, schema)
 		}
