@@ -67,6 +67,28 @@ func cliRepo(t *testing.T) string {
 	return root
 }
 
+func markCLIPlanApproved(t *testing.T, state *task.State) {
+	t.Helper()
+	units, err := task.NormalizeWorkUnits(state.WorkUnits, state.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(struct {
+		Plan       string          `json:"plan"`
+		Complexity string          `json:"complexity"`
+		WorkGraph  bool            `json:"work_graph"`
+		WorkUnits  []task.WorkUnit `json:"work_units"`
+	}{Plan: state.Plan, Complexity: state.Complexity, WorkGraph: state.WorkGraph, WorkUnits: units})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.ApprovalGateSchemaVersion = task.ApprovalGateSchemaVersion
+	state.Approval = &task.ApprovalRecord{
+		GateID: "test-plan-gate", Kind: task.ApprovalKindPlan, Status: task.ApprovalDecisionApprove,
+		SubjectFingerprint: task.ScopeSpecHash(string(payload)),
+	}
+}
+
 func runTestApp(t *testing.T, root string, input string, args ...string) (int, []byte, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
@@ -117,7 +139,9 @@ func TestPlanGraphAndWorkStartCommands(t *testing.T) {
 	}
 	store := task.NewStore(root)
 	planHash := task.ScopeSpecHash("plan")
-	if err := store.Create(task.State{ID: "graph-cli", RepoRoot: root, Phase: task.PhasePlanApproved, Plan: "plan", PlanHash: planHash, ApprovedPlanHash: planHash, WorkGraph: true, WorkUnits: units}); err != nil {
+	state := task.State{ID: "graph-cli", RepoRoot: root, Phase: task.PhasePlanApproved, Plan: "plan", PlanHash: planHash, ApprovedPlanHash: planHash, WorkGraph: true, WorkUnits: units}
+	markCLIPlanApproved(t, &state)
+	if err := store.Create(state); err != nil {
 		t.Fatal(err)
 	}
 	code, output, stderr := runTestApp(t, root, "", "plan", "graph", "graph-cli", "--json")

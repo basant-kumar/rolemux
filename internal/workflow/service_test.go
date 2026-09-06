@@ -119,6 +119,39 @@ func workflowTestModels() runner.ModelPage {
 	return runner.ModelPage{Models: models}
 }
 
+func markPlanHumanApproved(st *task.State) {
+	if st == nil {
+		return
+	}
+	if st.Plan == "" {
+		st.Plan = "approved test plan"
+	}
+	if st.PlanHash == "" {
+		st.PlanHash = hash(st.Plan)
+	}
+	if st.ApprovedPlanHash == "" {
+		st.ApprovedPlanHash = st.PlanHash
+	}
+	fingerprint := planReviewFingerprint(*st)
+	st.ApprovalGateSchemaVersion = task.ApprovalGateSchemaVersion
+	st.Approval = &task.ApprovalRecord{
+		GateID:             "test-plan-approval-" + st.ID,
+		Kind:               task.ApprovalKindPlan,
+		Status:             task.ApprovalDecisionApprove,
+		SubjectFingerprint: fingerprint,
+	}
+}
+
+func approveIfRequired(ctx context.Context, service *Service, id string, result Result, err error) (Result, error) {
+	if result.Status != "approval_required" || ExitCode(err) != ExitNeedsInput || result.State.Approval == nil {
+		return result, err
+	}
+	if result.State.ID != "" {
+		id = result.State.ID
+	}
+	return service.RespondApproval(ctx, id, result.State.Approval.GateID, task.ApprovalDecisionApprove, "")
+}
+
 func TestRuntimeSnapshotUsesCopilotGateway(t *testing.T) {
 	snapshot := RuntimeSnapshot("copilot", config.Provider{GatewayURL: "https://gateway.example.invalid", BearerTokenEnv: "COPILOT_TOKEN"})
 	if snapshot.Endpoint != "https://gateway.example.invalid" || snapshot.SDKSettings["base_url"] != snapshot.Endpoint || snapshot.SDKSettings["bearer_token_env"] != "COPILOT_TOKEN" {
@@ -138,6 +171,7 @@ func TestWorkGraphStartsOnlyReadyIndependentUnits(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent := task.State{ID: "dag", RepoRoot: root, Phase: task.PhasePlanApproved, Task: "dag", Plan: "plan", PlanHash: hash("plan"), ApprovedPlanHash: hash("plan"), WorkUnits: units, ProfilesSnapshot: map[string]task.ProfileSnapshot{}, RuntimeSnapshot: map[string]task.RuntimeSnapshot{}, MaxRounds: MaxRounds}
+	markPlanHumanApproved(&parent)
 	if err := service.Store.Create(parent); err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +224,7 @@ func TestIntegrationReviewUsesFreshFixerThenResumesReviewer(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent := task.State{ID: "integration-parent", RepoRoot: root, Phase: task.PhasePlanApproved, Task: "change app", Plan: "approved plan", PlanHash: hash("approved plan"), ApprovedPlanHash: hash("approved plan"), WorkUnits: units, ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: MaxRounds}
+	markPlanHumanApproved(&parent)
 	if err := service.Store.Create(parent); err != nil {
 		t.Fatal(err)
 	}
@@ -213,6 +248,7 @@ func TestIntegrationReviewUsesFreshFixerThenResumesReviewer(t *testing.T) {
 		t.Fatalf("integration=%#v err=%v", result.State, err)
 	}
 	result, err = service.ReviewIntegration(context.Background(), parent.ID)
+	result, err = approveIfRequired(context.Background(), service, parent.ID, result, err)
 	if err != nil || result.Status != "approved" || result.State.Phase != task.PhaseApproved || result.State.CodeRound != 2 {
 		t.Fatalf("integration approval=%#v err=%v", result.State, err)
 	}
@@ -288,6 +324,7 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 		t.Fatalf("plan revision: %#v err=%v", revisedPlan.State, err)
 	}
 	approvedPlan, err := service.ReviewPlan(context.Background(), "loop")
+	approvedPlan, err = approveIfRequired(context.Background(), service, "loop", approvedPlan, err)
 	if err != nil || approvedPlan.State.Phase != task.PhasePlanApproved || approvedPlan.State.Plan != "plan v2" || approvedPlan.State.PlanRound != 2 {
 		t.Fatalf("plan approval: %#v err=%v", approvedPlan.State, err)
 	}
@@ -300,6 +337,7 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 		t.Fatalf("code fix: %#v err=%v", fixedCode.State, err)
 	}
 	approvedCode, err := service.ReviewCode(context.Background(), "loop")
+	approvedCode, err = approveIfRequired(context.Background(), service, "loop", approvedCode, err)
 	if err != nil || approvedCode.State.Phase != task.PhaseApproved || approvedCode.State.CodeRound != 2 {
 		t.Fatalf("code approval: %#v err=%v", approvedCode.State, err)
 	}
@@ -401,7 +439,8 @@ func TestImplementerQuestionReturnsExitThreeAndResumesSameSession(t *testing.T) 
 	if _, err := service.StartPlan(context.Background(), "change app", "implement-question"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ReviewPlan(context.Background(), "implement-question"); err != nil {
+	planResult, err := service.ReviewPlan(context.Background(), "implement-question")
+	if _, err = approveIfRequired(context.Background(), service, "implement-question", planResult, err); err != nil {
 		t.Fatal(err)
 	}
 	result, err := service.Implement(context.Background(), "implement-question", "app.go")
@@ -749,7 +788,8 @@ func TestScopedMutationDuringReviewConsumesNoRoundAndRetryResumesReviewer(t *tes
 	if _, err := service.StartPlan(context.Background(), "change app", "barrier"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ReviewPlan(context.Background(), "barrier"); err != nil {
+	planResult, err := service.ReviewPlan(context.Background(), "barrier")
+	if _, err = approveIfRequired(context.Background(), service, "barrier", planResult, err); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.Implement(context.Background(), "barrier", "app.go"); err != nil {
@@ -760,6 +800,7 @@ func TestScopedMutationDuringReviewConsumesNoRoundAndRetryResumesReviewer(t *tes
 		t.Fatalf("barrier result=%#v err=%v exit=%d", result, err, ExitCode(err))
 	}
 	result, err = service.Retry(context.Background(), "barrier")
+	result, err = approveIfRequired(context.Background(), service, "barrier", result, err)
 	if err != nil || result.State.Phase != task.PhaseApproved || result.State.CodeRound != 1 {
 		t.Fatalf("retry result=%#v err=%v", result, err)
 	}
@@ -791,7 +832,8 @@ func TestCodeReviewRefreshesCandidateChangedBeforeReviewStarts(t *testing.T) {
 	if _, err := service.StartPlan(context.Background(), "change app", "pre-review-refresh"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ReviewPlan(context.Background(), "pre-review-refresh"); err != nil {
+	planResult, err := service.ReviewPlan(context.Background(), "pre-review-refresh")
+	if _, err = approveIfRequired(context.Background(), service, "pre-review-refresh", planResult, err); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.Implement(context.Background(), "pre-review-refresh", "app.go"); err != nil {
@@ -801,6 +843,7 @@ func TestCodeReviewRefreshesCandidateChangedBeforeReviewStarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := service.ReviewCode(context.Background(), "pre-review-refresh")
+	result, err = approveIfRequired(context.Background(), service, "pre-review-refresh", result, err)
 	if err != nil || result.State.Phase != task.PhaseApproved {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
@@ -872,6 +915,7 @@ func TestCodeReviewerRetryWithUnchangedCandidateContinuesWithoutRepeatingEvidenc
 		t.Fatal(err)
 	}
 	result, err := service.Retry(context.Background(), state.ID)
+	result, err = approveIfRequired(context.Background(), service, state.ID, result, err)
 	if err != nil || result.State.Phase != task.PhaseApproved {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
@@ -927,6 +971,27 @@ func TestPlannerAndImplementerPromptsAssignResearchToPlanner(t *testing.T) {
 	for _, required := range []string{"comma-separated", "commas between entries are valid"} {
 		if !strings.Contains(review, required) {
 			t.Fatalf("plan review prompt omitted canonical scope rule %q", required)
+		}
+	}
+}
+
+func TestDelegatedRolePromptsBoundAgentLatency(t *testing.T) {
+	implementation := implementPrompt("change app", "packet", "app.go", nil)
+	planReview := planReviewPrompt("change app", "plan", task.ComplexitySmall, []task.WorkUnit{{ID: "W1", Scope: "app.go"}}, false)
+	review := codeReviewPrompt(task.State{Task: "change app", Plan: "plan", Scope: "app.go"}, false)
+	for _, required := range []string{"at most three", "batched pre-edit", "git status/diff/log", "repository-wide searches", "repository-wide surveys", "post-green survey", "cohesive edits", "narrow validation", "full repository suite", "30 seconds", "one-second polling", "stop immediately", "focused validation passes"} {
+		if !strings.Contains(implementation, required) {
+			t.Fatalf("implementer prompt omitted %q: %s", required, implementation)
+		}
+	}
+	for _, required := range []string{"supplied delta and evidence", "changed files", "direct blast radius", "no git commands", "full suite", "validated verdict promptly"} {
+		if !strings.Contains(review, required) {
+			t.Fatalf("review prompt omitted %q: %s", required, review)
+		}
+	}
+	for _, required := range []string{"supplied task, plan, and work graph", "without redoing repository research"} {
+		if !strings.Contains(planReview, required) {
+			t.Fatalf("plan-review prompt omitted %q: %s", required, planReview)
 		}
 	}
 }
@@ -994,16 +1059,19 @@ func reviewFixture(t *testing.T, kind string, limit int, fake *scriptedAdapter) 
 }
 
 func reviewFixtureCall(ctx context.Context, service *Service, kind, id string) (Result, error) {
+	var result Result
+	var err error
 	switch kind {
 	case "plan":
-		return service.ReviewPlan(ctx, id)
+		result, err = service.ReviewPlan(ctx, id)
 	case "code":
-		return service.ReviewCode(ctx, id)
+		result, err = service.ReviewCode(ctx, id)
 	case "integration":
-		return service.ReviewIntegration(ctx, id)
+		result, err = service.ReviewIntegration(ctx, id)
 	default:
 		panic("unknown review kind " + kind)
 	}
+	return approveIfRequired(ctx, service, id, result, err)
 }
 
 func reviewFixtureTaskID(kind string, result Result, commandID string) string {
@@ -1272,6 +1340,7 @@ func TestReviewFailuresAndInvalidEnvelopesDoNotConsumeRounds(t *testing.T) {
 				service = New(service.RepoRoot, reviewLimitConfig(2), map[string]runner.Adapter{"codex": fake})
 				taskID := reviewFixtureTaskID(kind, result, commandID)
 				retried, retryErr := service.Retry(context.Background(), taskID)
+				retried, retryErr = approveIfRequired(context.Background(), service, taskID, retried, retryErr)
 				wantPhase := task.PhaseApproved
 				if kind == "plan" {
 					wantPhase = task.PhasePlanApproved
@@ -1313,6 +1382,7 @@ func TestReviewLimitsAndExplicitBoundaries(t *testing.T) {
 			service := New(root, reviewLimitConfig(test.limit), map[string]runner.Adapter{"codex": fake})
 			state := readyCodeState(t, service, "limit-task", test.limit, false)
 			result, err := service.ReviewCode(context.Background(), state.ID)
+			result, err = approveIfRequired(context.Background(), service, state.ID, result, err)
 			if ExitCode(err) != test.wantErr || result.Status != test.wantStatus || result.State.Phase != test.wantPhase {
 				t.Fatalf("result=%#v err=%v exit=%d", result, err, ExitCode(err))
 			}
@@ -1456,6 +1526,7 @@ func TestUnlimitedCodeReviewAllowsMoreThanFiveChangingRounds(t *testing.T) {
 		}
 	}
 	result, err := service.ReviewCode(context.Background(), state.ID)
+	result, err = approveIfRequired(context.Background(), service, state.ID, result, err)
 	if err != nil || result.Status != "approved" || result.State.Phase != task.PhaseApproved || result.State.CodeRound != 7 {
 		t.Fatalf("approval result=%#v err=%v", result, err)
 	}
@@ -1475,6 +1546,7 @@ func TestChildReviewPolicyUsesParentSnapshotAfterConfigChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent := task.State{ID: "policy-parent", RepoRoot: root, Phase: task.PhasePlanApproved, Task: "change app", Plan: "plan", PlanHash: hash("plan"), ApprovedPlanHash: hash("plan"), WorkGraph: true, WorkUnits: units, ProfilesSnapshot: parentProfiles, RuntimeSnapshot: parentRuntimes, MaxRounds: limit, ReviewPolicy: &task.ReviewPolicy{MaxRounds: limit}}
+	markPlanHumanApproved(&parent)
 	service := New(root, reviewLimitConfig(1), map[string]runner.Adapter{"codex": &scriptedAdapter{sessions: map[runner.Role]string{}, responses: map[runner.Role][]runner.Envelope{
 		runner.RoleCodeReviewer: {{Role: string(runner.RoleCodeReviewer), Verdict: "approved", Findings: []task.Finding{}}},
 	}}})
@@ -1489,6 +1561,7 @@ func TestChildReviewPolicyUsesParentSnapshotAfterConfigChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := service.ReviewIntegration(context.Background(), parent.ID)
+	result, err = approveIfRequired(context.Background(), service, parent.ID, result, err)
 	if err != nil || result.State.MaxRounds != limit || result.State.ReviewPolicy == nil || result.State.ReviewPolicy.MaxRounds != limit || result.State.Phase != task.PhaseApproved {
 		t.Fatalf("integration policy=%#v err=%v", result.State.ReviewPolicy, err)
 	}

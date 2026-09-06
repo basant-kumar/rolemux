@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -93,6 +94,18 @@ func TestAllHostsIncludesEverySupportedCLI(t *testing.T) {
 		}
 		if _, err := os.Stat(result.Path); err != nil {
 			t.Fatalf("installed skill %q: %v", result.Path, err)
+		}
+		contents, err := os.ReadFile(result.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, required := range []string{
+			"rolemux approval", "Never approve automatically", "approval_required",
+			"immutable artifact path", "Request changes", "Discuss", "final human approval gate",
+		} {
+			if !strings.Contains(string(contents), required) {
+				t.Fatalf("installed %s skill omitted %q", result.Host, required)
+			}
 		}
 	}
 }

@@ -51,6 +51,10 @@ Usage:
   rolemux implement TASK-ID [--scope PATH[,PATH...]] [--json]
   rolemux implement answer TASK-ID --answer TEXT [--json]
   rolemux code review TASK-ID [--json]
+  rolemux approval show TASK-ID [--json]
+  rolemux approval respond TASK-ID --gate GATE-ID
+                           --decision approve|request_changes|discuss
+                           [--feedback TEXT] [--json]
   rolemux status TASK-ID [--full] [--json]
   rolemux usage TASK-ID [--json]
   rolemux retry TASK-ID [--json]
@@ -113,6 +117,8 @@ func (a *app) run(args []string) int {
 		return a.runImplement(args[1:])
 	case "code":
 		return a.runCode(args[1:])
+	case "approval":
+		return a.runApproval(args[1:])
 	case "status":
 		return a.runStatus(args[1:])
 	case "usage":
@@ -1195,6 +1201,80 @@ func (a *app) runCode(args []string) int {
 	return a.workflowResult("code-review", result, callErr, opts.json())
 }
 
+func (a *app) runApproval(args []string) int {
+	jsonMode := containsFlag(args, "--json")
+	if len(args) == 0 {
+		return a.fail("approval", usage("approval requires show or respond"), jsonMode, workflow.Result{})
+	}
+	switch args[0] {
+	case "show":
+		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		if err != nil || len(opts.positionals) != 1 {
+			if err == nil {
+				err = usage("approval show requires TASK-ID")
+			}
+			return a.fail("approval-show", err, opts.json(), workflow.Result{})
+		}
+		id := opts.positionals[0]
+		service, err := a.providerFreeWorkflowServiceForTask(id)
+		if err != nil {
+			return a.fail("approval-show", err, opts.json(), workflow.Result{})
+		}
+		control, controlErr := service.Approval(id)
+		state, stateErr := service.Status(id)
+		if controlErr != nil {
+			return a.fail("approval-show", controlErr, opts.json(), workflow.Result{State: state})
+		}
+		if stateErr != nil {
+			return a.fail("approval-show", stateErr, opts.json(), workflow.Result{})
+		}
+		if control.Status != "approval_required" || control.ApprovalID == "" {
+			return a.fail("approval-show", &commandError{code: "NO_PENDING_APPROVAL", text: fmt.Sprintf("task %q has no pending human approval", id), exit: workflow.ExitUsage}, opts.json(), workflow.Result{State: state})
+		}
+		return a.pendingApproval("approval-show", state, control, opts.json())
+	case "respond":
+		opts, err := parse(args[1:], map[string]bool{"--json": false, "--gate": true, "--decision": true, "--feedback": true})
+		if err != nil || len(opts.positionals) != 1 || !opts.present("--gate") || !opts.present("--decision") {
+			if err == nil {
+				err = usage("approval respond requires TASK-ID, --gate, and --decision")
+			}
+			return a.fail("approval-respond", err, opts.json(), workflow.Result{})
+		}
+		decision := strings.TrimSpace(opts.value("--decision"))
+		gateID := strings.TrimSpace(opts.value("--gate"))
+		if gateID == "" {
+			return a.fail("approval-respond", usage("--gate must not be blank"), opts.json(), workflow.Result{})
+		}
+		if decision != string(task.ApprovalDecisionApprove) && decision != string(task.ApprovalDecisionRequestChanges) && decision != string(task.ApprovalDecisionDiscuss) {
+			return a.fail("approval-respond", usage("--decision must be approve, request_changes, or discuss"), opts.json(), workflow.Result{})
+		}
+		feedback := strings.TrimSpace(opts.value("--feedback"))
+		if decision == string(task.ApprovalDecisionRequestChanges) && feedback == "" {
+			return a.fail("approval-respond", usage("request_changes requires nonblank --feedback"), opts.json(), workflow.Result{})
+		}
+		if decision != string(task.ApprovalDecisionRequestChanges) && opts.present("--feedback") {
+			return a.fail("approval-respond", usage("--feedback is valid only with --decision request_changes"), opts.json(), workflow.Result{})
+		}
+		id := opts.positionals[0]
+		var service *workflow.Service
+		if decision == string(task.ApprovalDecisionRequestChanges) {
+			service, err = a.workflowServiceForTask(id)
+		} else {
+			service, err = a.providerFreeWorkflowServiceForTask(id)
+		}
+		if err != nil {
+			return a.fail("approval-respond", err, opts.json(), workflow.Result{})
+		}
+		result, callErr := service.RespondApproval(a.ctx, id, gateID, decision, feedback)
+		if decision == string(task.ApprovalDecisionDiscuss) && workflow.ExitCode(callErr) == workflow.ExitNeedsInput && result.State.ID != "" {
+			return a.pendingApproval("approval-respond", result.State, workflow.ControlFor(result.State), opts.json())
+		}
+		return a.workflowResult("approval-respond", result, callErr, opts.json())
+	default:
+		return a.fail("approval", usage("unknown approval command %q", args[0]), jsonMode, workflow.Result{})
+	}
+}
+
 func (a *app) runStatus(args []string) int {
 	opts, err := parse(args, map[string]bool{"--json": false, "--full": false})
 	if err != nil || len(opts.positionals) != 1 {
@@ -1203,7 +1283,7 @@ func (a *app) runStatus(args []string) int {
 		}
 		return a.fail("status", err, opts.json(), workflow.Result{})
 	}
-	service, err := a.workflowServiceForTask(opts.positionals[0])
+	service, err := a.providerFreeWorkflowServiceForTask(opts.positionals[0])
 	if err != nil {
 		return a.fail("status", err, opts.json(), workflow.Result{})
 	}
@@ -1214,11 +1294,15 @@ func (a *app) runStatus(args []string) int {
 	if opts.json() {
 		result := any(compactStatus(state))
 		if opts.bool("--full") {
-			result = state
+			result = fullStatus{State: state, Control: workflow.ControlFor(state)}
 		}
 		return a.success("status", result, &state, state.Advisories, true)
 	}
 	printState(a.out, state)
+	if control := workflow.ControlFor(state); control.Status == "approval_required" {
+		fmt.Fprintln(a.out)
+		printApprovalControl(a.out, state.ID, control)
+	}
 	return workflow.ExitOK
 }
 
@@ -1503,6 +1587,22 @@ func (a *app) workflowServiceForTask(taskID string) (*workflow.Service, error) {
 	return service, err
 }
 
+// providerFreeWorkflowServiceForTask handles approval inspection, approval,
+// and discussion without loading configuration or constructing provider
+// adapters. Human authorization must remain available when a CLI is signed
+// out, rate limited, missing, or temporarily unavailable.
+func (a *app) providerFreeWorkflowServiceForTask(taskID string) (*workflow.Service, error) {
+	root, err := task.DiscoverRepository(a.cwd)
+	if err != nil {
+		err = usage("%v", err)
+		if strings.TrimSpace(taskID) != "" {
+			return nil, &taskIDError{err: err, taskID: taskID}
+		}
+		return nil, err
+	}
+	return workflow.New(root, config.Default(), nil), nil
+}
+
 // workflowServiceForIntegration keeps recovery attached to the durable
 // integration task once ReviewIntegration has created it. Before that point,
 // the parent task is the only useful fallback identifier.
@@ -1679,6 +1779,11 @@ type statusSummary struct {
 	DirectImplementation  bool                            `json:"direct_implementation,omitempty"`
 }
 
+type fullStatus struct {
+	task.State
+	Control workflow.Control `json:"control"`
+}
+
 func compactStatus(st task.State) statusSummary {
 	result := statusSummary{
 		Control: workflow.ControlFor(st),
@@ -1799,11 +1904,32 @@ func (a *app) workflowResult(command string, result workflow.Result, err error, 
 	if jsonMode {
 		return a.success(command, compactWorkflowResult(result, nil), &result.State, result.State.Advisories, true)
 	}
-	fmt.Fprintf(a.out, "%s\t%s\t%s\n", result.State.ID, result.State.Phase, result.Status)
+	control := compactWorkflowResult(result, nil)
+	fmt.Fprintf(a.out, "task: %s\nphase: %s\nstatus: %s\nnext action: %s\n", result.State.ID, result.State.Phase, control.Status, control.NextAction)
 	for _, advisory := range result.State.Advisories {
 		fmt.Fprintf(a.errOut, "warning: %s: %s\n", advisory.Code, advisory.Message)
 	}
 	return workflow.ExitOK
+}
+
+func (a *app) pendingApproval(command string, state task.State, control workflow.Control, jsonMode bool) int {
+	if jsonMode {
+		payload := commandOutput{
+			OK: false, Command: command, Task: summarize(state), Result: control,
+			Advisories: state.Advisories,
+			Error:      &errorOutput{Code: workflow.ApprovalRequiredCode, Message: "human approval is required before this workflow can advance", Retryable: true, TaskID: state.ID},
+		}
+		if payload.Advisories == nil {
+			payload.Advisories = []task.Diagnostic{}
+		}
+		if err := encodeOne(a.out, payload); err != nil {
+			fmt.Fprintf(a.errOut, "rolemux: encode result: %v\n", err)
+			return workflow.ExitAction
+		}
+		return workflow.ExitNeedsInput
+	}
+	printApprovalControl(a.out, state.ID, control)
+	return workflow.ExitNeedsInput
 }
 
 func (a *app) success(command string, result any, st *task.State, advisories []task.Diagnostic, jsonMode bool) int {
@@ -1848,7 +1974,9 @@ func (a *app) fail(command string, err error, jsonMode bool, result workflow.Res
 		}
 	} else {
 		fmt.Fprintf(a.errOut, "rolemux: %s: %s\n", code, message)
-		if code == "NEEDS_INPUT" && result.State.ID != "" {
+		if code == workflow.ApprovalRequiredCode && result.State.ID != "" {
+			printApprovalControl(a.out, result.State.ID, workflow.ControlFor(result.State))
+		} else if code == "NEEDS_INPUT" && result.State.ID != "" {
 			fmt.Fprintf(a.out, "%s\t%s\n", result.State.ID, result.State.PendingQuestion)
 		}
 	}
@@ -1874,6 +2002,8 @@ func compactWorkflowResult(result workflow.Result, err error) workflow.Control {
 func statusForError(err error) string {
 	code, _, _, _, exit := classifyError(err)
 	switch code {
+	case workflow.ApprovalRequiredCode:
+		return "approval_required"
 	case "NEEDS_INPUT":
 		return "needs_input"
 	case "REVIEW_NEEDED":
@@ -1987,8 +2117,50 @@ func printState(out io.Writer, st task.State) {
 	}
 }
 
+func printApprovalControl(out io.Writer, requestedID string, control workflow.Control) {
+	ownerID := control.ApprovalTaskID
+	if ownerID == "" {
+		ownerID = requestedID
+	}
+	fmt.Fprintf(out, "task: %s\nreview verdict: Approved\nnext step: Human %s approval\n", requestedID, control.ApprovalKind)
+	if control.Question != "" {
+		fmt.Fprintf(out, "question: %s\n", control.Question)
+	}
+	if control.ArtifactPath != "" {
+		fmt.Fprintf(out, "review artifact: %s\n", control.ArtifactPath)
+	}
+	if control.Scope != "" {
+		fmt.Fprintf(out, "scope: %s\n", control.Scope)
+	}
+	if len(control.ChangedFiles) > 0 {
+		fmt.Fprintln(out, "changed files:")
+		for _, file := range control.ChangedFiles {
+			change := file.ChangeKind
+			if change == "" {
+				change = file.Kind
+			}
+			if change == "" {
+				fmt.Fprintf(out, "  - %s\n", file.Path)
+			} else {
+				fmt.Fprintf(out, "  - %s (%s)\n", file.Path, change)
+			}
+		}
+	}
+	if len(control.Choices) > 0 {
+		fmt.Fprintln(out, "choices:")
+		for _, choice := range control.Choices {
+			fmt.Fprintf(out, "  - %s (%s)\n", choice.Label, choice.Value)
+		}
+	}
+	fmt.Fprintf(out, "gate: %s\n", control.ApprovalID)
+	fmt.Fprintf(out, "approve: rolemux approval respond %s --gate %s --decision approve\n", ownerID, control.ApprovalID)
+	fmt.Fprintf(out, "request changes: rolemux approval respond %s --gate %s --decision request_changes --feedback \"...\"\n", ownerID, control.ApprovalID)
+	fmt.Fprintf(out, "discuss: rolemux approval respond %s --gate %s --decision discuss\n", ownerID, control.ApprovalID)
+}
+
 func printWorkGraph(out io.Writer, graph workflow.WorkGraph) {
 	fmt.Fprintf(out, "task: %s\nphase: %s\n", graph.TaskID, graph.Phase)
+	fmt.Fprintf(out, "status: %s\nnext action: %s\n", graph.Control.Status, graph.Control.NextAction)
 	if graph.Complexity != "" {
 		fmt.Fprintf(out, "complexity: %s\n", graph.Complexity)
 	}
@@ -2001,6 +2173,10 @@ func printWorkGraph(out io.Writer, graph workflow.WorkGraph) {
 			fmt.Fprintf(out, "\tblocked_by=%s", strings.Join(node.BlockedBy, ","))
 		}
 		fmt.Fprintln(out)
+	}
+	if graph.Control.Status == "approval_required" {
+		fmt.Fprintln(out)
+		printApprovalControl(out, graph.TaskID, graph.Control)
 	}
 }
 

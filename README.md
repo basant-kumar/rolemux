@@ -83,7 +83,9 @@ explicit review command to review that revised or fixed result. `plan answer`,
 `implement answer`, and `retry` also return after their completed operation;
 they do not start another review automatically. Integration is one logical,
 broad review gate with dedicated durable reviewer and fixer sessions, so it
-may span multiple host invocations.
+may span multiple host invocations. Reviewer approval of the plan and final
+integrated code creates a hard human gate with Approve, Request changes, and
+Discuss choices.
 
 The review safety limit is a top-level setting. The default is five accepted
 reviewer verdicts per review task:
@@ -124,12 +126,11 @@ The orchestrator then drives the workflow:
 1. For a local change with a known scope, use the planner-free fast path below.
    Otherwise, the planner classifies complexity and produces the smallest valid
    dependency graph; trivial work is one implementation-and-test unit.
-2. Each review command makes one reviewer turn and at most one requested
-   revision or fix, then returns control for an explicit next review.
-3. Independent work units may run concurrently in the shared checkout.
-4. Each implementer and reviewer resumes its own provider session.
-5. One logical deep integration review runs after all work units pass; its
-   durable reviewer/fixer sessions can continue across host invocations.
+2. After the plan reviewer approves, you approve or steer the reviewed plan.
+3. Independent work units may run concurrently in the shared checkout; each
+   implementer and reviewer resumes its own provider session.
+4. Unit reviews advance automatically; one integration review follows all
+   units and then stops for your final code approval.
 
 For an obvious local fix, skip the planner and plan-reviewer calls:
 
@@ -138,13 +139,15 @@ rolemux quick start --task "Keep the active role visible in configure" \
   --scope 'internal/cli/configure_view.go,internal/cli/configure_view_test.go' --json
 rolemux implement <task-id> --json
 rolemux code review <task-id> --json
+rolemux approval show <task-id>
 ```
 
 `quick start` performs no provider/model discovery and requires an explicit
 narrow scope. Full plans expose `complexity` as `trivial`, `small`, `medium`,
 `large`, or `system`; RoleMux rejects over-decomposed graphs and prose-like
 scope entries. A one-unit trivial/small plan does not repeat its focused code
-review as a broad integration-model call.
+review as a broad integration-model call, but it still requires final human
+approval.
 
 RoleMux never silently changes the selected provider, model, effort, or speed.
 If a provider is unavailable or rate-limited, it returns control to the
@@ -184,6 +187,8 @@ RoleMux can use it automatically to try to save more tokens.
 | `rolemux doctor --json` | Check CLIs, logins, models, and installation |
 | `rolemux list --json` | List tasks |
 | `rolemux status <task-id> --json` | Inspect workflow state |
+| `rolemux approval show <task-id>` | Inspect a pending human gate |
+| `rolemux approval respond …` | Approve, request changes, or discuss |
 | `rolemux usage <task-id> --json` | Compare measured token usage |
 | `rolemux retry <task-id> --json` | Resume a recoverable provider turn |
 

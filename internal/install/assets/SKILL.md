@@ -22,15 +22,22 @@ persists the exact provider session used by that role.
    another model.
 3. For non-trivial work, start planning with `rolemux plan start --task "<task>" --json`. Retain the
    returned task ID for every later command.
-4. When a command exits `3`, present its exact question to the user. Resume with
-   `rolemux plan answer <task-id> --answer "<answer>" --json` or
-   `rolemux implement answer <task-id> --answer "<answer>" --json`, according
-   to `pending_question_source`.
+4. When a command exits `3`, inspect `status`. For `approval_required`, show the
+   exact question, immutable artifact path, scope/changed files, gate ID, and
+   all choices (Approve, Request changes, and Discuss), then wait for an
+   explicit human decision. Use `rolemux approval respond` with the exact task
+   and gate IDs, one of `approve`, `request_changes`, or `discuss`, and feedback
+   when requesting changes. Never approve automatically. For
+   `needs_input`, present the question and resume with `rolemux plan answer
+   <task-id> --answer "<answer>" --json` or `rolemux implement answer <task-id>
+   --answer "<answer>" --json`, according to `pending_question_source`.
 5. Run `rolemux plan review <task-id> --json`. Each review command performs one
    planner-reviewer turn and, if changes are requested, at most one planner
    revision, then returns control. A `revised` result requires another explicit
    `rolemux plan review` to review the new plan. The command reuses the durable
-   planner and reviewer sessions. `plan answer`, `implement answer`, and
+   planner and reviewer sessions. Reviewer approval creates a human plan gate;
+   do not start execution until that exact gate is approved. `plan answer`,
+   `implement answer`, and
    `retry` also return after their completed operation without automatically
    starting another review.
 6. Read `rolemux plan graph <task-id> --json`. The graph exposes semantic
@@ -55,8 +62,9 @@ persists the exact provider session used by that role.
    integration review; invoke it again with the original `<task-id>`. Use the
    derived integration task ID returned by `work integrate` only for
    `implement answer` and `retry`. A one-unit trivial/small graph returns
-   approval without another provider call because its focused review is already
-   the complete boundary.
+   final human approval gate without another provider call because its focused
+   review is already the complete reviewer boundary. Completion still requires
+   the human to approve that gate.
 8. Inspect `rolemux status <task-id> --json` whenever recovery is needed. Use
    `rolemux retry <task-id> --json` when status reports a retryable saved
    operation, or when an in-flight operation's owning RoleMux process was
@@ -144,7 +152,8 @@ Use the result as the host decision:
 
 | Status | Host action |
 |---|---|
-| `approved` | Advance the graph; only an approved node unlocks dependencies. |
+| `approval_required` | Show the report and choices, then wait for the human; never infer or issue approval. |
+| `approved` | Advance the graph; only an approved work-unit node unlocks dependencies. |
 | `revised` / `fixed` | Issue the matching explicit review; keep dependencies locked. |
 | `needs_input` | Ask `question`, then use `source` with the matching `plan answer` or `implement answer` command. |
 | `review_needed` | Run `rolemux retry` using the exact task ID. |
@@ -152,11 +161,15 @@ Use the result as the host decision:
 | `failed` / `in_flight` | Follow recovery metadata: retry a durable failure or wait/inspect an in-flight owner. |
 | `exhausted` | Stop; the configured review ceiling has been reached. |
 
-Treat JSON stdout as the sole machine-readable result; diagnostics are on
-stderr. Exit `0` means the operation completed, not that it was approved. Exit
-`2` is a usage, configuration, or task-state error; exit `3` requires a user
-answer; exit `4` means scoped files changed during review and the saved review
-should be retried; exit `5` requires provider/orchestrator action, includes a
+Treat `status` as the outcome and `next_action` as the transition. Present them
+separately to humans (for example, `Review verdict: Approved` and `Next step:
+Start mobile-layout`), never as one ambiguous phrase. Treat JSON stdout as the
+sole machine-readable result; diagnostics are on stderr. Exit `0` means the
+operation completed, not that it was approved. Exit
+`2` is a usage, configuration, or task-state error; exit `3` requires human
+approval or a user answer, distinguished by `status`; exit `4` means scoped
+files changed during review and the saved review should be retried; exit `5`
+requires provider/orchestrator action, includes a
 failed-closed operation, or reports `no_progress`; exit `6` means the same task
 already has an operation in flight; exit `7` means the configured plan, code,
 or integration review limit was exhausted. Never infer approval from prose or

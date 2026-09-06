@@ -129,7 +129,8 @@ func TestImplementerOutsideScopeIgnoresStructuralDirectories(t *testing.T) {
 	if _, err := service.StartPlan(context.Background(), "implement the package", "scope-directory-noise"); err != nil {
 		t.Fatalf("start plan: %v", err)
 	}
-	if _, err := service.ReviewPlan(context.Background(), "scope-directory-noise"); err != nil {
+	planResult, err := service.ReviewPlan(context.Background(), "scope-directory-noise")
+	if _, err = approveIfRequired(context.Background(), service, "scope-directory-noise", planResult, err); err != nil {
 		t.Fatalf("review plan: %v", err)
 	}
 	result, err := service.Implement(context.Background(), "scope-directory-noise", "pkg/app.go")

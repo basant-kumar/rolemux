@@ -18,12 +18,12 @@ import (
 )
 
 func TestCodexArgumentPlacementFreshAndResume(t *testing.T) {
-	req := Request{RepoRoot: "/repo", Sandbox: "workspace-write", Model: "gpt-5.6-luna", Effort: "max", Speed: "priority"}
+	req := Request{Role: RoleImplementer, RepoRoot: "/repo", Sandbox: "workspace-write", Model: "gpt-5.6-luna", Effort: "max", Speed: "priority"}
 	got, err := BuildCodexArgs(req, "/schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "--config", "service_tier=priority", "-"}
+	want := []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "--config", "service_tier=priority", "--config", "developer_instructions=" + quoteTOML(codexImplementerDeveloperInstructions), "-"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("fresh args\n got: %#v\nwant: %#v", got, want)
 	}
@@ -32,9 +32,44 @@ func TestCodexArgumentPlacementFreshAndResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "resume", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "--config", "service_tier=priority", "thread-123", "-"}
+	want = []string{"-C", "/repo", "-s", "workspace-write", "-a", "never", "--search", "exec", "resume", "--ignore-user-config", "--ignore-rules", "--json", "--model", "gpt-5.6-luna", "--output-schema", "/schema.json", "--config", "model_reasoning_effort=max", "--config", "service_tier=priority", "--config", "developer_instructions=" + quoteTOML(codexImplementerDeveloperInstructions), "thread-123", "-"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("resume args\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestCodexRoleDeveloperInstructionsAreDeterministic(t *testing.T) {
+	cases := []struct {
+		role     Role
+		required []string
+	}{
+		{RoleImplementer, []string{"at most three batched pre-edit", "git status/diff/log", "repository-wide surveys", "post-green survey", "narrow validation", "full repository suite", "30 seconds", "one-second polling", "stop immediately"}},
+		{RoleCodeReviewer, []string{"supplied delta and evidence", "changed files", "direct blast radius", "no git commands", "full repository suite", "validated verdict promptly"}},
+		{RolePlanReviewer, []string{"supplied task, plan, and work graph", "without redoing repository research", "validated verdict promptly"}},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.role), func(t *testing.T) {
+			req := Request{Role: tc.role, RepoRoot: "/repo", Model: "configured-model", Effort: "high", Speed: "priority"}
+			first, err := BuildCodexArgs(req, "/schema.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := BuildCodexArgs(req, "/schema.json")
+			if err != nil || !reflect.DeepEqual(first, second) {
+				t.Fatalf("nondeterministic args: %#v %#v err=%v", first, second, err)
+			}
+			joined := strings.Join(first, "\n")
+			for _, required := range tc.required {
+				if !strings.Contains(joined, required) {
+					t.Fatalf("missing %q in %s", required, joined)
+				}
+			}
+			for _, required := range []string{"--model\nconfigured-model", "model_reasoning_effort=high", "service_tier=priority"} {
+				if !strings.Contains(joined, required) {
+					t.Fatalf("configured selection %q was not preserved in %s", required, joined)
+				}
+			}
+		})
 	}
 }
 

@@ -143,6 +143,8 @@ Start, review, and inspect a plan:
 ```bash
 rolemux plan start --task "Add resumable uploads" --json
 rolemux plan review <task-id> --json
+rolemux approval show <task-id>
+rolemux approval respond <task-id> --gate <gate-id> --decision approve
 rolemux plan graph <task-id> --json
 ```
 
@@ -166,9 +168,9 @@ passes, start the one-time integration gate:
 rolemux work integrate <task-id> --json
 ```
 
-For a one-unit trivial or small plan, this returns approval without another
-provider review because the unit's focused code review is already the complete
-integration boundary.
+For a one-unit trivial or small plan, this creates the final human gate without
+another provider review because the unit's focused code review is already the
+complete integration boundary.
 
 This starts one logical broad integration-review gate over the combined
 approved changes. It uses dedicated durable integration reviewer and fixer
@@ -179,6 +181,27 @@ multiple host invocations. `work integrate` always expects the parent plan task
 ID and derives the integration ID internally, so invoke it again with the
 parent ID for subsequent integration reviews. Preserve the returned derived
 integration task ID only for `implement answer` and `retry`.
+
+## Human approval gates
+
+Plan-reviewer approval pauses before execution. Final code-reviewer approval
+pauses before completion. Inspect the immutable report and respond using its
+exact gate ID:
+
+```bash
+rolemux approval show <task-id> [--json]
+rolemux approval respond <task-id> --gate <gate-id> --decision approve [--json]
+rolemux approval respond <task-id> --gate <gate-id> \
+  --decision request_changes --feedback "Keep the existing API" [--json]
+rolemux approval respond <task-id> --gate <gate-id> --decision discuss [--json]
+```
+
+Approve and Discuss are provider-free. Discuss leaves the gate pending.
+Request changes resumes the saved planner, direct implementer, or dedicated
+integration fixer; the changed result must be reviewed again and produces a
+new gate. Repeating the same decision for the same gate is idempotent, while a
+stale or conflicting gate ID fails closed. Parent plan IDs resolve an existing
+integration gate through `approval_task_id`.
 
 ## Host-controlled review continuation
 
@@ -201,14 +224,18 @@ Compact review control results contain these fields:
 
 | Field | Meaning |
 |---|---|
-| `status` | Durable outcome such as `approved`, `revised`, `fixed`, `needs_input`, `review_needed`, `no_progress`, `failed`, `in_flight`, or `exhausted`. |
+| `status` | Durable outcome such as `approval_required`, `approved`, `revised`, `fixed`, `needs_input`, `review_needed`, `no_progress`, `failed`, `in_flight`, or `exhausted`. |
 | `review_kind` | The independent counter: `plan`, `code`, or `integration`. |
 | `review_round` | Accepted reviewer verdicts for this kind. |
 | `max_rounds` | Snapshotted ceiling; `0` means unlimited. |
 | `can_review` | Whether the host may issue the next review command. |
-| `next_action` | The safe host continuation, such as `plan_review`, `code_review`, `work_integrate`, `plan_answer`, `implement_answer`, `retry`, `inspect`, `wait`, `advance`, or `stop`. |
-| `question` | Optional question when `status` is `needs_input`. |
+| `next_action` | The safe host continuation, such as `approval_respond`, `plan_review`, `code_review`, `work_integrate`, `plan_answer`, `implement_answer`, `retry`, `inspect`, `wait`, `advance`, or `stop`. |
+| `question` | Approval prompt or planner/implementer question. |
 | `source` | Optional planner/implementer answer source for that question. |
+
+Pending human gates also expose `approval_id`, `approval_task_id`,
+`approval_kind`, ordered `choices`, `artifact_path`, `scope`, and compact
+`changed_files`.
 
 For example, a completed code fix is returned compactly as:
 
@@ -220,7 +247,8 @@ The host decision table is:
 
 | Status | Host decision |
 |---|---|
-| `approved` | Advance the graph; only an approved node unlocks dependencies. |
+| `approval_required` | Show the artifact, question, and choices; wait for the human. Never approve automatically. |
+| `approved` | Advance the graph; only an approved unit unlocks dependencies. |
 | `revised` / `fixed` | Issue the matching explicit review; keep dependencies locked. |
 | `needs_input` | Ask `question`, then use `source` to choose the matching answer command. |
 | `review_needed` | Run `rolemux retry <task-id> --json`. |
@@ -228,7 +256,9 @@ The host decision table is:
 | `failed` / `in_flight` | Follow recovery metadata: retry a durable failure or wait/inspect an in-flight owner. |
 | `exhausted` | Stop; the review ceiling has been reached. |
 
-Hosts must preserve exact task IDs, schedule only graph-ready units, and never
+`status: approved` is the review outcome; `next_action: advance` is the graph
+transition. Human output presents them separately. Hosts must preserve exact
+task IDs, schedule only graph-ready units, and never
 unlock dependencies on `revised` or `fixed`. For integration, use the parent
 plan ID for every `work integrate` review; reserve the returned derived ID for
 answers and retries.
@@ -293,13 +323,14 @@ field names plus the additive usage counters.
 
 ## State and concurrency
 
-- Plans: `.rolemux/plans/<task-id>.md`
-- Private task/session state: `.git/rolemux`
+- Plans, approval reports, and task/session state: private Git state resolved
+  from `git rev-parse --git-path rolemux` (normally `.git/rolemux`)
 - Global settings: `~/.rolemux/config.toml`
 - Project override: `.rolemux.toml`
 
-The entire `.rolemux/` directory is ignored. RoleMux uses short task-state locks,
-not a repository-wide lock, so independent scoped units can share one checkout.
+RoleMux does not create or require a project `.rolemux/` directory. It uses
+short task-state locks, not a repository-wide lock, so independent scoped units
+can share one checkout.
 It rejects dependency graphs that schedule overlapping write scopes in parallel.
 Workers do not commit, push, stash, reset, rebase, merge, or create worktrees.
 
@@ -358,7 +389,7 @@ changes the selected model to enable pxpipe.
 |---:|---|
 | `0` | Completed successfully |
 | `2` | Usage, configuration, or task-state error |
-| `3` | A planner or implementer needs an answer |
+| `3` | Human approval or a planner/implementer answer is required; inspect `status` and `next_action` |
 | `4` | Scoped files changed during review; retry saved review |
 | `5` | Provider/orchestrator action required, operation failed closed, or review reports `no_progress` |
 | `6` | The task already has an operation in flight |

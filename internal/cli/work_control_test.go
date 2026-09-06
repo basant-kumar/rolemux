@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -53,6 +54,7 @@ func TestWorkStartAndStatusExposeCompactControlJSON(t *testing.T) {
 				WorkUnits:        units,
 				ReviewPolicy:     &task.ReviewPolicy{MaxRounds: test.maxRounds},
 			}
+			markCLIPlanApproved(t, &parent)
 			store := task.NewStore(root)
 			if err := store.Create(parent); err != nil {
 				t.Fatal(err)
@@ -137,7 +139,7 @@ func TestCompactWorkflowResultPreservesDerivedControl(t *testing.T) {
 
 	t.Run("empty status uses derived ready", func(t *testing.T) {
 		got := compactWorkflowResult(workflow.Result{State: state}, nil)
-		if got != derived {
+		if !reflect.DeepEqual(got, derived) {
 			t.Fatalf("control=%#v want %#v", got, derived)
 		}
 	})
@@ -146,7 +148,7 @@ func TestCompactWorkflowResultPreservesDerivedControl(t *testing.T) {
 		want := derived
 		want.Status = task.PhasePlanApproved
 		got := compactWorkflowResult(workflow.Result{State: state, Status: task.PhasePlanApproved}, nil)
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("control=%#v want %#v", got, want)
 		}
 	})
@@ -155,7 +157,7 @@ func TestCompactWorkflowResultPreservesDerivedControl(t *testing.T) {
 		want := derived
 		want.Status = "failed"
 		got := compactWorkflowResult(workflow.Result{State: state, Status: "success"}, errors.New("provider failed"))
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("control=%#v want %#v", got, want)
 		}
 	})

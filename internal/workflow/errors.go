@@ -15,6 +15,12 @@ const (
 	ExitAction       = 5
 	ExitInFlight     = 6
 	ExitExhausted    = 7
+
+	ApprovalRequiredCode = "APPROVAL_REQUIRED"
+	ApprovalConflictCode = "APPROVAL_CONFLICT"
+	ApprovalStaleCode    = "APPROVAL_STALE"
+	ApprovalArtifactCode = "APPROVAL_ARTIFACT"
+	ApprovalRecoveryCode = "APPROVAL_RECOVERY_REQUIRED"
 )
 
 type Error struct {

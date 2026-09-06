@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/basant-kumar/rolemux/internal/runner"
@@ -109,6 +110,9 @@ func TestControlForMaterializedWorkUnitChild(t *testing.T) {
 
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			if test.state.Phase == task.PhasePlanApproved && !isImplementationReadyPlan(test.state) && test.status == "approved" {
+				markPlanHumanApproved(&test.state)
+			}
 			control := ControlFor(test.state)
 			if control.Status != test.status || control.NextAction != test.action || control.ReviewKind != test.kind || control.ReviewRound != test.round || control.MaxRounds != test.max || control.CanReview != test.canReview || control.Question != test.question || control.Source != test.source {
 				t.Fatalf("control=%#v", control)
@@ -145,6 +149,7 @@ func TestStartWorkChildControlIsReady(t *testing.T) {
 		MaxRounds:        parentLimit,
 		ReviewPolicy:     &task.ReviewPolicy{MaxRounds: parentLimit},
 	}
+	markPlanHumanApproved(&parent)
 	if err := service.Store.Create(parent); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +173,7 @@ func TestStartWorkChildControlIsReady(t *testing.T) {
 		t.Fatalf("persisted child=%#v", persisted)
 	}
 	wantControl := Control{Status: "ready", ReviewRound: 0, MaxRounds: parentLimit, CanReview: false, NextAction: "implement"}
-	if control := ControlFor(persisted); control != wantControl {
+	if control := ControlFor(persisted); !reflect.DeepEqual(control, wantControl) {
 		t.Fatalf("persisted control=%#v want=%#v", control, wantControl)
 	}
 

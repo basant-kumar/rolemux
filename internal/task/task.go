@@ -28,6 +28,7 @@ const (
 	PhasePlanned             = "planned"
 	PhasePlanReviewing       = "plan_reviewing"
 	PhasePlanApproved        = "plan_approved"
+	PhaseAwaitingApproval    = "awaiting_approval"
 	PhaseImplementing        = "implementing"
 	PhaseNeedsInput          = "needs_input"
 	PhaseImplementationReady = "implementation_ready"
@@ -248,27 +249,30 @@ type State struct {
 	// ReviewCheckpoint is the exact candidate from the last completed
 	// changes-requested verdict. Re-review compares fixes against this point
 	// instead of making the reviewer rediscover the full task delta.
-	ReviewCheckpoint         []FileEntry                `json:"review_checkpoint_manifest,omitempty"`
-	ReviewCheckpointHash     string                     `json:"review_checkpoint_manifest_hash,omitempty"`
-	ReviewCheckpointFindings []Finding                  `json:"review_checkpoint_findings,omitempty"`
-	PlanReviewCheckpointHash string                     `json:"plan_review_checkpoint_hash,omitempty"`
-	ProfilesSnapshot         map[string]ProfileSnapshot `json:"profiles_snapshot,omitempty"`
-	RuntimeSnapshot          map[string]RuntimeSnapshot `json:"runtime_snapshot,omitempty"`
-	MaxRounds                int                        `json:"max_rounds,omitempty"`
-	PlanRound                int                        `json:"plan_round,omitempty"`
-	CodeRound                int                        `json:"code_round,omitempty"`
-	ReviewPolicy             *ReviewPolicy              `json:"review_policy,omitempty"`
-	ReviewProgress           *ReviewProgress            `json:"review_progress,omitempty"`
-	PendingQuestion          string                     `json:"pending_question,omitempty"`
-	PendingQuestionSource    string                     `json:"pending_question_source,omitempty"`
-	PendingAnswer            string                     `json:"pending_answer,omitempty"`
-	PromptInputs             []string                   `json:"prompt_inputs,omitempty"`
-	ReturnPhase              string                     `json:"return_phase,omitempty"`
-	InterruptedLoop          string                     `json:"interrupted_loop,omitempty"`
-	Findings                 []Finding                  `json:"findings,omitempty"`
-	Advisories               []Diagnostic               `json:"advisories,omitempty"`
-	Diagnostics              []string                   `json:"diagnostics,omitempty"`
-	Usage                    map[string]TokenUsage      `json:"usage,omitempty"`
+	ReviewCheckpoint          []FileEntry                `json:"review_checkpoint_manifest,omitempty"`
+	ReviewCheckpointHash      string                     `json:"review_checkpoint_manifest_hash,omitempty"`
+	ReviewCheckpointFindings  []Finding                  `json:"review_checkpoint_findings,omitempty"`
+	PlanReviewCheckpointHash  string                     `json:"plan_review_checkpoint_hash,omitempty"`
+	ProfilesSnapshot          map[string]ProfileSnapshot `json:"profiles_snapshot,omitempty"`
+	RuntimeSnapshot           map[string]RuntimeSnapshot `json:"runtime_snapshot,omitempty"`
+	MaxRounds                 int                        `json:"max_rounds,omitempty"`
+	PlanRound                 int                        `json:"plan_round,omitempty"`
+	CodeRound                 int                        `json:"code_round,omitempty"`
+	ReviewPolicy              *ReviewPolicy              `json:"review_policy,omitempty"`
+	ReviewProgress            *ReviewProgress            `json:"review_progress,omitempty"`
+	Approval                  *ApprovalRecord            `json:"approval,omitempty"`
+	ApprovalHistory           []ApprovalRecord           `json:"approval_history,omitempty"`
+	ApprovalGateSchemaVersion int                        `json:"approval_gate_schema_version,omitempty"`
+	PendingQuestion           string                     `json:"pending_question,omitempty"`
+	PendingQuestionSource     string                     `json:"pending_question_source,omitempty"`
+	PendingAnswer             string                     `json:"pending_answer,omitempty"`
+	PromptInputs              []string                   `json:"prompt_inputs,omitempty"`
+	ReturnPhase               string                     `json:"return_phase,omitempty"`
+	InterruptedLoop           string                     `json:"interrupted_loop,omitempty"`
+	Findings                  []Finding                  `json:"findings,omitempty"`
+	Advisories                []Diagnostic               `json:"advisories,omitempty"`
+	Diagnostics               []string                   `json:"diagnostics,omitempty"`
+	Usage                     map[string]TokenUsage      `json:"usage,omitempty"`
 	// ProviderUsageCumulative stores the last raw conversation-wide counters
 	// for providers that report cumulative rather than per-turn usage.
 	ProviderUsageCumulative map[string]TokenUsage `json:"provider_usage_cumulative,omitempty"`
@@ -283,9 +287,10 @@ func StateFingerprint(st State) string {
 }
 
 type Store struct {
-	Root string
-	Dir  string
-	err  error
+	Root       string
+	Dir        string
+	privateDir string
+	err        error
 }
 
 func NewStore(repoRoot string) *Store {
@@ -297,12 +302,13 @@ func NewStore(repoRoot string) *Store {
 	if err != nil {
 		return &Store{Root: root, err: fmt.Errorf("discover private git state: %w", err)}
 	}
-	return &Store{Root: root, Dir: filepath.Join(gitDir, "tasks")}
+	return &Store{Root: root, Dir: filepath.Join(gitDir, "tasks"), privateDir: gitDir}
 }
 
 func NewStoreAt(dir string) *Store {
 	abs, _ := filepath.Abs(dir)
-	return &Store{Root: filepath.Clean(abs), Dir: filepath.Clean(abs)}
+	abs = filepath.Clean(abs)
+	return &Store{Root: abs, Dir: abs, privateDir: abs}
 }
 
 // DiscoverRepository is the public repository boundary. It resolves nested
@@ -368,7 +374,14 @@ func (s *Store) ensure() error {
 	if s.Dir == "" {
 		return ErrNotGitRepository
 	}
-	return os.MkdirAll(s.Dir, 0o700)
+	root := s.privateDir
+	if root == "" {
+		root = s.Dir
+		if filepath.Base(root) == "tasks" {
+			root = filepath.Dir(root)
+		}
+	}
+	return ensurePrivateDirectory(root, s.Dir)
 }
 
 func (s *Store) path(id string) (string, error) {
@@ -1192,8 +1205,13 @@ func WritePlan(repoRoot, id, contents string) error {
 	if !validID(id) {
 		return fmt.Errorf("%w %q", ErrInvalidTaskID, id)
 	}
-	dir := filepath.Join(repoRoot, ".rolemux", "plans")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	path, err := PlanPath(repoRoot, id)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	privateRoot := filepath.Dir(dir)
+	if err := ensurePrivateDirectory(privateRoot, dir); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".plan-*.tmp")
@@ -1217,7 +1235,7 @@ func WritePlan(repoRoot, id, contents string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(name, filepath.Join(dir, id+".md")); err != nil {
+	if err := os.Rename(name, path); err != nil {
 		return err
 	}
 	return syncDir(dir)

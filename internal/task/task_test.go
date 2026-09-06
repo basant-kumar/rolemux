@@ -437,8 +437,18 @@ func TestWritePlanRejectsPathTraversalAndWritesAtomically(t *testing.T) {
 	if err := WritePlan(root, "a-task", "# plan\n"); err != nil {
 		t.Fatal(err)
 	}
-	if b, err := os.ReadFile(filepath.Join(root, ".rolemux", "plans", "a-task.md")); err != nil || string(b) != "# plan\n" {
+	path, err := PlanPath(root, "a-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(path) {
+		t.Fatalf("plan path is not absolute: %q", path)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "# plan\n" {
 		t.Fatalf("plan write: %q %v", b, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".rolemux", "plans", "a-task.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("plan was written into project state: %v", err)
 	}
 	if err := WritePlan(root, "../escape", "bad"); !errors.Is(err, ErrInvalidTaskID) {
 		t.Fatalf("traversal: %v", err)

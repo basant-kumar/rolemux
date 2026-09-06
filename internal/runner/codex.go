@@ -367,11 +367,33 @@ func BuildCodexArgs(req Request, schemaPath string) ([]string, error) {
 	if req.Speed != "" && req.Speed != "standard" {
 		args = append(args, "--config", "service_tier="+req.Speed)
 	}
+	if instructions := codexDeveloperInstructions(req.Role); instructions != "" {
+		args = append(args, "--config", "developer_instructions="+quoteTOML(instructions))
+	}
 	if req.Resume {
 		args = append(args, req.SessionID)
 	}
 	args = append(args, "-")
 	return args, nil
+}
+
+const (
+	codexImplementerDeveloperInstructions  = `RoleMux implementer discipline: use at most three batched pre-edit read/search calls. Do not run git status/diff/log, repository-wide searches, repository-wide surveys, or a post-green survey. Make cohesive edits. Run only the narrow validation commands named by the execution packet; never run the full repository suite. If a background test or build is needed, wait at least 30 seconds instead of one-second polling, and stop immediately when focused validation passes.`
+	codexReviewerDeveloperInstructions     = `RoleMux reviewer discipline: treat the supplied delta and evidence as authoritative. Inspect only changed files and their direct blast radius. Use no git commands and never run the full repository suite. Return the validated verdict promptly.`
+	codexPlanReviewerDeveloperInstructions = `RoleMux plan-reviewer discipline: validate the supplied task, plan, and work graph against the acceptance criteria without redoing repository research. Inspect only the supplied planning evidence and return the validated verdict promptly.`
+)
+
+func codexDeveloperInstructions(role Role) string {
+	switch role {
+	case RoleImplementer:
+		return codexImplementerDeveloperInstructions
+	case RoleCodeReviewer:
+		return codexReviewerDeveloperInstructions
+	case RolePlanReviewer:
+		return codexPlanReviewerDeveloperInstructions
+	default:
+		return ""
+	}
 }
 
 func createSchemaFile(schema string) ([]byte, string, error) {
