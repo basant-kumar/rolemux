@@ -34,7 +34,6 @@ Usage:
   rolemux -h
   rolemux --help
   rolemux --version [--json]
-  rolemux version [--json]  (backward-compatible alias)
   rolemux models [--refresh] [--runner PROVIDER] [--json]
   rolemux configure [--global|--project] [--from PATH|-]
                     [--role planner|implementer|reviewer|plan-reviewer|code-reviewer]
@@ -98,7 +97,7 @@ func (a *app) run(args []string) int {
 		return workflow.ExitOK
 	}
 	switch args[0] {
-	case "--version", "version":
+	case "--version":
 		return a.runVersion(args[1:])
 	case "models":
 		return a.runModels(args[1:])

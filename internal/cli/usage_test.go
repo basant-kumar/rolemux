@@ -100,16 +100,19 @@ func TestUsageHumanOutputNamesAllUnreportedTokens(t *testing.T) {
 	}
 }
 
-func TestVersionFlagAndAlias(t *testing.T) {
+func TestVersionFlagAndUnknownCommand(t *testing.T) {
 	root := cliRepo(t)
-	for _, args := range [][]string{{"--version"}, {"version"}} {
-		code, output, stderr := runTestApp(t, root, "", args...)
-		if code != 0 || stderr != "" || string(output) != "vtest\n" {
-			t.Fatalf("args=%v code=%d stderr=%q output=%q", args, code, stderr, output)
-		}
+	code, output, stderr := runTestApp(t, root, "", "--version")
+	if code != 0 || stderr != "" || string(output) != "vtest\n" {
+		t.Fatalf("code=%d stderr=%q output=%q", code, stderr, output)
 	}
 
-	code, output, stderr := runTestApp(t, root, "", "--version", "--json")
+	code, output, stderr = runTestApp(t, root, "", "version")
+	if code == 0 || len(output) != 0 || !strings.Contains(string(stderr), `rolemux: USAGE: unknown command "version"`) {
+		t.Fatalf("unknown command code=%d stderr=%q output=%q", code, stderr, output)
+	}
+
+	code, output, stderr = runTestApp(t, root, "", "--version", "--json")
 	if code != 0 || stderr != "" {
 		t.Fatalf("JSON version code=%d stderr=%q output=%s", code, stderr, output)
 	}
@@ -133,6 +136,9 @@ func TestNestedHelpFlagsReturnUsageWithoutRunningCommands(t *testing.T) {
 		}
 		if !strings.Contains(string(output), "rolemux --version") {
 			t.Fatalf("args=%v did not return usage: %s", args, output)
+		}
+		if strings.Contains(string(output), "rolemux version") {
+			t.Fatalf("args=%v still exposed version alias: %s", args, output)
 		}
 	}
 }

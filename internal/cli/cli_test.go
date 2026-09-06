@@ -91,7 +91,7 @@ func decodeSingleObject(t *testing.T, data []byte) map[string]any {
 
 func TestVersionAndUsageEmitExactlyOneJSONObject(t *testing.T) {
 	root := cliRepo(t)
-	code, output, stderr := runTestApp(t, root, "", "version", "--json")
+	code, output, stderr := runTestApp(t, root, "", "--version", "--json")
 	if code != 0 || stderr != "" {
 		t.Fatalf("code=%d stderr=%q", code, stderr)
 	}
