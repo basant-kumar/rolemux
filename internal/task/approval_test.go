@@ -40,6 +40,10 @@ func TestLegacyStateDoesNotInventApproval(t *testing.T) {
 			AcceptedRound:       2,
 			ReviewedFingerprint: "plan-fingerprint",
 		},
+		ExternalReview: &ExternalReview{
+			Provider: "github", URL: "https://github.com/example/project/pull/7", Number: 7,
+			Repository: "example/project", LastReviewCommentID: 42,
+		},
 		CreatedAt:            created,
 		DecidedAt:            &decided,
 		HumanFeedback:        "Looks good",
@@ -66,6 +70,9 @@ func TestLegacyStateDoesNotInventApproval(t *testing.T) {
 	}
 	if got.Approval.ReviewerEvidence == nil || got.Approval.ReviewerEvidence.ReviewedFingerprint != "plan-fingerprint" {
 		t.Fatalf("reviewer evidence was not retained: %#v", got.Approval.ReviewerEvidence)
+	}
+	if got.Approval.ExternalReview == nil || got.Approval.ExternalReview.URL != current.ExternalReview.URL || got.Approval.ExternalReview.LastReviewCommentID != 42 {
+		t.Fatalf("external review was not retained: %#v", got.Approval.ExternalReview)
 	}
 	if len(got.ApprovalHistory) != 1 || got.ApprovalHistory[0].HumanFeedback != "Fix scope" {
 		t.Fatalf("approval history was not retained: %#v", got.ApprovalHistory)
@@ -115,6 +122,44 @@ func TestApprovalArtifactIsPrivateImmutableAndRepairable(t *testing.T) {
 	repaired, err := store.ReadOrRepairApprovalArtifact("task-1", "gate-1", contents)
 	if err != nil || repaired != ref {
 		t.Fatalf("artifact repair: %#v %v", repaired, err)
+	}
+}
+
+func TestReadContentRefRequiresPrivateUntamperedBlob(t *testing.T) {
+	root := testRepo(t)
+	name := filepath.Join(root, "candidate.txt")
+	if err := os.WriteFile(name, []byte("review me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := NewWorktree(root).ManifestForScope("candidate.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(root)
+	captured, err := CaptureContentRefs(entries, root, store.privateDir, "candidate", "task-1")
+	if err != nil || captured[0].Worktree.Ref == nil {
+		t.Fatalf("capture=%#v err=%v", captured, err)
+	}
+	ref := *captured[0].Worktree.Ref
+	contents, err := store.ReadContentRef(ref)
+	if err != nil || string(contents) != "review me\n" {
+		t.Fatalf("read=%q err=%v", contents, err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideRef := ref
+	outsideRef.Path = outside
+	if _, err := store.ReadContentRef(outsideRef); !errors.Is(err, ErrInvalidArtifactPath) {
+		t.Fatalf("outside content ref was accepted: %v", err)
+	}
+	if err := os.WriteFile(ref.Path, []byte("tampered!\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadContentRef(ref); !errors.Is(err, ErrArtifactCorrupt) {
+		t.Fatalf("tampered content ref was accepted: %v", err)
 	}
 }
 

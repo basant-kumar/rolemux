@@ -17,7 +17,7 @@ import (
 const (
 	maxFrontmatterBytes = 16 << 10
 	maxCandidates       = 256
-	maxSkills           = 20
+	maxSkills           = 8
 	maxDescriptionRunes = 240
 	maxNoteBytes        = 6 << 10
 )
@@ -119,6 +119,15 @@ func Discover(options Options) Inventory {
 		}
 		return a.Name < b.Name
 	})
+	if strings.TrimSpace(options.Task) != "" {
+		filtered := result.Skills[:0]
+		for _, skill := range result.Skills {
+			if skill.score > 0 && !strings.EqualFold(skill.Name, "rolemux") {
+				filtered = append(filtered, skill)
+			}
+		}
+		result.Skills = filtered
+	}
 	if len(result.Skills) > maxSkills {
 		result.Skills = result.Skills[:maxSkills]
 	}
@@ -513,7 +522,7 @@ func sanitize(value string, limit int) string {
 func relevance(task, value string) int {
 	terms := map[string]bool{}
 	for _, term := range strings.FieldsFunc(strings.ToLower(task), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
-		if len(term) >= 3 {
+		if len(term) >= 3 || term == "ui" || term == "ux" || term == "ai" {
 			terms[term] = true
 		}
 	}

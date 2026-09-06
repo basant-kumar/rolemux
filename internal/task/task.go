@@ -119,6 +119,8 @@ type Diagnostic struct {
 // by RoleMux for every provider invocation.
 type TokenUsage struct {
 	Requests           int64 `json:"requests"`
+	AgentTurns         int64 `json:"agent_turns,omitempty"`
+	ToolCalls          int64 `json:"tool_calls,omitempty"`
 	PromptBytes        int64 `json:"prompt_bytes"`
 	UnreportedRequests int64 `json:"unreported_requests,omitempty"`
 	IncompleteRequests int64 `json:"incomplete_requests,omitempty"`
@@ -131,7 +133,7 @@ type TokenUsage struct {
 }
 
 func (u TokenUsage) Empty() bool {
-	return u.Requests == 0 && u.PromptBytes == 0 && u.InputTokens == 0 &&
+	return u.Requests == 0 && u.AgentTurns == 0 && u.ToolCalls == 0 && u.PromptBytes == 0 && u.InputTokens == 0 &&
 		u.UnreportedRequests == 0 && u.IncompleteRequests == 0 &&
 		u.CachedInputTokens == 0 && u.CacheWriteTokens == 0 &&
 		u.OutputTokens == 0 && u.ReasoningTokens == 0 && u.TotalTokens == 0
@@ -139,6 +141,8 @@ func (u TokenUsage) Empty() bool {
 
 func (u *TokenUsage) Add(turn TokenUsage) {
 	u.Requests += turn.Requests
+	u.AgentTurns += turn.AgentTurns
+	u.ToolCalls += turn.ToolCalls
 	u.PromptBytes += turn.PromptBytes
 	u.UnreportedRequests += turn.UnreportedRequests
 	u.IncompleteRequests += turn.IncompleteRequests
@@ -148,6 +152,46 @@ func (u *TokenUsage) Add(turn TokenUsage) {
 	u.OutputTokens += turn.OutputTokens
 	u.ReasoningTokens += turn.ReasoningTokens
 	u.TotalTokens += turn.TotalTokens
+}
+
+// RoleBudget is snapshotted when a task starts so later configuration edits
+// cannot silently change the execution contract of an active workflow.
+type RoleBudget struct {
+	MaxTurns       int   `json:"max_turns,omitempty" toml:"max_turns,omitempty"`
+	MaxToolCalls   int   `json:"max_tool_calls,omitempty" toml:"max_tool_calls,omitempty"`
+	TimeoutSeconds int   `json:"timeout_seconds,omitempty" toml:"timeout_seconds,omitempty"`
+	MaxOutputBytes int64 `json:"max_output_bytes,omitempty" toml:"max_output_bytes,omitempty"`
+}
+
+// WorkflowEvent is a bounded, non-secret lifecycle record. It carries
+// coordination facts and review findings, never provider reasoning or raw
+// tool output.
+type WorkflowEvent struct {
+	Type       string    `json:"type"`
+	Role       string    `json:"role,omitempty"`
+	Operation  string    `json:"operation,omitempty"`
+	Round      int       `json:"round,omitempty"`
+	Message    string    `json:"message"`
+	Findings   []Finding `json:"findings,omitempty"`
+	OccurredAt time.Time `json:"occurred_at"`
+}
+
+type BudgetIssue struct {
+	Role     string `json:"role"`
+	Kind     string `json:"kind"`
+	Limit    int64  `json:"limit"`
+	Observed int64  `json:"observed"`
+	Message  string `json:"message"`
+}
+
+type Progress struct {
+	Role         string    `json:"role"`
+	Operation    string    `json:"operation"`
+	AgentTurns   int64     `json:"agent_turns"`
+	ToolCalls    int64     `json:"tool_calls"`
+	LastTool     string    `json:"last_tool,omitempty"`
+	Active       bool      `json:"active"`
+	LastActivity time.Time `json:"last_activity"`
 }
 
 type ProfileSnapshot struct {
@@ -255,6 +299,7 @@ type State struct {
 	PlanReviewCheckpointHash  string                     `json:"plan_review_checkpoint_hash,omitempty"`
 	ProfilesSnapshot          map[string]ProfileSnapshot `json:"profiles_snapshot,omitempty"`
 	RuntimeSnapshot           map[string]RuntimeSnapshot `json:"runtime_snapshot,omitempty"`
+	BudgetsSnapshot           map[string]RoleBudget      `json:"budgets_snapshot,omitempty"`
 	MaxRounds                 int                        `json:"max_rounds,omitempty"`
 	PlanRound                 int                        `json:"plan_round,omitempty"`
 	CodeRound                 int                        `json:"code_round,omitempty"`
@@ -273,6 +318,9 @@ type State struct {
 	Advisories                []Diagnostic               `json:"advisories,omitempty"`
 	Diagnostics               []string                   `json:"diagnostics,omitempty"`
 	Usage                     map[string]TokenUsage      `json:"usage,omitempty"`
+	Events                    []WorkflowEvent            `json:"events,omitempty"`
+	BudgetIssue               *BudgetIssue               `json:"budget_issue,omitempty"`
+	Progress                  *Progress                  `json:"progress,omitempty"`
 	// ProviderUsageCumulative stores the last raw conversation-wide counters
 	// for providers that report cumulative rather than per-turn usage.
 	ProviderUsageCumulative map[string]TokenUsage `json:"provider_usage_cumulative,omitempty"`

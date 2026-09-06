@@ -12,11 +12,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/basant-kumar/rolemux/internal/catalog"
 	"github.com/basant-kumar/rolemux/internal/config"
+	"github.com/basant-kumar/rolemux/internal/reviewhost"
 	"github.com/basant-kumar/rolemux/internal/runner"
 	"github.com/basant-kumar/rolemux/internal/task"
 )
@@ -34,8 +36,8 @@ type Result struct {
 }
 
 // Control is the durable host-action view of a task. It intentionally carries
-// only workflow coordination data; provider prompts, findings, and usage stay
-// in task.State.
+// only workflow coordination data; provider prompts, raw output, and detailed
+// usage stay in task.State. Review findings appear only inside bounded events.
 type Control struct {
 	Status         string                     `json:"status"`
 	ReviewKind     string                     `json:"review_kind,omitempty"`
@@ -52,6 +54,11 @@ type Control struct {
 	Scope          string                     `json:"scope,omitempty"`
 	ChangedFiles   []task.ApprovalChangedFile `json:"changed_files,omitempty"`
 	Source         string                     `json:"source,omitempty"`
+	Events         []task.WorkflowEvent       `json:"events,omitempty"`
+	BudgetIssue    *task.BudgetIssue          `json:"budget_issue,omitempty"`
+	Progress       *task.Progress             `json:"progress,omitempty"`
+	ExternalReview *task.ExternalReview       `json:"external_review,omitempty"`
+	ReviewOutdated bool                       `json:"review_outdated,omitempty"`
 }
 
 type ApprovalChoice struct {
@@ -71,6 +78,11 @@ func ControlFor(st task.State) Control {
 		ReviewRound: reviewRound(st, kind),
 		MaxRounds:   maxRounds(&st),
 		NextAction:  "inspect",
+		Events:      cloneEvents(st.Events),
+	}
+	if st.Progress != nil {
+		progress := *st.Progress
+		control.Progress = &progress
 	}
 	if st.IntegrationReview && st.ParentTaskID != "" {
 		control.ApprovalTaskID = task.IntegrationTaskID(st.ParentTaskID)
@@ -88,6 +100,13 @@ func ControlFor(st task.State) Control {
 		control.NextAction = answerAction(kind, st.PendingQuestionSource)
 		control.Question = st.PendingQuestion
 		control.Source = st.PendingQuestionSource
+		return control
+	}
+	if st.BudgetIssue != nil {
+		issue := *st.BudgetIssue
+		control.BudgetIssue = &issue
+		control.Status = "budget_exhausted"
+		control.NextAction = "budget_extend"
 		return control
 	}
 	if isExhaustedState(st) {
@@ -209,7 +228,7 @@ func ControlFor(st task.State) Control {
 
 const (
 	planApprovalQuestion = "Approve this reviewed plan to begin execution."
-	codeApprovalQuestion = "Approve this reviewed code candidate to complete the workflow."
+	codeApprovalQuestion = "Inspect this reviewed code candidate, then approve it to complete the workflow."
 )
 
 func defaultApprovalChoices() []ApprovalChoice {
@@ -248,6 +267,11 @@ func approvalControl(control Control, st task.State, record *task.ApprovalRecord
 		control.ChangedFiles = approvalChangedFiles(st)
 	}
 	control.ArtifactPath = record.ArtifactRef
+	if record.ExternalReview != nil {
+		review := *record.ExternalReview
+		control.ExternalReview = &review
+		control.ReviewOutdated = review.PublishedCandidateFingerprint != record.SubjectFingerprint
+	}
 	return control
 }
 
@@ -472,6 +496,12 @@ type Service struct {
 	Token          func() string
 	ProcessID      func() int
 	ProcessAlive   func(int) bool
+	ReviewHost     ExternalReviewHost
+}
+
+type ExternalReviewHost interface {
+	Publish(context.Context, task.State, task.ApprovalRecord) (task.ExternalReview, error)
+	FetchFeedback(context.Context, task.ExternalReview) (reviewhost.Feedback, error)
 }
 
 type CapabilityContext struct {
@@ -535,7 +565,7 @@ func planApprovalRecord(st task.State, evidence *task.ReviewerEvidence) task.App
 }
 
 func codeApprovalRecord(st task.State, evidence *task.ReviewerEvidence) task.ApprovalRecord {
-	return task.ApprovalRecord{
+	record := task.ApprovalRecord{
 		Kind:               task.ApprovalKindCode,
 		SubjectFingerprint: st.CandidateManifestHash,
 		Question:           codeApprovalQuestion,
@@ -546,6 +576,17 @@ func codeApprovalRecord(st task.State, evidence *task.ReviewerEvidence) task.App
 		ReviewerEvidence:   evidence,
 		CreatedAt:          st.UpdatedAt,
 	}
+	// A fix/re-review cycle keeps one draft PR and updates its candidate
+	// branch. The archived approval owns the synchronization cursors.
+	for i := len(st.ApprovalHistory) - 1; i >= 0; i-- {
+		prior := st.ApprovalHistory[i]
+		if prior.Kind == task.ApprovalKindCode && prior.ExternalReview != nil && prior.ExternalReview.Provider == "github" {
+			review := *prior.ExternalReview
+			record.ExternalReview = &review
+			break
+		}
+	}
+	return record
 }
 
 func changedPaths(entries []task.FileEntry) []string {
@@ -751,6 +792,85 @@ func (s *Service) Approval(id string) (Control, error) {
 		control.ApprovalTaskID = targetID
 	}
 	return control, nil
+}
+
+// PublishApprovalReview creates or updates the optional external human-review
+// surface. The host performs all Git/GitHub work before the short gate CAS.
+func (s *Service) PublishApprovalReview(ctx context.Context, id string) (Result, *task.ExternalReview, error) {
+	targetID, st, err := s.loadEffective(id)
+	if err != nil {
+		return Result{}, nil, err
+	}
+	st, err = s.ensureLegacyBoundary(targetID, st)
+	if err != nil {
+		return Result{State: st, Status: ControlFor(st).Status}, nil, err
+	}
+	if st.Approval == nil || st.Approval.Status != "" || st.Approval.Kind != task.ApprovalKindCode {
+		return Result{State: st, Status: ControlFor(st).Status}, nil, problem("GITHUB_REVIEW_NOT_PENDING", "a pending code approval is required before publishing a draft PR", targetID, ExitUsage, false, nil)
+	}
+	if s.ReviewHost == nil {
+		return Result{State: st, Status: ControlFor(st).Status}, nil, problem("GITHUB_REVIEW_UNAVAILABLE", "GitHub review is unavailable; inspect the changed files locally", targetID, ExitAction, false, reviewhost.ErrUnavailable)
+	}
+	record := *st.Approval
+	review, publishErr := s.ReviewHost.Publish(ctx, st, record)
+	if publishErr != nil {
+		return Result{State: st, Status: ControlFor(st).Status}, nil, problem("GITHUB_REVIEW_FAILED", publishErr.Error()+"; inspect the changed files locally", targetID, ExitAction, true, publishErr)
+	}
+	updated, updateErr := s.Store.Update(targetID, func(current *task.State) error {
+		if current.Approval == nil || current.Approval.Status != "" || current.Approval.GateID != record.GateID || current.Approval.SubjectFingerprint != record.SubjectFingerprint {
+			return task.ErrStaleOperation
+		}
+		copyReview := review
+		current.Approval.ExternalReview = &copyReview
+		appendEvent(current, task.WorkflowEvent{Type: "external_review_published", Role: "human", Operation: "github_review", Round: reviewRound(*current, reviewKind(*current)), Message: "draft PR published for human review: " + review.URL, OccurredAt: s.now()})
+		return nil
+	})
+	if updateErr != nil {
+		return Result{State: st, Status: ControlFor(st).Status}, nil, problem(ApprovalStaleCode, "the approval gate changed while the draft PR was being published", targetID, ExitAction, true, updateErr)
+	}
+	return Result{State: updated, Status: "approval_required"}, &review, nil
+}
+
+// SyncApprovalReview imports new draft-PR comments as an explicit
+// request_changes decision and resumes the normal same-session fix loop.
+func (s *Service) SyncApprovalReview(ctx context.Context, id string) (Result, error) {
+	targetID, st, err := s.loadEffective(id)
+	if err != nil {
+		return Result{}, err
+	}
+	st, err = s.ensureLegacyBoundary(targetID, st)
+	if err != nil {
+		return Result{State: st, Status: ControlFor(st).Status}, err
+	}
+	if st.Approval == nil || st.Approval.Status != "" || st.Approval.Kind != task.ApprovalKindCode || st.Approval.ExternalReview == nil {
+		return Result{State: st, Status: ControlFor(st).Status}, problem("GITHUB_REVIEW_NOT_PENDING", "this approval has no active GitHub draft review", targetID, ExitUsage, false, nil)
+	}
+	if s.ReviewHost == nil {
+		return Result{State: st, Status: ControlFor(st).Status}, problem("GITHUB_REVIEW_UNAVAILABLE", "GitHub review is unavailable; provide feedback with approval respond", targetID, ExitAction, false, reviewhost.ErrUnavailable)
+	}
+	record := *st.Approval
+	feedback, fetchErr := s.ReviewHost.FetchFeedback(ctx, *record.ExternalReview)
+	if fetchErr != nil {
+		return Result{State: st, Status: ControlFor(st).Status}, problem("GITHUB_REVIEW_FAILED", fetchErr.Error(), targetID, ExitAction, true, fetchErr)
+	}
+	updated, updateErr := s.Store.Update(targetID, func(current *task.State) error {
+		if current.Approval == nil || current.Approval.Status != "" || current.Approval.GateID != record.GateID || current.Approval.SubjectFingerprint != record.SubjectFingerprint {
+			return task.ErrStaleOperation
+		}
+		review := feedback.Review
+		current.Approval.ExternalReview = &review
+		if strings.TrimSpace(feedback.Text) != "" {
+			appendEvent(current, task.WorkflowEvent{Type: "external_feedback_imported", Role: "human", Operation: "github_review", Round: reviewRound(*current, reviewKind(*current)), Message: "new draft PR feedback imported as requested changes", OccurredAt: s.now()})
+		}
+		return nil
+	})
+	if updateErr != nil {
+		return Result{State: st, Status: ControlFor(st).Status}, problem(ApprovalStaleCode, "the approval gate changed while GitHub feedback was being synchronized", targetID, ExitAction, true, updateErr)
+	}
+	if strings.TrimSpace(feedback.Text) == "" {
+		return Result{State: updated, Status: "no_feedback"}, nil
+	}
+	return s.RespondApproval(ctx, id, record.GateID, task.ApprovalDecisionRequestChanges, feedback.Text)
 }
 
 func normalizeApprovalDecision(value any) (task.ApprovalDecision, error) {
@@ -1033,7 +1153,7 @@ func (s *Service) StartPlan(ctx context.Context, text, id string) (Result, error
 	limit := s.Config.EffectiveReviewMaxRounds()
 	st := task.State{
 		ID: id, RepoRoot: s.RepoRoot, Phase: task.PhasePlanned, Task: text, Prompt: prompt,
-		ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: limit,
+		ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, BudgetsSnapshot: cloneBudgets(s.Config.EffectiveBudgets()), MaxRounds: limit,
 		ReviewPolicy: &task.ReviewPolicy{MaxRounds: limit},
 		UpdatedAt:    now, InFlight: s.ownedFlight(task.InFlight{Token: token, Operation: "plan_start", Role: string(runner.RolePlanner), StartedAt: now, PreviousPhase: task.PhasePlanned, Prompt: prompt, Loop: "plan_initial"}),
 	}
@@ -1071,7 +1191,7 @@ func (s *Service) StartQuick(text, rawScope, id string) (Result, error) {
 		ID: id, RepoRoot: s.RepoRoot, Phase: task.PhasePlanApproved,
 		Task: text, Plan: text, PlanHash: planHash, ApprovedPlanHash: planHash,
 		PlannedScope: canonical, Complexity: task.ComplexityTrivial, DirectImplementation: true,
-		ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, MaxRounds: limit,
+		ProfilesSnapshot: profiles, RuntimeSnapshot: runtimes, BudgetsSnapshot: cloneBudgets(s.Config.EffectiveBudgets()), MaxRounds: limit,
 		ReviewPolicy: &task.ReviewPolicy{MaxRounds: limit}, UpdatedAt: s.now(),
 	}
 	if err := s.Store.Create(st); err != nil {
@@ -1208,6 +1328,7 @@ func (s *Service) ReviewPlan(ctx context.Context, id string) (Result, error) {
 		prompt := planReviewPrompt(st.Task, st.Plan, st.Complexity, st.WorkUnits, st.PlanReviewerSessionID != "")
 		st.Phase = task.PhasePlanReviewing
 		setReviewProgress(st, "plan", "pending")
+		resetOperationEvents(st, task.WorkflowEvent{Type: "review_started", Role: string(runner.RolePlanReviewer), Operation: "plan_review", Round: reviewRound(*st, "plan") + 1, Message: "plan review started", OccurredAt: s.now()})
 		st.InFlight = s.ownedFlight(task.InFlight{Token: token, Operation: "plan_review", Role: string(runner.RolePlanReviewer), StartedAt: s.now(), KnownSession: st.PlanReviewerSessionID != "", SessionID: st.PlanReviewerSessionID, PreviousPhase: task.PhasePlanned, Prompt: prompt, Loop: "plan_review"})
 		return nil
 	})
@@ -1579,6 +1700,155 @@ func (s *Service) Status(id string) (task.State, error) {
 
 func (s *Service) List() ([]task.State, error) { return s.Store.List() }
 
+func (s *Service) Budget(id string) (map[string]task.RoleBudget, error) {
+	_, st, err := s.loadEffective(id)
+	if err != nil {
+		return nil, err
+	}
+	budgets := st.BudgetsSnapshot
+	if len(budgets) == 0 {
+		budgets = s.Config.EffectiveBudgets()
+	}
+	return cloneBudgets(budgets), nil
+}
+
+// ExtendBudget is an explicit host recovery action. It never starts a
+// provider turn; the caller must issue retry after inspecting the saved state.
+func (s *Service) ExtendBudget(id string, role string, turns, toolCalls, timeoutSeconds int, outputBytes int64) (Result, error) {
+	canonical, err := config.CanonicalRole(role)
+	if err != nil || canonical == config.RoleReviewer {
+		return Result{}, problem("USAGE", "--role must be planner, implementer, plan-reviewer, or code-reviewer", id, ExitUsage, false, err)
+	}
+	if turns < 0 || toolCalls < 0 || timeoutSeconds < 0 || outputBytes < 0 || turns == 0 && toolCalls == 0 && timeoutSeconds == 0 && outputBytes == 0 {
+		return Result{}, problem("USAGE", "at least one positive budget extension is required", id, ExitUsage, false, nil)
+	}
+	targetID, _, err := s.loadEffective(id)
+	if err != nil {
+		return Result{}, err
+	}
+	updated, err := s.Store.Update(targetID, func(st *task.State) error {
+		if st.InFlight != nil {
+			return task.ErrOperationInFlight
+		}
+		if issue := st.BudgetIssue; issue != nil {
+			matches := canonical == issue.Role
+			switch issue.Kind {
+			case "model_turns":
+				matches = matches && turns > 0
+			case "tool_calls":
+				matches = matches && toolCalls > 0
+			case "timeout_seconds":
+				matches = matches && timeoutSeconds > 0
+			case "output_bytes":
+				matches = matches && outputBytes > 0
+			default:
+				matches = false
+			}
+			if !matches {
+				return problem("BUDGET_EXTENSION_MISMATCH", "extend the exhausted "+issue.Role+" "+issue.Kind+" limit before retrying", targetID, ExitUsage, false, nil)
+			}
+		}
+		if st.BudgetsSnapshot == nil {
+			st.BudgetsSnapshot = cloneBudgets(s.Config.EffectiveBudgets())
+		}
+		budget := st.BudgetsSnapshot[canonical]
+		budget.MaxTurns += turns
+		budget.MaxToolCalls += toolCalls
+		budget.TimeoutSeconds += timeoutSeconds
+		previousOutput := budget.MaxOutputBytes
+		budget.MaxOutputBytes += outputBytes
+		if budget.MaxTurns < turns || budget.MaxToolCalls < toolCalls || budget.TimeoutSeconds < timeoutSeconds || budget.MaxOutputBytes < previousOutput {
+			return fmt.Errorf("budget extension overflows its limit")
+		}
+		if budget.TimeoutSeconds > 7200 {
+			return fmt.Errorf("timeout extension exceeds 7200 seconds")
+		}
+		st.BudgetsSnapshot[canonical] = budget
+		st.BudgetIssue = nil
+		appendEvent(st, task.WorkflowEvent{Type: "budget_extended", Role: canonical, Message: fmt.Sprintf("budget extended: turns +%d, tool calls +%d, timeout +%ds, output +%d bytes", turns, toolCalls, timeoutSeconds, outputBytes), OccurredAt: s.now()})
+		return nil
+	})
+	if err != nil {
+		return Result{}, classify(targetID, err)
+	}
+	return Result{State: updated, Status: "budget_extended"}, nil
+}
+
+// Adopt records host-completed changes at an interrupted implementation
+// boundary without fabricating a provider completion. Exact manifests and a
+// required audit note make the handoff reviewable and fail closed.
+func (s *Service) Adopt(id, note string) (Result, error) {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return Result{}, problem("USAGE", "work adopt requires a nonblank --note", id, ExitUsage, false, nil)
+	}
+	targetID, st, err := s.loadEffective(id)
+	if err != nil {
+		return Result{}, err
+	}
+	if st.InFlight != nil {
+		if !s.operationAbandoned(st.InFlight) {
+			return Result{State: st, Status: "in_flight"}, classify(targetID, task.ErrOperationInFlight)
+		}
+		st, err = s.recoverAbandoned(targetID, st.InFlight.Token)
+		if err != nil && st.ID == "" {
+			return Result{}, err
+		}
+	}
+	if st.Scope == "" || st.ScopedBaselineHash == "" {
+		return Result{State: st}, problem("ADOPT_UNSAFE", "task has no established implementation scope and baseline", targetID, ExitUsage, false, nil)
+	}
+	if st.Phase == task.PhaseApproved || st.Phase == task.PhaseAwaitingApproval {
+		return Result{State: st}, problem("ADOPT_UNSAFE", "reviewed or approval-pending code cannot be replaced by adoption", targetID, ExitUsage, false, nil)
+	}
+	if st.Phase != task.PhaseFailed && st.Phase != task.PhaseNeedsInput && st.Phase != task.PhaseImplementationReady && st.Phase != task.PhaseReviewNeeded {
+		return Result{State: st}, problem("ADOPT_UNSAFE", "task is not at an interrupted implementation boundary", targetID, ExitUsage, false, nil)
+	}
+	candidate, err := s.Observe(st.Scope)
+	if err != nil {
+		return Result{State: st}, classify(targetID, err)
+	}
+	candidate, err = s.Capture(candidate, "host-adopted-"+shortToken(s.newToken()), targetID)
+	if err != nil {
+		return Result{State: st}, classify(targetID, err)
+	}
+	if !task.ManifestChanged(st.ScopedBaseline, candidate) {
+		return Result{State: st}, problem("ADOPT_NO_CHANGES", "no scoped changes exist to adopt", targetID, ExitUsage, false, nil)
+	}
+	candidateHash := task.HashManifest(candidate)
+	updated, err := s.Store.Update(targetID, func(current *task.State) error {
+		if current.InFlight != nil {
+			return task.ErrOperationInFlight
+		}
+		if current.Scope != st.Scope || current.ScopedBaselineHash != st.ScopedBaselineHash {
+			return task.ErrStaleOperation
+		}
+		if current.Approval != nil && current.Approval.Status == "" || current.Phase == task.PhaseApproved || current.Phase == task.PhaseAwaitingApproval {
+			return task.ErrInvalidPhase
+		}
+		if current.Phase != task.PhaseFailed && current.Phase != task.PhaseNeedsInput && current.Phase != task.PhaseImplementationReady && current.Phase != task.PhaseReviewNeeded {
+			return task.ErrInvalidPhase
+		}
+		current.CandidateManifest = cloneManifest(candidate)
+		current.CandidateManifestHash = candidateHash
+		current.ChangeManifest = changeEntries(current.ScopedBaseline, candidate)
+		current.Phase = task.PhaseImplementationReady
+		current.PendingQuestion, current.PendingQuestionSource, current.PendingAnswer = "", "", ""
+		current.Retry, current.BudgetIssue = nil, nil
+		if current.ReviewCheckpointHash != "" {
+			setReviewProgress(current, reviewKind(*current), "fixed")
+		} else {
+			current.ReviewProgress = nil
+		}
+		resetOperationEvents(current, task.WorkflowEvent{Type: "host_changes_adopted", Role: string(runner.RoleImplementer), Operation: "work_adopt", Message: note, OccurredAt: s.now()})
+		return nil
+	})
+	if err != nil {
+		return Result{}, classify(targetID, err)
+	}
+	return Result{State: updated, Status: "implementation_ready"}, nil
+}
+
 type WorkNode struct {
 	task.WorkUnit
 	TaskID    string   `json:"task_id"`
@@ -1588,13 +1858,15 @@ type WorkNode struct {
 }
 
 type WorkGraph struct {
-	TaskID     string     `json:"task_id"`
-	Phase      string     `json:"phase"`
-	Complexity string     `json:"complexity,omitempty"`
-	Waves      [][]string `json:"waves"`
-	Ready      []string   `json:"ready"`
-	Nodes      []WorkNode `json:"nodes"`
-	Control    Control    `json:"control"`
+	TaskID              string     `json:"task_id"`
+	Phase               string     `json:"phase"`
+	Complexity          string     `json:"complexity,omitempty"`
+	Waves               [][]string `json:"waves"`
+	Ready               []string   `json:"ready"`
+	Nodes               []WorkNode `json:"nodes"`
+	Control             Control    `json:"control"`
+	CriticalPath        []string   `json:"critical_path,omitempty"`
+	CriticalPathMinutes int        `json:"critical_path_minutes,omitempty"`
 }
 
 // Graph returns live scheduling state for a planner-produced DAG. It never
@@ -1627,6 +1899,10 @@ func (s *Service) Graph(id string) (WorkGraph, error) {
 	if err != nil {
 		return WorkGraph{}, problem("INVALID_WORK_GRAPH", err.Error(), id, ExitUsage, false, err)
 	}
+	criticalPath, criticalMinutes, err := task.WorkUnitCriticalPath(units)
+	if err != nil {
+		return WorkGraph{}, problem("INVALID_WORK_GRAPH", err.Error(), id, ExitUsage, false, err)
+	}
 	approved := map[string]bool{}
 	states := map[string]task.State{}
 	planApproved := humanPlanApproved(parent)
@@ -1640,7 +1916,7 @@ func (s *Service) Graph(id string) (WorkGraph, error) {
 			return WorkGraph{}, classify(childID, loadErr)
 		}
 	}
-	graph := WorkGraph{TaskID: parent.ID, Phase: effective.Phase, Complexity: parent.Complexity, Waves: waves, Ready: []string{}, Nodes: make([]WorkNode, 0, len(units)), Control: ControlFor(effective)}
+	graph := WorkGraph{TaskID: parent.ID, Phase: effective.Phase, Complexity: parent.Complexity, Waves: waves, Ready: []string{}, Nodes: make([]WorkNode, 0, len(units)), Control: ControlFor(effective), CriticalPath: criticalPath, CriticalPathMinutes: criticalMinutes}
 	if effectiveID != id && graph.Control.ApprovalTaskID == "" {
 		graph.Control.ApprovalTaskID = effectiveID
 	}
@@ -1725,16 +2001,18 @@ func (s *Service) StartWork(parentID, unitID string) (Result, error) {
 		}
 		return Result{}, problem("WORK_UNIT_BLOCKED", "work unit "+unitID+" is blocked by "+strings.Join(selected.BlockedBy, ", "), parentID, ExitUsage, false, nil)
 	}
-	planHash := hash(selected.ExecutionPacket)
+	unitPlan := executionPacket(selected.WorkUnit)
+	planHash := hash(unitPlan)
 	policy := resolvedReviewPolicy(&parent)
 	child := task.State{
 		ID: selected.TaskID, RepoRoot: s.RepoRoot, Phase: task.PhasePlanApproved,
-		Task: selected.Objective, Plan: selected.ExecutionPacket, PlanHash: planHash, ApprovedPlanHash: planHash,
+		Task: selected.Objective, Plan: unitPlan, PlanHash: planHash, ApprovedPlanHash: planHash,
 		ParentTaskID: parentID, WorkUnitID: unitID, PlannedScope: selected.Scope,
 		Complexity:       parent.Complexity,
-		ProfilesSnapshot: parent.ProfilesSnapshot, RuntimeSnapshot: parent.RuntimeSnapshot,
+		ProfilesSnapshot: parent.ProfilesSnapshot, RuntimeSnapshot: parent.RuntimeSnapshot, BudgetsSnapshot: cloneBudgets(parent.BudgetsSnapshot),
 		MaxRounds: policy.MaxRounds, ReviewPolicy: &policy, UpdatedAt: s.now(),
 	}
+	child.ImplementerSessionID = s.contextSession(parent, selected.WorkUnit)
 	if err := s.Store.Create(child); err != nil {
 		if errors.Is(err, task.ErrTaskExists) {
 			existing, loadErr := s.Store.Load(child.ID)
@@ -1872,7 +2150,7 @@ func (s *Service) ReviewIntegration(ctx context.Context, parentID string) (Resul
 		Complexity: parent.Complexity,
 		Scope:      scope, ScopeSpecHash: task.ScopeSpecHash(scope), ScopedBaseline: baseline, ScopedBaselineHash: task.HashManifest(baseline),
 		CandidateManifest: candidate, CandidateManifestHash: task.HashManifest(candidate), ChangeManifest: changeEntries(baseline, candidate),
-		ProfilesSnapshot: parent.ProfilesSnapshot, RuntimeSnapshot: parent.RuntimeSnapshot,
+		ProfilesSnapshot: parent.ProfilesSnapshot, RuntimeSnapshot: parent.RuntimeSnapshot, BudgetsSnapshot: cloneBudgets(parent.BudgetsSnapshot),
 		MaxRounds: policy.MaxRounds, ReviewPolicy: &policy, UpdatedAt: s.now(),
 	}
 	if err := s.Store.Create(integration); err != nil {
@@ -1901,6 +2179,7 @@ func (s *Service) ReviewIntegration(ctx context.Context, parentID string) (Resul
 			st.Approval = integration.Approval
 			st.ApprovalGateSchemaVersion = integration.ApprovalGateSchemaVersion
 			st.Phase = task.PhaseAwaitingApproval
+			resetOperationEvents(st, task.WorkflowEvent{Type: "review_approved", Role: string(runner.RoleCodeReviewer), Operation: "integration_review", Round: st.CodeRound, Message: "focused unit review satisfies the one-unit integration gate", OccurredAt: s.now()})
 			return nil
 		}); saveErr != nil {
 			return s.errorResult(integrationID, classify(integrationID, saveErr))
@@ -1974,6 +2253,7 @@ func (s *Service) runPlanner(ctx context.Context, id, token, loop string) (Resul
 				setReviewProgress(st, "plan", "no_progress")
 			} else {
 				setReviewProgress(st, "plan", "revised")
+				appendEvent(st, task.WorkflowEvent{Type: "revision_completed", Role: string(runner.RolePlanner), Operation: "plan_revision", Round: reviewRound(*st, "plan"), Message: "planner completed the requested revision", OccurredAt: s.now()})
 			}
 		} else {
 			st.Phase = task.PhasePlanned
@@ -2039,6 +2319,7 @@ func (s *Service) runPlanReviewer(ctx context.Context, id, token string) (Result
 		acceptReviewRound(st, "plan")
 		st.Findings = cloneFindings(env.Findings)
 		if env.Verdict == "approved" {
+			appendEvent(st, task.WorkflowEvent{Type: "review_approved", Role: string(runner.RolePlanReviewer), Operation: "plan_review", Round: reviewRound(*st, "plan"), Message: "plan reviewer approved", OccurredAt: s.now()})
 			if isImplementationReadyPlan(*st) {
 				st.ApprovedPlanHash = st.PlanHash
 				st.Phase = task.PhasePlanApproved
@@ -2058,6 +2339,7 @@ func (s *Service) runPlanReviewer(ctx context.Context, id, token string) (Result
 			return nil
 		}
 		st.PlanReviewCheckpointHash = planReviewFingerprint(*st)
+		appendEvent(st, task.WorkflowEvent{Type: "changes_requested", Role: string(runner.RolePlanReviewer), Operation: "plan_review", Round: reviewRound(*st, "plan"), Message: "plan reviewer requested changes", Findings: env.Findings, OccurredAt: s.now()})
 		if limit := maxRounds(st); limit > 0 && reviewRound(*st, "plan") >= limit {
 			exhausted = true
 			st.Phase = task.PhaseFailed
@@ -2073,6 +2355,7 @@ func (s *Service) runPlanReviewer(ctx context.Context, id, token string) (Result
 		st.InFlight.Prompt = plannerRevisionPrompt(st.Plan, env.Findings, st.PlannerSessionID != "")
 		st.InFlight.Findings = cloneFindings(env.Findings)
 		st.InFlight.StartedAt = s.now()
+		appendEvent(st, task.WorkflowEvent{Type: "revision_started", Role: string(runner.RolePlanner), Operation: "plan_revision", Round: reviewRound(*st, "plan"), Message: "feedback sent to the same planner session", Findings: env.Findings, OccurredAt: s.now()})
 		setReviewProgress(st, "plan", "pending")
 		return nil
 	})
@@ -2160,6 +2443,7 @@ func (s *Service) runImplementer(ctx context.Context, id, token, loop string) (R
 				setReviewProgress(st, reviewKind(*st), "no_progress")
 			} else {
 				setReviewProgress(st, reviewKind(*st), "fixed")
+				appendEvent(st, task.WorkflowEvent{Type: "fix_completed", Role: string(runner.RoleImplementer), Operation: "code_revision", Round: reviewRound(*st, reviewKind(*st)), Message: "implementer completed the requested fixes", OccurredAt: s.now()})
 			}
 		} else {
 			st.Phase = task.PhaseImplementationReady
@@ -2277,6 +2561,7 @@ func (s *Service) runCodeReviewer(ctx context.Context, id, token string) (Result
 		acceptReviewRound(st, kind)
 		st.Findings = cloneFindings(env.Findings)
 		if env.Verdict == "approved" {
+			appendEvent(st, task.WorkflowEvent{Type: "review_approved", Role: string(runner.RoleCodeReviewer), Operation: "code_review", Round: reviewRound(*st, kind), Message: kind + " reviewer approved", OccurredAt: s.now()})
 			if isMaterializedWorkUnitChild(*st) {
 				st.ApprovedManifestHash = st.CandidateManifestHash
 				st.Phase = task.PhaseApproved
@@ -2298,6 +2583,7 @@ func (s *Service) runCodeReviewer(ctx context.Context, id, token string) (Result
 		st.ReviewCheckpoint = cloneManifest(st.CandidateManifest)
 		st.ReviewCheckpointHash = st.CandidateManifestHash
 		st.ReviewCheckpointFindings = cloneFindings(env.Findings)
+		appendEvent(st, task.WorkflowEvent{Type: "changes_requested", Role: string(runner.RoleCodeReviewer), Operation: "code_review", Round: reviewRound(*st, kind), Message: kind + " reviewer requested changes", Findings: env.Findings, OccurredAt: s.now()})
 		if limit := maxRounds(st); limit > 0 && reviewRound(*st, kind) >= limit {
 			exhausted = true
 			st.Phase = task.PhaseFailed
@@ -2314,6 +2600,7 @@ func (s *Service) runCodeReviewer(ctx context.Context, id, token string) (Result
 		st.InFlight.Prompt = implementReviewFixPrompt(*st, env.Findings)
 		st.InFlight.Findings = cloneFindings(env.Findings)
 		st.InFlight.StartedAt = s.now()
+		appendEvent(st, task.WorkflowEvent{Type: "fix_started", Role: string(runner.RoleImplementer), Operation: "code_revision", Round: reviewRound(*st, kind), Message: "review feedback sent to the implementer session", Findings: env.Findings, OccurredAt: s.now()})
 		setReviewProgress(st, kind, "pending")
 		return nil
 	})
@@ -2379,6 +2666,7 @@ func (s *Service) beginCodeReview(id string, before, candidate []task.FileEntry,
 		token := s.newToken()
 		st.Phase = task.PhaseCodeReviewing
 		setReviewProgress(st, kind, "pending")
+		resetOperationEvents(st, task.WorkflowEvent{Type: "review_started", Role: string(runner.RoleCodeReviewer), Operation: "code_review", Round: reviewRound(*st, kind) + 1, Message: kind + " review started", OccurredAt: s.now()})
 		st.InFlight = s.ownedFlight(task.InFlight{Token: token, Operation: "code_review", Role: string(runner.RoleCodeReviewer), StartedAt: s.now(), KnownSession: st.CodeReviewerSessionID != "", SessionID: st.CodeReviewerSessionID, SnapshotManifest: cloneManifest(before), PreviousPhase: task.PhaseImplementationReady, Prompt: prompt, Scope: st.Scope, Loop: loop})
 		return nil
 	})
@@ -2407,11 +2695,30 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 	if adapter == nil {
 		return runner.Response{}, s.fail(id, token, &runner.ProviderError{Code: "PROVIDER_UNAVAILABLE", Message: fmt.Sprintf("%s provider is unavailable; install or log in with its CLI", profile.Provider), Retryable: false, KnownSession: st.InFlight.KnownSession, SessionID: st.InFlight.SessionID})
 	}
+	budget := budgetFor(st, role, s.Config)
+	used := st.Usage[string(role)]
+	usedTurns := used.AgentTurns
+	if usedTurns == 0 {
+		// Task files created before model-turn accounting retain only the
+		// host-owned invocation count. Keep their budget fail-closed instead of
+		// treating all prior work as free.
+		usedTurns = used.Requests
+	}
+	if budget.MaxTurns > 0 && usedTurns >= int64(budget.MaxTurns) {
+		budgetErr := &runner.BudgetError{Kind: "model_turns", Limit: int64(budget.MaxTurns), Observed: usedTurns}
+		return runner.Response{}, s.fail(id, token, budgetErr)
+	}
+	if _, updateErr := s.Store.UpdateOwned(id, token, func(current *task.State) error {
+		current.Progress = &task.Progress{Role: string(role), Operation: current.InFlight.Operation, Active: true, LastActivity: s.now()}
+		return nil
+	}); updateErr != nil {
+		return runner.Response{}, classify(id, updateErr)
+	}
 	sandbox := "read-only"
 	if role == runner.RoleImplementer {
 		sandbox = "workspace-write"
 	}
-	request := runner.Request{Role: role, Operation: st.InFlight.Operation, Prompt: st.InFlight.Prompt, Model: profile.Model, Effort: profile.Effort, Speed: profile.Speed, RepoRoot: s.RepoRoot, Scope: st.InFlight.Scope, SessionID: st.InFlight.SessionID, Resume: st.InFlight.KnownSession && st.InFlight.SessionID != "", Runtime: st.RuntimeSnapshot[string(role)], Sandbox: sandbox}
+	request := runner.Request{Role: role, Operation: st.InFlight.Operation, Prompt: st.InFlight.Prompt, Model: profile.Model, Effort: profile.Effort, Speed: profile.Speed, RepoRoot: s.RepoRoot, Scope: st.InFlight.Scope, SessionID: st.InFlight.SessionID, Resume: st.InFlight.KnownSession && st.InFlight.SessionID != "", Runtime: st.RuntimeSnapshot[string(role)], Sandbox: sandbox, Budget: budget, MaxOutputBytes: budget.MaxOutputBytes}
 	if s.Capabilities != nil {
 		available := s.Capabilities(profile.Provider, role, st.Task)
 		request.SkillDirectories = append([]string(nil), available.SkillDirectories...)
@@ -2421,10 +2728,19 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 	}
 	callContext := ctx
 	cancel := func() {}
-	if seconds := s.Config.ProviderTurnTimeoutSeconds; seconds > 0 {
+	timeoutSeconds := budget.TimeoutSeconds
+	if timeoutSeconds == 0 || s.Config.ProviderTurnTimeoutSeconds > 0 && s.Config.ProviderTurnTimeoutSeconds < timeoutSeconds {
+		timeoutSeconds = s.Config.ProviderTurnTimeoutSeconds
+	}
+	if seconds := timeoutSeconds; seconds > 0 {
 		callContext, cancel = context.WithTimeout(ctx, time.Duration(seconds)*time.Second)
 	}
 	defer cancel()
+	var activityMu sync.Mutex
+	var agentTurns, toolCalls int64
+	if s.Diagnostic != nil {
+		s.Diagnostic(fmt.Sprintf("%s progress: %s started", role, st.InFlight.Operation))
+	}
 	resp, callErr := adapter.Run(callContext, request, runner.Callbacks{SessionStarted: func(session string) error {
 		if strings.TrimSpace(session) == "" {
 			return runner.ErrMissingSession
@@ -2435,12 +2751,74 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 			return nil
 		})
 		return updateErr
+	}, Event: func(event runner.Event) error {
+		activityMu.Lock()
+		defer activityMu.Unlock()
+		if event.AgentTurn {
+			agentTurns++
+			if s.Diagnostic != nil {
+				s.Diagnostic(fmt.Sprintf("%s progress: model turn %d", role, agentTurns))
+			}
+		}
+		if event.ToolCall {
+			toolCalls++
+			if s.Diagnostic != nil {
+				label := event.ToolName
+				if label == "" {
+					label = "tool"
+				}
+				s.Diagnostic(fmt.Sprintf("%s progress: tool %d/%d %s", role, toolCalls, budget.MaxToolCalls, label))
+			}
+		}
+		if event.AgentTurn || event.ToolCall {
+			if _, updateErr := s.Store.UpdateOwned(id, token, func(current *task.State) error {
+				if current.Progress == nil {
+					current.Progress = &task.Progress{Role: string(role), Operation: current.InFlight.Operation, Active: true}
+				}
+				current.Progress.AgentTurns = agentTurns
+				current.Progress.ToolCalls = toolCalls
+				if event.ToolName != "" {
+					current.Progress.LastTool = event.ToolName
+				}
+				current.Progress.LastActivity = s.now()
+				return nil
+			}); updateErr != nil {
+				return updateErr
+			}
+		}
+		if budget.MaxTurns > 0 && usedTurns+agentTurns > int64(budget.MaxTurns) {
+			return &runner.BudgetError{Kind: "model_turns", Limit: int64(budget.MaxTurns), Observed: usedTurns + agentTurns}
+		}
+		if budget.MaxToolCalls > 0 && toolCalls > int64(budget.MaxToolCalls) {
+			return &runner.BudgetError{Kind: "tool_calls", Limit: int64(budget.MaxToolCalls), Observed: toolCalls}
+		}
+		return nil
 	}, Diagnostic: s.Diagnostic})
+	activityMu.Lock()
+	observedAgentTurns, observedToolCalls := agentTurns, toolCalls
+	activityMu.Unlock()
+	if errors.Is(callContext.Err(), context.DeadlineExceeded) && callErr != nil {
+		callErr = &runner.BudgetError{Kind: "timeout_seconds", Limit: int64(timeoutSeconds), Observed: int64(timeoutSeconds)}
+	} else if errors.Is(callErr, runner.ErrOutputLimit) {
+		callErr = &runner.BudgetError{Kind: "output_bytes", Limit: budget.MaxOutputBytes, Observed: budget.MaxOutputBytes}
+	}
 	turnUsage := resp.Usage
 	// Requests and prompt bytes are host measurements. Keep provider token
 	// counters intact, but do not let provider-side aggregate fields inflate
 	// the host-owned counters.
 	turnUsage.Requests = 1
+	if observedAgentTurns > turnUsage.AgentTurns {
+		turnUsage.AgentTurns = observedAgentTurns
+	}
+	if observedToolCalls > turnUsage.ToolCalls {
+		turnUsage.ToolCalls = observedToolCalls
+	}
+	if turnUsage.AgentTurns == 0 {
+		turnUsage.AgentTurns = 1
+	}
+	if callErr == nil && budget.MaxTurns > 0 && usedTurns+turnUsage.AgentTurns > int64(budget.MaxTurns) {
+		callErr = &runner.BudgetError{Kind: "model_turns", Limit: int64(budget.MaxTurns), Observed: usedTurns + turnUsage.AgentTurns}
+	}
 	turnUsage.PromptBytes = int64(len(request.Prompt))
 	turnUsage.UnreportedRequests = 0
 	turnUsage.IncompleteRequests = 0
@@ -2471,6 +2849,12 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 		}
 		total.Add(turnUsage)
 		st.Usage[string(role)] = total
+		if st.Progress != nil {
+			st.Progress.AgentTurns = turnUsage.AgentTurns
+			st.Progress.ToolCalls = turnUsage.ToolCalls
+			st.Progress.Active = false
+			st.Progress.LastActivity = s.now()
+		}
 		return nil
 	}); updateErr != nil {
 		return runner.Response{}, classify(id, updateErr)
@@ -2540,12 +2924,17 @@ func tokenDelta(current, previous int64) int64 {
 func (s *Service) fail(id, token string, cause error) error {
 	var pe *runner.ProviderError
 	errors.As(cause, &pe)
+	var budgetErr *runner.BudgetError
+	errors.As(cause, &budgetErr)
 	code, message, retryable, known, session := "PROVIDER_ERROR", cause.Error(), false, false, ""
 	if pe != nil {
 		if pe.Code != "" {
 			code = pe.Code
 		}
 		message, retryable, known, session = pe.Message, pe.Retryable, pe.KnownSession, pe.SessionID
+	}
+	if budgetErr != nil {
+		code, message, retryable = "BUDGET_EXHAUSTED", budgetErr.Error(), true
 	}
 	_, err := s.Store.UpdateOwned(id, token, func(st *task.State) error {
 		kind := reviewKind(*st)
@@ -2560,6 +2949,10 @@ func (s *Service) fail(id, token string, cause error) error {
 			st.Retry = nil
 		}
 		st.Phase = task.PhaseFailed
+		if budgetErr != nil {
+			st.BudgetIssue = &task.BudgetIssue{Role: st.InFlight.Role, Kind: budgetErr.Kind, Limit: budgetErr.Limit, Observed: budgetErr.Observed, Message: message}
+			appendEvent(st, task.WorkflowEvent{Type: "budget_exhausted", Role: st.InFlight.Role, Operation: st.InFlight.Operation, Message: message, OccurredAt: s.now()})
+		}
 		setReviewProgress(st, kind, "failed")
 		st.InFlight = nil
 		return nil
@@ -2862,10 +3255,78 @@ func cloneWorkUnits(units []task.WorkUnit) []task.WorkUnit {
 	for i, unit := range units {
 		out[i] = unit
 		out[i].DependsOn = append([]string(nil), unit.DependsOn...)
+		out[i].ContextFiles = append([]string(nil), unit.ContextFiles...)
+		out[i].AffectedSymbols = append([]string(nil), unit.AffectedSymbols...)
 		out[i].AcceptanceCriteria = append([]string(nil), unit.AcceptanceCriteria...)
 		out[i].ValidationCommands = append([]string(nil), unit.ValidationCommands...)
 	}
 	return out
+}
+
+func cloneBudgets(values map[string]task.RoleBudget) map[string]task.RoleBudget {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]task.RoleBudget, len(values))
+	for role, budget := range values {
+		out[role] = budget
+	}
+	return out
+}
+
+func budgetFor(st task.State, role runner.Role, cfg config.Config) task.RoleBudget {
+	if budget, ok := st.BudgetsSnapshot[string(role)]; ok {
+		return budget
+	}
+	return cfg.EffectiveBudgets()[string(role)]
+}
+
+func cloneEvents(values []task.WorkflowEvent) []task.WorkflowEvent {
+	if values == nil {
+		return nil
+	}
+	out := make([]task.WorkflowEvent, len(values))
+	for i, event := range values {
+		out[i] = event
+		out[i].Findings = cloneFindings(event.Findings)
+	}
+	return out
+}
+
+const maxWorkflowEvents = 40
+
+func appendEvent(st *task.State, event task.WorkflowEvent) {
+	if event.OccurredAt.IsZero() {
+		event.OccurredAt = time.Now().UTC()
+	}
+	event.Findings = cloneFindings(event.Findings)
+	st.Events = append(st.Events, event)
+	if len(st.Events) > maxWorkflowEvents {
+		st.Events = append([]task.WorkflowEvent(nil), st.Events[len(st.Events)-maxWorkflowEvents:]...)
+	}
+}
+
+func resetOperationEvents(st *task.State, event task.WorkflowEvent) {
+	st.Events = nil
+	appendEvent(st, event)
+}
+
+func (s *Service) contextSession(parent task.State, unit task.WorkUnit) string {
+	if unit.ContextGroup == "" {
+		return ""
+	}
+	var session string
+	var newest time.Time
+	for _, candidate := range parent.WorkUnits {
+		if candidate.ID == unit.ID || candidate.ContextGroup != unit.ContextGroup {
+			continue
+		}
+		child, err := s.Store.Load(task.WorkTaskID(parent.ID, candidate.ID))
+		if err == nil && child.Phase == task.PhaseApproved && child.ImplementerSessionID != "" && child.UpdatedAt.After(newest) {
+			session, newest = child.ImplementerSessionID, child.UpdatedAt
+		}
+	}
+	return session
 }
 
 func isReviewerRole(role string) bool {
@@ -3148,12 +3609,12 @@ const tokenDiscipline = "Use tokens deliberately without sacrificing correctness
 
 const (
 	implementerRoleDiscipline  = "Implementer execution discipline: before the first edit, use at most three batched pre-edit read/search tool calls; do not run git status/diff/log, repository-wide searches, repository-wide surveys, or a post-green survey; make cohesive edits; run only the narrow validation commands named by the execution packet; never run the full repository suite; wait at least 30 seconds for a background test or build instead of one-second polling; stop immediately when focused validation passes."
-	reviewerRoleDiscipline     = "Reviewer execution discipline: treat the supplied delta and evidence as authoritative; inspect only changed files and their direct blast radius; use no git commands or full suite; return the validated verdict promptly."
+	reviewerRoleDiscipline     = "Reviewer execution discipline: treat the supplied delta and evidence as authoritative; use at most three tool calls, normally two batched reads of changed files plus one direct dependency; inspect only changed files and their direct blast radius; use no git commands, repository-wide search, external research, or full suite; return the validated verdict promptly."
 	planReviewerRoleDiscipline = "Plan-reviewer execution discipline: validate the supplied task, plan, and work graph without redoing repository research; use the supplied evidence as authoritative and return the validated verdict promptly."
 )
 
 func plannerPrompt(text string, inputs []string) string {
-	return tokenDiscipline + "\nYou are the primary research and architecture brain. First classify complexity as trivial, small, medium, large, or system, then make the smallest plan justified by that class. Trivial work must be exactly one unit containing implementation, tests, and validation. Small work may use at most two units and medium at most six; never create separate renderer, documentation, or validation-only units for a local change. Split only for a real dependency or material parallel wall-time benefit. Large/system work may use the full graph needed. Research relevant repository and external contracts once, including each direct blast radius, then produce an execution-ready plan so implementers do not rediscover the system. Every node needs a stable ID, exact non-overlapping write scope, dependencies, a self-contained execution packet with named files/symbols/contracts/steps, acceptance criteria, and validation commands. Scope is machine data: use only bare comma-separated repository paths or globs, never prose, punctuation, or annotations such as 'Write only' or '(new)'. Put truly independent nodes in the same dependency wave; add an edge when write scopes overlap. Resolve uncertainty now or return needs_input with an empty work_units array. Return only the required planner JSON envelope.\n\nTask:\n" + text + "\n\nAdditional context:\n" + strings.Join(inputs, "\n")
+	return tokenDiscipline + "\nYou are the primary research, architecture, and scheduling brain. Classify complexity as trivial, small, medium, large, or system. Optimize for the shortest safe critical path and the fewest repeated reads—not the most nodes. Keep tightly coupled changes that need the same files in one unit. Split only when units have genuinely disjoint write scopes and can save material wall time, or when a dependency boundary is required. Trivial work must be one unit; small work usually one and never more than two; medium at most six. Never create renderer-, documentation-, test-, or validation-only units for a local change. Research repository and external contracts once, including direct blast radius, then make every packet executable without rediscovery. Every node must provide a stable ID, exact write scope, dependency edges, context_group, authoritative context_files, affected_symbols, estimated_minutes, a self-contained execution packet with concrete steps/contracts, acceptance criteria, and narrow validation commands. Reuse one context_group only for dependency-ordered units that should resume the same implementer session; parallel units must use distinct groups. Scope and context files are bare repository paths/globs without prose or annotations. Put independent nodes in the same wave, add edges for overlapping scopes, and keep overlapping writers out of parallel waves. Resolve uncertainty now or return needs_input with an empty work_units array. Return only the required planner JSON envelope.\n\nTask:\n" + text + "\n\nAdditional context:\n" + strings.Join(inputs, "\n")
 }
 func plannerAnswerPrompt(question, answer string, reviewing bool, findings []task.Finding) string {
 	return fmt.Sprintf("Continue in this same planning session. Question: %s\nAnswer: %s\nReview loop: %t\nFindings: %s\nReturn only the planner JSON envelope.", question, answer, reviewing, mustJSON(findings))
@@ -3167,12 +3628,23 @@ func plannerRevisionPrompt(plan string, findings []task.Finding, resumed bool) s
 }
 func planReviewPrompt(text, plan, complexity string, units []task.WorkUnit, resumed bool) string {
 	if resumed {
-		return planReviewerRoleDiscipline + "\nReview only the revision in this same review session; the task and previously validated evidence are unchanged. Verify that every prior finding is fixed and that each execution packet is implementation-ready. Validate the revised complexity and dependency graph, especially over-decomposition, cycles, and concurrent write-scope isolation. Scope is canonically represented as a comma-separated string of bare repository paths/globs; commas between entries are valid and must not be rejected as punctuation or ambiguity. Do not repeat repository research or restate inputs. Return only the plan_reviewer JSON envelope.\nComplexity:\n" + complexity + "\nRevised plan:\n" + plan + "\nRevised work graph:\n" + mustJSON(units)
+		return planReviewerRoleDiscipline + "\nReview only the revision in this same review session; the task and previously validated evidence are unchanged. Verify that every prior finding is fixed and that each execution packet is implementation-ready. Validate revised complexity, context groups/files, affected symbols, estimates, critical path, dependency cycles, and concurrent write-scope isolation. Scope is canonically represented as a comma-separated string of bare repository paths/globs; commas between entries are valid and must not be rejected as punctuation or ambiguity. Do not repeat repository research or restate inputs. Return only the plan_reviewer JSON envelope.\nComplexity:\n" + complexity + "\nRevised plan:\n" + plan + "\nRevised work graph:\n" + mustJSON(units)
 	}
-	return tokenDiscipline + "\n" + planReviewerRoleDiscipline + " Review this plan against the task and its declared complexity. Reject over-decomposition: trivial work must have one unit with implementation and tests together; small work at most two; medium at most six; validation-only units are not justified for local changes. Scope is canonically represented as a comma-separated string of bare repository paths/globs; commas between entries are valid. Reject prose or annotations attached to an entry, not valid separators. Also reject if an implementer would need to rediscover architecture, affected symbols, contracts, dependencies, blast radius, acceptance criteria, or validation commands. Verify that the graph is acyclic and same-wave scopes are disjoint. This is plan review, not code review. Return only the required plan_reviewer JSON envelope.\nTask:\n" + text + "\nComplexity:\n" + complexity + "\nPlan:\n" + plan + "\nWork graph:\n" + mustJSON(units)
+	return tokenDiscipline + "\n" + planReviewerRoleDiscipline + " Review this plan against the task and its declared complexity. Reject over-decomposition: trivial work must have one unit with implementation and tests together; small work at most two; medium at most six; validation-only units are not justified for local changes. Reject parallel nodes that repeat the same context or touch overlapping writers; tightly coupled work belongs in one unit or one dependency-ordered context_group so its implementer session is reused. Verify estimated_minutes create a short safe critical path, context_files and affected_symbols make every packet implementation-ready, the graph is acyclic, and same-wave scopes are disjoint. Scope and context files are canonically represented bare repository paths/globs; commas are valid separators, while prose annotations are not. Reject any packet that requires rediscovering architecture, contracts, dependencies, blast radius, acceptance criteria, or validation. This is plan review, not code review. Return only the required plan_reviewer JSON envelope.\nTask:\n" + text + "\nComplexity:\n" + complexity + "\nPlan:\n" + plan + "\nWork graph:\n" + mustJSON(units)
 }
 func implementPrompt(text, plan, scope string, findings []task.Finding) string {
-	return tokenDiscipline + "\n" + implementerRoleDiscipline + "\nImplement the approved execution packet in this existing shared checkout. Treat its architecture and named evidence as authoritative. Before the first edit, batch exact named files and symbols. Do not inspect unrelated tests before editing. After the first edit, read more only to resolve a concrete compiler/test failure or a named direct dependency. If the packet is insufficient or the checkout contradicts it, return one precise needs_input question instead of researching outward. You are the only source-code writer for this task. Other RoleMux tasks may run concurrently only in disjoint scopes. Change only the declared scope; do not run git mutation commands. Return only the implementer JSON envelope.\nTask:\n" + text + "\nExecution packet / approved plan:\n" + plan + "\nScope:\n" + scope + "\nFindings:\n" + mustJSON(findings)
+	return tokenDiscipline + "\n" + implementerRoleDiscipline + "\nImplement the approved execution packet in this existing shared checkout. Its architecture, context_files, affected_symbols, and named evidence are authoritative. Batch-read only those files/symbols before the first edit; do not rediscover repository structure or inspect unrelated tests. After the first edit, read more only for a concrete compiler/test failure or a named direct dependency. If the packet is insufficient or the checkout contradicts it, return one precise needs_input question instead of researching outward. You are the only source-code writer for this task. Other RoleMux tasks may run concurrently only in disjoint scopes. Change only the declared scope; do not run git mutation commands. Return only the implementer JSON envelope.\nTask:\n" + text + "\nExecution packet / approved plan:\n" + plan + "\nScope:\n" + scope + "\nFindings:\n" + mustJSON(findings)
+}
+
+func executionPacket(unit task.WorkUnit) string {
+	return "Objective: " + unit.Objective +
+		"\nContext group: " + unit.ContextGroup +
+		"\nAuthoritative context files: " + strings.Join(unit.ContextFiles, ", ") +
+		"\nAffected symbols: " + strings.Join(unit.AffectedSymbols, ", ") +
+		fmt.Sprintf("\nExpected focused effort: %d minutes", unit.EstimatedMinutes) +
+		"\nImplementation instructions:\n" + unit.ExecutionPacket +
+		"\nAcceptance criteria:\n- " + strings.Join(unit.AcceptanceCriteria, "\n- ") +
+		"\nValidation commands:\n- " + strings.Join(unit.ValidationCommands, "\n- ")
 }
 func implementAnswerPrompt(question, answer string, findings []task.Finding) string {
 	return implementerRoleDiscipline + "\nContinue in this same implementation session.\nQuestion: " + question + "\nAnswer: " + answer + "\nFindings:\n" + mustJSON(findings) + "\nReturn only the implementer JSON envelope."

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 func TestConfigPathsUseRoleMuxHomeDirectory(t *testing.T) {
@@ -130,6 +132,33 @@ func TestProviderTurnTimeoutDefaultsAndValidates(t *testing.T) {
 		if err := Validate(cfg); err != nil {
 			t.Fatalf("timeout %d rejected: %v", seconds, err)
 		}
+	}
+}
+
+func TestRoleBudgetsDefaultLayerAndExpandReviewer(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	global := filepath.Join(home, ".rolemux", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(global), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(global, []byte("[budgets.reviewer]\nmax_tool_calls=2\n[budgets.implementer]\ntimeout_seconds=240\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadWithEnv(root, []string{"HOME=" + home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	budgets := cfg.EffectiveBudgets()
+	if budgets[RolePlanReviewer].MaxToolCalls != 2 || budgets[RoleCodeReviewer].MaxToolCalls != 2 {
+		t.Fatalf("review budgets=%#v", budgets)
+	}
+	if budgets[RoleImplementer].TimeoutSeconds != 240 || budgets[RoleImplementer].MaxTurns == 0 {
+		t.Fatalf("implementer budget=%#v", budgets[RoleImplementer])
+	}
+	bad := Default()
+	bad.Budgets[RolePlanner] = task.RoleBudget{TimeoutSeconds: 2}
+	if err := Validate(bad); err == nil {
+		t.Fatal("unsafe budget accepted")
 	}
 }
 

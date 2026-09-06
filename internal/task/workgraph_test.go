@@ -79,3 +79,23 @@ func TestComplexityBoundsWorkGraphSize(t *testing.T) {
 		}
 	}
 }
+
+func TestContextGroupsAreOrderedAndCriticalPathUsesEstimates(t *testing.T) {
+	units, err := NormalizeWorkUnits([]WorkUnit{
+		{ID: "T1", Objective: "core", Scope: "core.go", ContextGroup: "core", ContextFiles: []string{"core.go"}, EstimatedMinutes: 7, ExecutionPacket: "core", AcceptanceCriteria: []string{"done"}, ValidationCommands: []string{"test core"}},
+		{ID: "T2", Objective: "follow-up", Scope: "follow.go", ContextGroup: "core", ContextFiles: []string{"core.go", "follow.go"}, EstimatedMinutes: 4, DependsOn: []string{"T1"}, ExecutionPacket: "follow", AcceptanceCriteria: []string{"done"}, ValidationCommands: []string{"test follow"}},
+		{ID: "T3", Objective: "independent", Scope: "other.go", ContextGroup: "other", ContextFiles: []string{"other.go"}, EstimatedMinutes: 9, ExecutionPacket: "other", AcceptanceCriteria: []string{"done"}, ValidationCommands: []string{"test other"}},
+	}, "plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, minutes, err := WorkUnitCriticalPath(units)
+	if err != nil || strings.Join(path, ",") != "T1,T2" || minutes != 11 {
+		t.Fatalf("path=%v minutes=%d err=%v", path, minutes, err)
+	}
+	bad := append([]WorkUnit(nil), units...)
+	bad[1].DependsOn = nil
+	if err := ValidateWorkUnits(bad); err == nil || !strings.Contains(err.Error(), "context-sharing") {
+		t.Fatalf("unordered context group accepted: %v", err)
+	}
+}

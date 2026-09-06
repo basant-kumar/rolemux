@@ -87,6 +87,21 @@ may span multiple host invocations. Reviewer approval of the plan and final
 integrated code creates a hard human gate with Approve, Request changes, and
 Discuss choices.
 
+At the final code gate, `approval show` prints narrow local Git review commands.
+For a GitHub repository, you can explicitly publish a temporary draft PR and
+send its comments back through the same implementation session:
+
+```bash
+rolemux approval publish <task-id>
+# Comment on the draft PR.
+rolemux approval sync <task-id>
+```
+
+Publishing is opt-in, uses the existing `gh` login, never touches the current
+branch/index/worktree, and reuses one draft PR across fix/re-review rounds. The
+PR is a review surface only—do not merge it. If GitHub or `gh` is unavailable,
+review locally and use `approval respond` for feedback or approval.
+
 The review safety limit is a top-level setting. The default is five accepted
 reviewer verdicts per review task:
 
@@ -125,10 +140,12 @@ The orchestrator then drives the workflow:
 
 1. For a local change with a known scope, use the planner-free fast path below.
    Otherwise, the planner classifies complexity and produces the smallest valid
-   dependency graph; trivial work is one implementation-and-test unit.
+   dependency graph and shortest safe critical path; trivial work is one
+   implementation-and-test unit.
 2. After the plan reviewer approves, you approve or steer the reviewed plan.
 3. Independent work units may run concurrently in the shared checkout; each
-   implementer and reviewer resumes its own provider session.
+   context lane resumes its implementer session, while disjoint lanes may run
+   concurrently.
 4. Unit reviews advance automatically; one integration review follows all
    units and then stops for your final code approval.
 
@@ -145,7 +162,9 @@ rolemux approval show <task-id>
 `quick start` performs no provider/model discovery and requires an explicit
 narrow scope. Full plans expose `complexity` as `trivial`, `small`, `medium`,
 `large`, or `system`; RoleMux rejects over-decomposed graphs and prose-like
-scope entries. A one-unit trivial/small plan does not repeat its focused code
+scope entries. Planner packets include authoritative files, symbols, estimates,
+dependencies, and narrow validation so implementers do not rediscover the
+repository. A one-unit trivial/small plan does not repeat its focused code
 review as a broad integration-model call, but it still requires final human
 approval.
 
@@ -167,15 +186,16 @@ starts that provider's login flow and discovers models after login completes.
 
 ## Token use
 
-RoleMux keeps context useful and small: the planner sends self-contained work
-packets, resumed turns send only new answers or diffs, task reviews inspect the
-change and its blast radius, and one logical full integration review gate runs
-across the approved work units. Review results expose compact status,
-review-kind, round, limit, reviewability, and next-action fields; exit 0 means
-the operation completed, not that the review approved.
-`rolemux usage <task-id> --json` reports measured usage when providers expose
-it. If [pxpipe](https://github.com/teamchong/pxpipe) is installed and eligible,
-RoleMux can use it automatically to try to save more tokens.
+RoleMux sends self-contained work packets, resumes provider sessions, reviews
+only task deltas and their direct blast radius, then runs one integration review
+per plan. It streams compact progress to stderr and persists model turns, tool
+calls, provider invocations, and reported tokens. Per-role budgets stop runaway
+turns, tools, time, and output; a human can inspect and explicitly extend them.
+
+`plan graph --json` is compact; add `--full` only when packet details are needed.
+If [pxpipe](https://github.com/teamchong/pxpipe) is installed, RoleMux reports
+whether each eligible turn actually used image compression or passed through as
+text. The installed pxpipe configuration—not RoleMux—decides model eligibility.
 
 ## Useful commands
 
@@ -187,9 +207,15 @@ RoleMux can use it automatically to try to save more tokens.
 | `rolemux doctor --json` | Check CLIs, logins, models, and installation |
 | `rolemux list --json` | List tasks |
 | `rolemux status <task-id> --json` | Inspect workflow state |
+| `rolemux plan graph <task-id> --json` | Inspect compact scheduling state |
 | `rolemux approval show <task-id>` | Inspect a pending human gate |
+| `rolemux approval publish <task-id>` | Publish or update an optional GitHub draft review |
+| `rolemux approval sync <task-id>` | Import new PR comments as requested changes |
 | `rolemux approval respond …` | Approve, request changes, or discuss |
 | `rolemux usage <task-id> --json` | Compare measured token usage |
+| `rolemux budget show <task-id>` | Inspect snapshotted role budgets |
+| `rolemux budget extend …` | Explicitly extend an exhausted budget |
+| `rolemux work adopt …` | Adopt scoped host fallback changes for review |
 | `rolemux retry <task-id> --json` | Resume a recoverable provider turn |
 
 ## Documentation

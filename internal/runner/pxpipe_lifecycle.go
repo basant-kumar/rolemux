@@ -297,6 +297,7 @@ func (p *PXPipeTaskLauncher) Launch(ctx context.Context, spec PXPipeLaunchSpec) 
 		case outcome := <-resultCh:
 			cancelTask()
 			stopPXPipeServer(server, shutdownTimeout)
+			reportPXPipeMode(spec.Diagnostic, eventsFile, eventsOffset)
 			return outcome.result, outcome.err
 		case <-server.Done():
 			cancelTask()
@@ -329,6 +330,67 @@ func (p *PXPipeTaskLauncher) Launch(ctx context.Context, spec PXPipeLaunchSpec) 
 		lastErr = errors.New("pxpipe could not start a private server")
 	}
 	return ProcessResult{}, &PXPipeLaunchError{BeforeTask: true, Cause: lastErr}
+}
+
+func reportPXPipeMode(diagnostic func(string), path string, offset int64) {
+	if diagnostic == nil || strings.TrimSpace(path) == "" {
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	if offset > 0 {
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return
+		}
+	}
+	var last struct {
+		Status     int     `json:"status"`
+		Model      string  `json:"model"`
+		Compressed bool    `json:"compressed"`
+		SavedPct   float64 `json:"saved_pct"`
+		Input      struct {
+			Mode string `json:"mode"`
+		} `json:"input"`
+	}
+	found := false
+	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+	for {
+		var event struct {
+			Status     int     `json:"status"`
+			Model      string  `json:"model"`
+			Compressed bool    `json:"compressed"`
+			SavedPct   float64 `json:"saved_pct"`
+			Input      struct {
+				Mode string `json:"mode"`
+			} `json:"input"`
+		}
+		if err := decoder.Decode(&event); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return
+		}
+		if event.Status >= 200 && event.Status < 400 {
+			last, found = event, true
+		}
+	}
+	if !found {
+		return
+	}
+	mode := strings.TrimSpace(last.Input.Mode)
+	if mode == "" {
+		mode = "text"
+	}
+	message := fmt.Sprintf("pxpipe transport: model=%s mode=%s compressed=%t", last.Model, mode, last.Compressed)
+	if last.SavedPct > 0 {
+		message += fmt.Sprintf(" saved=%.1f%%", last.SavedPct)
+	}
+	if mode == "text" {
+		message += " (pass-through; pxpipe did not image this model/turn)"
+	}
+	diagnostic(message)
 }
 
 func pxpipeEventsOffset(path string) int64 {

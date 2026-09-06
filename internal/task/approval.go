@@ -89,6 +89,27 @@ type ReviewerEvidence struct {
 	ReviewedFingerprint string           `json:"reviewed_fingerprint,omitempty"`
 }
 
+// ExternalReview tracks an optional human-review surface. It contains only
+// public repository coordinates and synchronization cursors; credentials are
+// always owned by the host CLI.
+type ExternalReview struct {
+	Provider                      string    `json:"provider"`
+	URL                           string    `json:"url"`
+	Number                        int       `json:"number"`
+	Repository                    string    `json:"repository"`
+	Remote                        string    `json:"remote"`
+	BaseBranch                    string    `json:"base_branch"`
+	HeadBranch                    string    `json:"head_branch"`
+	BaseCommit                    string    `json:"base_commit"`
+	HeadCommit                    string    `json:"head_commit"`
+	PublishedCandidateFingerprint string    `json:"published_candidate_fingerprint"`
+	LastIssueCommentID            int64     `json:"last_issue_comment_id,omitempty"`
+	LastReviewCommentID           int64     `json:"last_review_comment_id,omitempty"`
+	LastReviewID                  int64     `json:"last_review_id,omitempty"`
+	PublishedAt                   time.Time `json:"published_at"`
+	LastSyncedAt                  time.Time `json:"last_synced_at,omitempty"`
+}
+
 // ApprovalRecord is the durable human-approval gate. An absent record is
 // distinct from a record with an approval decision: loading legacy JSON never
 // invents a human decision.
@@ -106,6 +127,7 @@ type ApprovalRecord struct {
 	ChangedPaths         []string              `json:"changed_paths,omitempty"`
 	ChangedFiles         []ApprovalChangedFile `json:"changed_files,omitempty"`
 	ReviewerEvidence     *ReviewerEvidence     `json:"reviewer_evidence,omitempty"`
+	ExternalReview       *ExternalReview       `json:"external_review,omitempty"`
 	CreatedAt            time.Time             `json:"created_at,omitempty"`
 	DecidedAt            *time.Time            `json:"decided_at,omitempty"`
 	HumanFeedback        string                `json:"human_feedback,omitempty"`
@@ -798,6 +820,41 @@ func (s *Store) ReadApprovalArtifactRef(ref ContentRef) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %s", ErrApprovalArtifactMissing, ref.Path)
 	}
 	if digestBytes(b) != ref.Digest {
+		return nil, fmt.Errorf("%w: %s", ErrArtifactCorrupt, ref.Path)
+	}
+	return b, nil
+}
+
+// ReadContentRef verifies and reads a captured baseline/candidate blob. The
+// path is accepted only from RoleMux's private content root, so a modified
+// task record cannot turn review publishing into an arbitrary file read.
+func (s *Store) ReadContentRef(ref ContentRef) ([]byte, error) {
+	if !filepath.IsAbs(ref.Path) || !validApprovalDigest(ref.Digest) {
+		return nil, ErrInvalidArtifactDigest
+	}
+	root, err := s.artifactPrivateRoot()
+	if err != nil {
+		return nil, err
+	}
+	contentRoot := filepath.Join(root, "content")
+	rel, err := filepath.Rel(contentRoot, ref.Path)
+	if err != nil || rel == ".." || len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator) {
+		return nil, ErrInvalidArtifactPath
+	}
+	if err := validatePrivateDirectory(contentRoot, filepath.Dir(ref.Path)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %s", ErrApprovalArtifactMissing, ref.Path)
+		}
+		return nil, err
+	}
+	b, ok, err := existingArtifactBytes(ref.Path)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrApprovalArtifactMissing, ref.Path)
+	}
+	if digestBytes(b) != ref.Digest || int64(len(b)) != ref.Size {
 		return nil, fmt.Errorf("%w: %s", ErrArtifactCorrupt, ref.Path)
 	}
 	return b, nil

@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -80,10 +81,22 @@ func (c *Claude) Run(ctx context.Context, req Request, callbacks Callbacks) (Res
 	if envErr != nil {
 		return Response{}, providerError("CLAUDE_AUTH", envErr.Error(), false, false, req.SessionID, envErr)
 	}
-	spec := ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes}
+	spec := ProcessSpec{Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes, StdoutLine: func(line []byte) error {
+		if callbacks.Event != nil {
+			for _, event := range EventsFromLine("claude", line) {
+				if err := callbacks.Event(event); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}}
 	result, processErr := c.runClaudeTask(ctx, req, spec, callbacks)
 	outerID, nested, model, effort, parseErr := parseClaudeResult(result.Stdout, req.SessionID, req.Role)
-	usage, usageReported := usageFromJSONDocumentWithPresence(result.Stdout, false)
+	usage, usageReported := usageFromJSONLinesWithPresence(result.Stdout, false)
+	if turns := claudeReportedTurns(result.Stdout); turns > 0 {
+		usage.AgentTurns = turns
+	}
 	response := Response{SessionID: outerID, Text: string(nested), ReportedModel: model, ReportedEffort: effort, Usage: usage, UsageStatus: usageStatus(usageReported, usageReported)}
 	// A fresh Claude session ID is assigned and persisted before launch. Once
 	// the OS accepts the task process, an error must retry that exact ID rather
@@ -247,7 +260,7 @@ func BuildClaudeArgs(req Request) ([]string, error) {
 		tools = append(tools, "Edit", "Write")
 	}
 	toolList := strings.Join(tools, ",")
-	args := []string{"--print", "--output-format", "json", "--input-format", "text", "--restricted", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--tools", toolList, "--allowed-tools", toolList, "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`}
+	args := []string{"--print", "--output-format", "stream-json", "--verbose", "--input-format", "text", "--restricted", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--tools", toolList, "--allowed-tools", toolList, "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`}
 	if req.Speed == "fast" {
 		args = append(args, "--settings", `{"fastMode":true}`)
 	} else if req.Speed == "standard" {
@@ -270,6 +283,44 @@ func BuildClaudeArgs(req Request) ([]string, error) {
 }
 
 func parseClaudeResult(data []byte, expectedSession string, role Role) (session string, nested []byte, model, effort string, err error) {
+	lines := bytes.Split(bytes.TrimSpace(data), []byte{'\n'})
+	if len(lines) > 1 {
+		var found bool
+		for _, line := range lines {
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 {
+				continue
+			}
+			var event map[string]json.RawMessage
+			if e := json.Unmarshal(line, &event); e != nil {
+				return "", nil, "", "", fmt.Errorf("%w: invalid Claude stream event: %v", ErrInvalidEnvelope, e)
+			}
+			var eventSession string
+			_ = json.Unmarshal(event["session_id"], &eventSession)
+			if eventSession != "" {
+				if session != "" && session != eventSession {
+					return "", nil, "", "", fmt.Errorf("%w: conflicting Claude session IDs", ErrInvalidEnvelope)
+				}
+				session = eventSession
+			}
+			if raw := event["model"]; len(raw) > 0 {
+				_ = json.Unmarshal(raw, &model)
+			}
+			if raw := event["effort"]; len(raw) > 0 {
+				_ = json.Unmarshal(raw, &effort)
+			}
+			if raw := event["structured_output"]; len(raw) > 0 && string(raw) != "null" {
+				if _, e := DecodeEnvelope(raw, role); e != nil {
+					return session, nil, model, effort, e
+				}
+				nested, found = append([]byte(nil), raw...), true
+			}
+		}
+		if !found {
+			return session, nil, model, effort, fmt.Errorf("%w: Claude stream lacks structured_output", ErrInvalidEnvelope)
+		}
+		return session, nested, model, effort, nil
+	}
 	var outer map[string]json.RawMessage
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	if e := dec.Decode(&outer); e != nil {
@@ -302,6 +353,22 @@ func parseClaudeResult(data []byte, expectedSession string, role Role) (session 
 		return session, nil, model, effort, e
 	}
 	return session, append([]byte(nil), raw...), model, effort, nil
+}
+
+func claudeReportedTurns(data []byte) int64 {
+	var latest int64
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		var value map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(line)))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			continue
+		}
+		if turns, ok := numberWithPresence(value, "num_turns", "numTurns"); ok {
+			latest = turns
+		}
+	}
+	return latest
 }
 
 func outerIDOr(got, fallback string) string {

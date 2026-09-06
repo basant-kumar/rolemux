@@ -319,8 +319,10 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 	if _, err := executableForRequest(c.Path, req.Runtime.CLIPath); err != nil {
 		return Response{}, providerError("COPILOT_UNAVAILABLE", err.Error(), false, false, "", err)
 	}
+	runContext, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	client := copilot.NewClient(c.clientOptions(req))
-	if err := client.Start(ctx); err != nil {
+	if err := client.Start(runContext); err != nil {
 		return Response{}, providerProcessError("copilot", err, false, "")
 	}
 	defer client.Stop()
@@ -330,9 +332,9 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 		if req.SessionID == "" {
 			return Response{}, providerError("COPILOT_SESSION", "resume requires a session ID", false, false, "", ErrMissingSession)
 		}
-		session, err = client.ResumeSession(ctx, req.SessionID, c.resumeConfig(req))
+		session, err = client.ResumeSession(runContext, req.SessionID, c.resumeConfig(req))
 	} else {
-		session, err = client.CreateSession(ctx, c.sessionConfig(req))
+		session, err = client.CreateSession(runContext, c.sessionConfig(req))
 	}
 	if err != nil {
 		return Response{}, providerProcessError("copilot", err, req.Resume, req.SessionID)
@@ -348,13 +350,26 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 	var usageMu sync.Mutex
 	var usage copilotUsageAccumulator
 	unsubscribe := session.On(func(event copilot.SessionEvent) {
-		data, ok := event.Data.(*copilot.AssistantUsageData)
-		if !ok || data == nil {
+		if data, ok := event.Data.(*copilot.AssistantUsageData); ok && data != nil {
+			usageMu.Lock()
+			usage.Add(data)
+			usageMu.Unlock()
+		}
+		if callbacks.Event == nil {
 			return
 		}
-		usageMu.Lock()
-		usage.Add(data)
-		usageMu.Unlock()
+		var normalized Event
+		switch data := event.Data.(type) {
+		case *copilot.ModelCallStartData:
+			normalized = Event{Type: "model_call_start", AgentTurn: true}
+		case *copilot.ToolExecutionStartData:
+			normalized = Event{Type: "tool_execution_start", ToolCall: true, ToolName: data.ToolName}
+		default:
+			return
+		}
+		if err := callbacks.Event(normalized); err != nil {
+			cancel(err)
+		}
 	})
 	defer unsubscribe()
 	usageSnapshot := func(terminal bool) Response {
@@ -363,8 +378,11 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 		counters, reported := usage.Snapshot()
 		return Response{SessionID: session.SessionID, Usage: counters, UsageStatus: usageStatus(reported, terminal)}
 	}
-	result, err := session.SendAndWait(ctx, copilot.MessageOptions{Prompt: CopilotEnvelopePrompt(req.Role) + "\n\n" + req.Prompt})
+	result, err := session.SendAndWait(runContext, copilot.MessageOptions{Prompt: CopilotEnvelopePrompt(req.Role) + "\n\n" + req.Prompt})
 	if err != nil {
+		if budgetErr, ok := context.Cause(runContext).(*BudgetError); ok {
+			return usageSnapshot(false), providerError("BUDGET_EXHAUSTED", budgetErr.Error(), true, true, session.SessionID, budgetErr)
+		}
 		return usageSnapshot(false), providerProcessError("copilot", err, true, session.SessionID)
 	}
 	if result == nil {
@@ -373,6 +391,9 @@ func (c *Copilot) Run(ctx context.Context, req Request, callbacks Callbacks) (Re
 	data, ok := result.Data.(*copilot.AssistantMessageData)
 	if !ok || data == nil {
 		return usageSnapshot(true), providerError("COPILOT_OUTPUT", "Copilot terminal event was not an assistant message", true, true, session.SessionID, ErrInvalidEnvelope)
+	}
+	if req.MaxOutputBytes > 0 && int64(len(data.Content)) > req.MaxOutputBytes {
+		return usageSnapshot(true), providerError("OUTPUT_LIMIT", "Copilot output exceeded RoleMux's configured role budget", true, true, session.SessionID, ErrOutputLimit)
 	}
 	env, err := DecodeEnvelope([]byte(data.Content), req.Role)
 	if err != nil {

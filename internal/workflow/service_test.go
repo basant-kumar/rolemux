@@ -247,6 +247,13 @@ func TestIntegrationReviewUsesFreshFixerThenResumesReviewer(t *testing.T) {
 	if err != nil || result.Status != "fixed" || result.State.Phase != task.PhaseImplementationReady || result.State.CodeRound != 1 || !result.State.IntegrationReview || result.State.ParentTaskID != parent.ID {
 		t.Fatalf("integration=%#v err=%v", result.State, err)
 	}
+	eventTypes := make([]string, 0, len(result.State.Events))
+	for _, event := range result.State.Events {
+		eventTypes = append(eventTypes, event.Type)
+	}
+	if strings.Join(eventTypes, ",") != "review_started,changes_requested,fix_started,fix_completed" || len(result.State.Events[1].Findings) != 1 {
+		t.Fatalf("review transparency events=%#v", result.State.Events)
+	}
 	result, err = service.ReviewIntegration(context.Background(), parent.ID)
 	result, err = approveIfRequired(context.Background(), service, parent.ID, result, err)
 	if err != nil || result.Status != "approved" || result.State.Phase != task.PhaseApproved || result.State.CodeRound != 2 {
@@ -322,6 +329,13 @@ func TestAutomaticReviewLoopsResumeEveryRoleSession(t *testing.T) {
 	revisedPlan, err := service.ReviewPlan(context.Background(), "loop")
 	if err != nil || revisedPlan.Status != "revised" || revisedPlan.State.Phase != task.PhasePlanned || revisedPlan.State.Plan != "plan v2" || revisedPlan.State.PlanRound != 1 {
 		t.Fatalf("plan revision: %#v err=%v", revisedPlan.State, err)
+	}
+	planEventTypes := make([]string, 0, len(revisedPlan.State.Events))
+	for _, event := range revisedPlan.State.Events {
+		planEventTypes = append(planEventTypes, event.Type)
+	}
+	if strings.Join(planEventTypes, ",") != "review_started,changes_requested,revision_started,revision_completed" {
+		t.Fatalf("plan revision events=%v", planEventTypes)
 	}
 	approvedPlan, err := service.ReviewPlan(context.Background(), "loop")
 	approvedPlan, err = approveIfRequired(context.Background(), service, "loop", approvedPlan, err)
@@ -958,7 +972,7 @@ func TestPlannerAndImplementerPromptsAssignResearchToPlanner(t *testing.T) {
 	planning := plannerPrompt("change app", nil)
 	review := planReviewPrompt("change app", "plan", task.ComplexitySmall, []task.WorkUnit{{ID: "W1", Scope: "app.go,app_test.go"}}, true)
 	implementation := implementPrompt("change app", "packet", "app.go", nil)
-	for _, required := range []string{"primary research and architecture brain", "execution packet", "direct blast radius", "validation commands"} {
+	for _, required := range []string{"primary research, architecture, and scheduling brain", "execution packet", "direct blast radius", "validation commands"} {
 		if !strings.Contains(planning, required) {
 			t.Fatalf("planner prompt omitted %q", required)
 		}

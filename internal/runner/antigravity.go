@@ -107,11 +107,22 @@ func (a *Antigravity) Run(ctx context.Context, req Request, callbacks Callbacks)
 		Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: antigravityInput(req.Prompt), MaxOutputBytes: req.MaxOutputBytes,
 		StdoutLine: func(line []byte) error {
 			id, _ := antigravitySessionFromLine(line)
-			return notify(id)
+			if err := notify(id); err != nil {
+				return err
+			}
+			if callbacks.Event != nil {
+				for _, event := range EventsFromLine("antigravity", line) {
+					if err := callbacks.Event(event); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
 		},
 	})
 	parseCallbacks := callbacks
 	parseCallbacks.SessionStarted = notify
+	parseCallbacks.Event = nil
 	response, parseErr := parseAntigravityOutput(result.Stdout, req.Role, parseCallbacks)
 	known := response.SessionID != ""
 	if req.Resume && response.SessionID == "" {

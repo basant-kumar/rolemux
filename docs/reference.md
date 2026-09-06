@@ -75,6 +75,24 @@ Example:
 provider_turn_timeout_seconds = 900
 review_max_rounds = 5
 
+[budgets.planner]
+max_turns = 20
+max_tool_calls = 20
+timeout_seconds = 300
+max_output_bytes = 8388608
+
+[budgets.implementer]
+max_turns = 20
+max_tool_calls = 12
+timeout_seconds = 300
+max_output_bytes = 8388608
+
+[budgets.reviewer]
+max_turns = 20
+max_tool_calls = 3
+timeout_seconds = 180
+max_output_bytes = 4194304
+
 [profiles.planner]
 provider = "codex"
 model = "gpt-5.6-sol"
@@ -91,6 +109,12 @@ provider = "codex"
 model = "gpt-5.6-sol"
 effort = "xhigh"
 ```
+
+Budgets are task-lifetime model turns plus per-invocation tool calls, wall-clock
+seconds, and process-output bytes. The shared `reviewer` budget feeds plan and
+code review unless `[budgets.plan_reviewer]` or `[budgets.code_reviewer]`
+overrides it. Positive values in global/project layers override the defaults;
+new tasks snapshot the effective values.
 
 For example, a project override can remove the ceiling or choose another
 positive value:
@@ -148,8 +172,10 @@ rolemux approval respond <task-id> --gate <gate-id> --decision approve
 rolemux plan graph <task-id> --json
 ```
 
-The graph returns dependency-ordered waves, ready unit IDs, write scopes, and
-self-contained execution packets. Planner results declare `complexity` as
+The default JSON graph is a compact scheduling view: dependency waves, ready
+unit IDs, write scopes, context groups, estimates, and the critical path. Use
+`--full --json` only when complete execution packets, context files, affected
+symbols, criteria, and validation commands are needed. Planner results declare `complexity` as
 `trivial`, `small`, `medium`, `large`, or `system`. Trivial plans have one unit,
 small plans at most two, and medium plans at most six. Scope fields accept bare
 repository paths/globs only; prose and annotations are rejected. The
@@ -161,8 +187,11 @@ rolemux implement <work-task-id> --json
 rolemux code review <work-task-id> --json
 ```
 
-Re-run `plan graph` after approvals to find newly ready units. Once every unit
-passes, start the one-time integration gate:
+Dependency-ordered units with the same `context_group` reuse the prior
+implementer session. Parallel units must have distinct context groups, avoiding
+repeated repository discovery while preserving safe concurrency. Re-run `plan
+graph` after approvals to find newly ready units. Once every unit passes, start
+the one-time integration gate:
 
 ```bash
 rolemux work integrate <task-id> --json
@@ -203,6 +232,33 @@ new gate. Repeating the same decision for the same gate is idempotent, while a
 stale or conflicting gate ID fails closed. Parent plan IDs resolve an existing
 integration gate through `approval_task_id`.
 
+For final code approval, `approval show` also prints path-limited local `git
+status` and `git diff` commands. If the repository has a GitHub remote and the
+GitHub CLI is installed and authenticated, the human can opt into a temporary
+draft-PR review:
+
+```bash
+rolemux approval publish <task-id> [--json]
+# Add review comments on the draft PR.
+rolemux approval sync <task-id> [--json]
+```
+
+`publish` is the explicit authorization to push two `rolemux-review/*`
+branches and create or update a draft PR. It uses the existing `git` and `gh`
+CLIs and stores no credentials. The commits are built from RoleMux's immutable
+baseline and reviewed-candidate snapshots in an isolated temporary worktree,
+so the user's current branch, index, and worktree are unchanged. The draft is a
+review surface only and must not be merged.
+
+`sync` imports only comments and reviews newer than its saved cursors. Any
+non-empty new feedback becomes `request_changes` and resumes the same saved
+implementer (or integration fixer) session. After the fix and another model
+review, `publish` updates the existing candidate branch and reuses the same PR.
+The final RoleMux `approval respond ... --decision approve` remains the
+authoritative completion action; a GitHub approval does not bypass that hard
+gate. If GitHub, `gh`, login, or a supported remote is unavailable, use the
+printed local review commands and `approval respond` instead.
+
 ## Host-controlled review continuation
 
 Every `plan review`, `code review`, or integration review command performs one
@@ -229,9 +285,11 @@ Compact review control results contain these fields:
 | `review_round` | Accepted reviewer verdicts for this kind. |
 | `max_rounds` | Snapshotted ceiling; `0` means unlimited. |
 | `can_review` | Whether the host may issue the next review command. |
-| `next_action` | The safe host continuation, such as `approval_respond`, `plan_review`, `code_review`, `work_integrate`, `plan_answer`, `implement_answer`, `retry`, `inspect`, `wait`, `advance`, or `stop`. |
+| `next_action` | The safe host continuation, such as `approval_respond`, `plan_review`, `code_review`, `work_integrate`, `plan_answer`, `implement_answer`, `retry`, `budget_extend`, `inspect`, `wait`, `advance`, or `stop`. |
 | `question` | Approval prompt or planner/implementer question. |
 | `source` | Optional planner/implementer answer source for that question. |
+| `events` | Bounded lifecycle facts such as review started, changes requested, fix started/completed, and approval, including structured findings. |
+| `progress` | Current role/operation with model-turn and tool-call counters; provider prose and raw tool output are excluded. |
 
 Pending human gates also expose `approval_id`, `approval_task_id`,
 `approval_kind`, ordered `choices`, `artifact_path`, `scope`, and compact
@@ -252,6 +310,7 @@ The host decision table is:
 | `revised` / `fixed` | Issue the matching explicit review; keep dependencies locked. |
 | `needs_input` | Ask `question`, then use `source` to choose the matching answer command. |
 | `review_needed` | Run `rolemux retry <task-id> --json`. |
+| `budget_exhausted` | Inspect partial work, explicitly extend the named limit, then retry the saved session. |
 | `no_progress` | Inspect the saved candidate and decide deliberately; do not repeat automatically. |
 | `failed` / `in_flight` | Follow recovery metadata: retry a durable failure or wait/inspect an in-flight owner. |
 | `exhausted` | Stop; the review ceiling has been reached. |
@@ -285,19 +344,34 @@ rolemux status <task-id> --json
 rolemux status <task-id> --full --json
 rolemux usage <task-id> --json
 rolemux retry <task-id> --json
+rolemux budget show <task-id> --json
+rolemux budget extend <task-id> --role implementer --tool-calls 3 --json
+rolemux budget extend <task-id> --role implementer --output-bytes 1048576 --json
+rolemux work adopt <task-id> --note "Host completed the scoped fallback" --json
 rolemux list --json
 ```
 
 `status` is compact unless `--full` is supplied. Ctrl+C, SIGTERM, and provider
 timeouts save a resumable retry when a durable session exists. RoleMux fails
 closed instead of replaying a turn in a fresh conversation.
+`list --json` is a compact task index; query one task with `status` or `usage`
+instead of loading every task's findings, profiles, and counters.
+
+Budget extension and adoption are provider-free recovery actions. Extending a
+budget never starts work; inspect the state and issue `retry`. Adoption is only
+allowed at an interrupted implementation boundary with a previously captured
+scope/baseline and a nonblank audit note. It captures the current scoped delta
+for ordinary review; it cannot replace approved or approval-pending code.
 
 ## Usage accounting
 
-`status` and `usage` persist the same per-role usage fields. `requests` is one
-host-measured count per adapter invocation, and `prompt_bytes` is the byte
-length of the actual request prompt after any initial capability note is
-inserted. Provider response values cannot inflate either host counter.
+`status` and `usage` persist the same per-role usage fields. `requests` is the
+backward-compatible JSON name for host-measured provider invocations.
+`agent_turns` counts observed model turns (`codex` is a conservative estimate
+because its CLI does not expose the internal count), `tool_calls` counts
+observed tool starts, and `prompt_bytes` is the actual request size after any
+initial capability note is inserted. Provider response values cannot inflate
+host-owned invocation or prompt counters.
 
 Token fields (`input_tokens`, `cached_input_tokens`, `cache_write_tokens`,
 `output_tokens`, `reasoning_tokens`, and `total_tokens`) are retained exactly
@@ -336,10 +410,10 @@ Workers do not commit, push, stash, reset, rebase, merge, or create worktrees.
 
 ## Skills and host handoffs
 
-On each role's first turn, RoleMux sends a bounded inventory of available skill
-names, descriptions, tools, provider scope, and installed helpers. It does not
-copy skill bodies, credentials, environment values, or the inventory again on
-resumed turns.
+On each role's first turn, RoleMux sends a task-ranked, bounded inventory of
+relevant skill names, descriptions, tools, provider scope, and installed
+helpers. It does not copy skill bodies, credentials, environment values, or the
+inventory again on resumed turns.
 
 When a capability exists only in the host—such as a UI tool or connector—the
 worker returns a precise question. The orchestrator gathers the evidence and
@@ -359,9 +433,8 @@ idempotent success.
 
 For eligible Claude and Codex task turns, RoleMux can start a private foreground
 [pxpipe](https://github.com/teamchong/pxpipe) process and prints its temporary
-dashboard and event-log paths. No
-separately managed daemon is required. Authentication and model discovery still
-go directly to the provider.
+dashboard and event-log paths. No separately managed daemon is required.
+Authentication and model discovery still go directly to the provider.
 
 If pxpipe is missing or cannot start, RoleMux reports or suggests installation
 once and safely uses the provider directly. Model eligibility and actual savings
@@ -371,8 +444,11 @@ come from pxpipe itself; verify them with:
 pxpipe stats --file <events-file>
 ```
 
-RoleMux does not claim compression when no matching event exists and never
-changes the selected model to enable pxpipe.
+After each wrapped turn, stderr reports the actual pxpipe event mode, model,
+compression flag, and savings when supplied. `mode=text` is explicitly labeled
+pass-through; `mode=image` confirms image transport. RoleMux does not assume
+Luna, Sol, Astra, or any other model is eligible, does not claim compression
+without a matching event, and never changes the selected model to enable it.
 
 ## Provider boundaries
 

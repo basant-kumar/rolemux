@@ -22,6 +22,7 @@ import (
 	"github.com/basant-kumar/rolemux/internal/config"
 	"github.com/basant-kumar/rolemux/internal/install"
 	"github.com/basant-kumar/rolemux/internal/picker"
+	"github.com/basant-kumar/rolemux/internal/reviewhost"
 	"github.com/basant-kumar/rolemux/internal/runner"
 	"github.com/basant-kumar/rolemux/internal/task"
 	"github.com/basant-kumar/rolemux/internal/workflow"
@@ -44,17 +45,24 @@ Usage:
   rolemux plan start --task TEXT [--id TASK-ID] [--json]
   rolemux plan answer TASK-ID --answer TEXT [--json]
   rolemux plan review TASK-ID [--json]
-  rolemux plan graph TASK-ID [--json]
+  rolemux plan graph TASK-ID [--full] [--json]
   rolemux quick start --task TEXT --scope PATH[,PATH...] [--id TASK-ID] [--json]
   rolemux work start TASK-ID UNIT-ID [--json]
   rolemux work integrate TASK-ID [--json]
+  rolemux work adopt TASK-ID --note TEXT [--json]
   rolemux implement TASK-ID [--scope PATH[,PATH...]] [--json]
   rolemux implement answer TASK-ID --answer TEXT [--json]
   rolemux code review TASK-ID [--json]
   rolemux approval show TASK-ID [--json]
+  rolemux approval publish TASK-ID [--json]
+  rolemux approval sync TASK-ID [--json]
   rolemux approval respond TASK-ID --gate GATE-ID
                            --decision approve|request_changes|discuss
                            [--feedback TEXT] [--json]
+  rolemux budget show TASK-ID [--json]
+  rolemux budget extend TASK-ID --role ROLE
+                        [--turns N] [--tool-calls N] [--timeout-seconds N]
+                        [--output-bytes N] [--json]
   rolemux status TASK-ID [--full] [--json]
   rolemux usage TASK-ID [--json]
   rolemux retry TASK-ID [--json]
@@ -119,6 +127,8 @@ func (a *app) run(args []string) int {
 		return a.runCode(args[1:])
 	case "approval":
 		return a.runApproval(args[1:])
+	case "budget":
+		return a.runBudget(args[1:])
 	case "status":
 		return a.runStatus(args[1:])
 	case "usage":
@@ -1086,7 +1096,7 @@ func (a *app) runPlan(args []string) int {
 		result, callErr := service.ReviewPlan(a.ctx, opts.positionals[0])
 		return a.workflowResult("plan-review", result, callErr, opts.json())
 	case "graph":
-		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		opts, err := parse(args[1:], map[string]bool{"--json": false, "--full": false})
 		if err != nil || len(opts.positionals) != 1 {
 			if err == nil {
 				err = usage("plan graph requires TASK-ID")
@@ -1102,7 +1112,10 @@ func (a *app) runPlan(args []string) int {
 			return a.fail("plan-graph", graphErr, opts.json(), workflow.Result{})
 		}
 		if opts.json() {
-			return a.success("plan-graph", graph, nil, nil, true)
+			if opts.bool("--full") {
+				return a.success("plan-graph", graph, nil, nil, true)
+			}
+			return a.success("plan-graph", compactGraph(graph), nil, nil, true)
 		}
 		printWorkGraph(a.out, graph)
 		return workflow.ExitOK
@@ -1145,9 +1158,107 @@ func (a *app) runWork(args []string) int {
 		}
 		result, callErr := service.ReviewIntegration(a.ctx, opts.positionals[0])
 		return a.workflowResult("work-integrate", result, callErr, opts.json())
+	case "adopt":
+		opts, err := parse(args[1:], map[string]bool{"--json": false, "--note": true})
+		if err != nil || len(opts.positionals) != 1 || !opts.present("--note") {
+			if err == nil {
+				err = usage("work adopt requires TASK-ID and --note")
+			}
+			return a.fail("work-adopt", err, opts.json(), workflow.Result{})
+		}
+		service, err := a.providerFreeWorkflowServiceForTask(opts.positionals[0])
+		if err != nil {
+			return a.fail("work-adopt", err, opts.json(), workflow.Result{})
+		}
+		result, callErr := service.Adopt(opts.positionals[0], opts.value("--note"))
+		return a.workflowResult("work-adopt", result, callErr, opts.json())
 	default:
 		return a.fail("work", usage("unknown work command %q", args[0]), jsonMode, workflow.Result{})
 	}
+}
+
+func (a *app) runBudget(args []string) int {
+	jsonMode := containsFlag(args, "--json")
+	if len(args) == 0 {
+		return a.fail("budget", usage("budget requires show or extend"), jsonMode, workflow.Result{})
+	}
+	switch args[0] {
+	case "show":
+		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		if err != nil || len(opts.positionals) != 1 {
+			if err == nil {
+				err = usage("budget show requires TASK-ID")
+			}
+			return a.fail("budget-show", err, opts.json(), workflow.Result{})
+		}
+		service, err := a.providerFreeWorkflowServiceForTask(opts.positionals[0])
+		if err != nil {
+			return a.fail("budget-show", err, opts.json(), workflow.Result{})
+		}
+		budgets, err := service.Budget(opts.positionals[0])
+		if err != nil {
+			return a.fail("budget-show", err, opts.json(), workflow.Result{})
+		}
+		if opts.json() {
+			return a.success("budget-show", map[string]any{"task_id": opts.positionals[0], "budgets": budgets}, nil, nil, true)
+		}
+		printBudgets(a.out, budgets)
+		return workflow.ExitOK
+	case "extend":
+		opts, err := parse(args[1:], map[string]bool{"--json": false, "--role": true, "--turns": true, "--tool-calls": true, "--timeout-seconds": true, "--output-bytes": true})
+		if err != nil || len(opts.positionals) != 1 || !opts.present("--role") {
+			if err == nil {
+				err = usage("budget extend requires TASK-ID, --role, and at least one limit")
+			}
+			return a.fail("budget-extend", err, opts.json(), workflow.Result{})
+		}
+		turns, err := nonnegativeOption(opts, "--turns")
+		if err != nil {
+			return a.fail("budget-extend", err, opts.json(), workflow.Result{})
+		}
+		tools, err := nonnegativeOption(opts, "--tool-calls")
+		if err != nil {
+			return a.fail("budget-extend", err, opts.json(), workflow.Result{})
+		}
+		timeout, err := nonnegativeOption(opts, "--timeout-seconds")
+		if err != nil {
+			return a.fail("budget-extend", err, opts.json(), workflow.Result{})
+		}
+		outputBytes, err := nonnegativeInt64Option(opts, "--output-bytes")
+		if err != nil {
+			return a.fail("budget-extend", err, opts.json(), workflow.Result{})
+		}
+		service, err := a.providerFreeWorkflowServiceForTask(opts.positionals[0])
+		if err != nil {
+			return a.fail("budget-extend", err, opts.json(), workflow.Result{})
+		}
+		result, callErr := service.ExtendBudget(opts.positionals[0], opts.value("--role"), turns, tools, timeout, outputBytes)
+		return a.workflowResult("budget-extend", result, callErr, opts.json())
+	default:
+		return a.fail("budget", usage("unknown budget command %q", args[0]), jsonMode, workflow.Result{})
+	}
+}
+
+func nonnegativeOption(opts options, name string) (int, error) {
+	if !opts.present(name) {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(opts.value(name))
+	if err != nil || value < 0 {
+		return 0, usage("%s must be a nonnegative integer", name)
+	}
+	return value, nil
+}
+
+func nonnegativeInt64Option(opts options, name string) (int64, error) {
+	if !opts.present(name) {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(opts.value(name), 10, 64)
+	if err != nil || value < 0 {
+		return 0, usage("%s must be a nonnegative integer", name)
+	}
+	return value, nil
 }
 
 func (a *app) runImplement(args []string) int {
@@ -1204,7 +1315,7 @@ func (a *app) runCode(args []string) int {
 func (a *app) runApproval(args []string) int {
 	jsonMode := containsFlag(args, "--json")
 	if len(args) == 0 {
-		return a.fail("approval", usage("approval requires show or respond"), jsonMode, workflow.Result{})
+		return a.fail("approval", usage("approval requires show, publish, sync, or respond"), jsonMode, workflow.Result{})
 	}
 	switch args[0] {
 	case "show":
@@ -1232,6 +1343,66 @@ func (a *app) runApproval(args []string) int {
 			return a.fail("approval-show", &commandError{code: "NO_PENDING_APPROVAL", text: fmt.Sprintf("task %q has no pending human approval", id), exit: workflow.ExitUsage}, opts.json(), workflow.Result{State: state})
 		}
 		return a.pendingApproval("approval-show", state, control, opts.json())
+	case "publish":
+		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		if err != nil || len(opts.positionals) != 1 {
+			if err == nil {
+				err = usage("approval publish requires TASK-ID")
+			}
+			return a.fail("approval-publish", err, opts.json(), workflow.Result{})
+		}
+		id := opts.positionals[0]
+		service, err := a.providerFreeWorkflowServiceForTask(id)
+		if err != nil {
+			return a.fail("approval-publish", err, opts.json(), workflow.Result{})
+		}
+		host, hostErr := reviewhost.NewGitHub(service.RepoRoot, a.environ)
+		if hostErr != nil {
+			return a.fail("approval-publish", action("GITHUB_REVIEW_UNAVAILABLE", hostErr.Error()+"; inspect the changed files locally"), opts.json(), workflow.Result{})
+		}
+		service.ReviewHost = host
+		result, review, callErr := service.PublishApprovalReview(a.ctx, id)
+		if callErr != nil {
+			return a.fail("approval-publish", callErr, opts.json(), result)
+		}
+		payload := map[string]any{"status": "published", "review": review, "control": workflow.ControlFor(result.State)}
+		if opts.json() {
+			return a.success("approval-publish", payload, &result.State, result.State.Advisories, true)
+		}
+		fmt.Fprintf(a.out, "draft PR: %s\n", review.URL)
+		fmt.Fprintf(a.out, "comment on GitHub, then import requested changes: rolemux approval sync %s\n", id)
+		fmt.Fprintf(a.out, "approve after review: rolemux approval respond %s --gate %s --decision approve\n", id, result.State.Approval.GateID)
+		return workflow.ExitOK
+	case "sync":
+		opts, err := parse(args[1:], map[string]bool{"--json": false})
+		if err != nil || len(opts.positionals) != 1 {
+			if err == nil {
+				err = usage("approval sync requires TASK-ID")
+			}
+			return a.fail("approval-sync", err, opts.json(), workflow.Result{})
+		}
+		id := opts.positionals[0]
+		service, err := a.workflowServiceForTask(id)
+		if err != nil {
+			return a.fail("approval-sync", err, opts.json(), workflow.Result{})
+		}
+		host, hostErr := reviewhost.NewGitHub(service.RepoRoot, a.environ)
+		if hostErr != nil {
+			return a.fail("approval-sync", action("GITHUB_REVIEW_UNAVAILABLE", hostErr.Error()), opts.json(), workflow.Result{})
+		}
+		service.ReviewHost = host
+		result, callErr := service.SyncApprovalReview(a.ctx, id)
+		if callErr != nil {
+			return a.workflowResult("approval-sync", result, callErr, opts.json())
+		}
+		if result.Status == "no_feedback" {
+			if opts.json() {
+				return a.success("approval-sync", map[string]any{"status": "no_feedback", "control": workflow.ControlFor(result.State)}, &result.State, result.State.Advisories, true)
+			}
+			fmt.Fprintln(a.out, "No new GitHub review comments were found; the human approval gate remains open.")
+			return workflow.ExitOK
+		}
+		return a.workflowResult("approval-sync", result, nil, opts.json())
 	case "respond":
 		opts, err := parse(args[1:], map[string]bool{"--json": false, "--gate": true, "--decision": true, "--feedback": true})
 		if err != nil || len(opts.positionals) != 1 || !opts.present("--gate") || !opts.present("--decision") {
@@ -1363,9 +1534,9 @@ func (a *app) runList(args []string) int {
 		return a.fail("list", listErr, opts.json(), workflow.Result{})
 	}
 	if opts.json() {
-		tasks := make([]statusSummary, 0, len(states))
+		tasks := make([]listTaskSummary, 0, len(states))
 		for _, state := range states {
-			tasks = append(tasks, compactStatus(state))
+			tasks = append(tasks, compactListTask(state))
 		}
 		return a.success("list", map[string]any{"tasks": tasks}, nil, nil, true)
 	}
@@ -1756,6 +1927,25 @@ type operationSummary struct {
 	Loop         string    `json:"loop,omitempty"`
 }
 
+type listTaskSummary struct {
+	ID                string    `json:"id"`
+	Phase             string    `json:"phase"`
+	Status            string    `json:"status"`
+	NextAction        string    `json:"next_action"`
+	ReviewKind        string    `json:"review_kind,omitempty"`
+	PlanRound         int       `json:"plan_round,omitempty"`
+	CodeRound         int       `json:"code_round,omitempty"`
+	ParentTaskID      string    `json:"parent_task_id,omitempty"`
+	WorkUnitID        string    `json:"work_unit_id,omitempty"`
+	IntegrationReview bool      `json:"integration_review,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+func compactListTask(st task.State) listTaskSummary {
+	control := workflow.ControlFor(st)
+	return listTaskSummary{ID: st.ID, Phase: st.Phase, Status: control.Status, NextAction: control.NextAction, ReviewKind: control.ReviewKind, PlanRound: st.PlanRound, CodeRound: st.CodeRound, ParentTaskID: st.ParentTaskID, WorkUnitID: st.WorkUnitID, IntegrationReview: st.IntegrationReview, UpdatedAt: st.UpdatedAt}
+}
+
 type statusSummary struct {
 	workflow.Control
 	ID                    string                          `json:"id"`
@@ -1906,6 +2096,7 @@ func (a *app) workflowResult(command string, result workflow.Result, err error, 
 	}
 	control := compactWorkflowResult(result, nil)
 	fmt.Fprintf(a.out, "task: %s\nphase: %s\nstatus: %s\nnext action: %s\n", result.State.ID, result.State.Phase, control.Status, control.NextAction)
+	printWorkflowEvents(a.out, control.Events)
 	for _, advisory := range result.State.Advisories {
 		fmt.Fprintf(a.errOut, "warning: %s: %s\n", advisory.Code, advisory.Message)
 	}
@@ -1928,6 +2119,7 @@ func (a *app) pendingApproval(command string, state task.State, control workflow
 		}
 		return workflow.ExitNeedsInput
 	}
+	printWorkflowEvents(a.out, control.Events)
 	printApprovalControl(a.out, state.ID, control)
 	return workflow.ExitNeedsInput
 }
@@ -1974,10 +2166,27 @@ func (a *app) fail(command string, err error, jsonMode bool, result workflow.Res
 		}
 	} else {
 		fmt.Fprintf(a.errOut, "rolemux: %s: %s\n", code, message)
+		if result.State.ID != "" {
+			printWorkflowEvents(a.out, workflow.ControlFor(result.State).Events)
+		}
 		if code == workflow.ApprovalRequiredCode && result.State.ID != "" {
 			printApprovalControl(a.out, result.State.ID, workflow.ControlFor(result.State))
 		} else if code == "NEEDS_INPUT" && result.State.ID != "" {
 			fmt.Fprintf(a.out, "%s\t%s\n", result.State.ID, result.State.PendingQuestion)
+		} else if code == "BUDGET_EXHAUSTED" && result.State.ID != "" {
+			issue := result.State.BudgetIssue
+			if issue != nil {
+				flag, amount := "--turns", "1"
+				switch issue.Kind {
+				case "tool_calls":
+					flag, amount = "--tool-calls", "1"
+				case "timeout_seconds":
+					flag, amount = "--timeout-seconds", "60"
+				case "output_bytes":
+					flag, amount = "--output-bytes", "1048576"
+				}
+				fmt.Fprintf(a.out, "next step: inspect partial work, then run rolemux budget extend %s --role %s %s %s and rolemux retry %s\n", result.State.ID, issue.Role, flag, amount, result.State.ID)
+			}
 		}
 	}
 	return exit
@@ -2014,6 +2223,8 @@ func statusForError(err error) string {
 		return "exhausted"
 	case "OPERATION_IN_FLIGHT":
 		return "in_flight"
+	case "BUDGET_EXHAUSTED":
+		return "budget_exhausted"
 	}
 	switch exit {
 	case workflow.ExitNeedsInput:
@@ -2102,6 +2313,14 @@ func printState(out io.Writer, st task.State) {
 	if st.Retry != nil {
 		fmt.Fprintf(out, "retry: %s (%s)\n", st.Retry.Operation, st.Retry.Role)
 	}
+	if st.Progress != nil {
+		fmt.Fprintf(out, "progress: role=%s operation=%s agent_turns=%d tool_calls=%d active=%t", st.Progress.Role, st.Progress.Operation, st.Progress.AgentTurns, st.Progress.ToolCalls, st.Progress.Active)
+		if st.Progress.LastTool != "" {
+			fmt.Fprintf(out, " last_tool=%s", st.Progress.LastTool)
+		}
+		fmt.Fprintln(out)
+	}
+	printWorkflowEvents(out, control.Events)
 	roles := make([]string, 0, len(st.Usage))
 	for role := range st.Usage {
 		roles = append(roles, role)
@@ -2109,7 +2328,7 @@ func printState(out io.Writer, st task.State) {
 	sort.Strings(roles)
 	for _, role := range roles {
 		u := st.Usage[role]
-		fmt.Fprintf(out, "usage %s: requests=%d prompt_bytes=%d input=%d cached=%d cache_write=%d output=%d reasoning=%d total=%d unreported=%d incomplete=%d", role, u.Requests, u.PromptBytes, u.InputTokens, u.CachedInputTokens, u.CacheWriteTokens, u.OutputTokens, u.ReasoningTokens, u.TotalTokens, u.UnreportedRequests, u.IncompleteRequests)
+		fmt.Fprintf(out, "usage %s: provider_invocations=%d agent_turns=%d tool_calls=%d prompt_bytes=%d input=%d cached=%d cache_write=%d output=%d reasoning=%d total=%d unreported=%d incomplete=%d", role, u.Requests, u.AgentTurns, u.ToolCalls, u.PromptBytes, u.InputTokens, u.CachedInputTokens, u.CacheWriteTokens, u.OutputTokens, u.ReasoningTokens, u.TotalTokens, u.UnreportedRequests, u.IncompleteRequests)
 		if label := usageLabel(u); label != "" {
 			fmt.Fprintf(out, " (%s)", label)
 		}
@@ -2146,6 +2365,25 @@ func printApprovalControl(out io.Writer, requestedID string, control workflow.Co
 			}
 		}
 	}
+	if control.ApprovalKind == string(task.ApprovalKindCode) {
+		paths := make([]string, 0, len(control.ChangedFiles))
+		for _, file := range control.ChangedFiles {
+			paths = append(paths, shellQuote(file.Path))
+		}
+		if len(paths) > 0 {
+			fmt.Fprintf(out, "review locally (status): git status --short -- %s\n", strings.Join(paths, " "))
+			fmt.Fprintf(out, "review locally (tracked diff): git diff HEAD -- %s\n", strings.Join(paths, " "))
+		}
+		if control.ExternalReview == nil {
+			fmt.Fprintf(out, "review on GitHub: rolemux approval publish %s\n", ownerID)
+		} else {
+			fmt.Fprintf(out, "GitHub draft PR: %s\n", control.ExternalReview.URL)
+			if control.ReviewOutdated {
+				fmt.Fprintf(out, "update GitHub draft: rolemux approval publish %s\n", ownerID)
+			}
+			fmt.Fprintf(out, "import PR comments as requested changes: rolemux approval sync %s\n", ownerID)
+		}
+	}
 	if len(control.Choices) > 0 {
 		fmt.Fprintln(out, "choices:")
 		for _, choice := range control.Choices {
@@ -2158,17 +2396,29 @@ func printApprovalControl(out io.Writer, requestedID string, control workflow.Co
 	fmt.Fprintf(out, "discuss: rolemux approval respond %s --gate %s --decision discuss\n", ownerID, control.ApprovalID)
 }
 
+func shellQuote(value string) string {
+	if value != "" && strings.IndexFunc(value, func(r rune) bool {
+		return !(r == '/' || r == '.' || r == '_' || r == '-' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
+	}) < 0 {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
 func printWorkGraph(out io.Writer, graph workflow.WorkGraph) {
 	fmt.Fprintf(out, "task: %s\nphase: %s\n", graph.TaskID, graph.Phase)
 	fmt.Fprintf(out, "status: %s\nnext action: %s\n", graph.Control.Status, graph.Control.NextAction)
 	if graph.Complexity != "" {
 		fmt.Fprintf(out, "complexity: %s\n", graph.Complexity)
 	}
+	if len(graph.CriticalPath) > 0 {
+		fmt.Fprintf(out, "critical path: %s (%d estimated minutes)\n", strings.Join(graph.CriticalPath, " -> "), graph.CriticalPathMinutes)
+	}
 	for index, wave := range graph.Waves {
 		fmt.Fprintf(out, "wave %d: %s\n", index+1, strings.Join(wave, ", "))
 	}
 	for _, node := range graph.Nodes {
-		fmt.Fprintf(out, "%s\t%s\t%s\tscope=%s", node.ID, node.Status, node.TaskID, node.Scope)
+		fmt.Fprintf(out, "%s\t%s\t%s\tscope=%s\tcontext=%s\testimate=%dm", node.ID, node.Status, node.TaskID, node.Scope, node.ContextGroup, node.EstimatedMinutes)
 		if len(node.BlockedBy) > 0 {
 			fmt.Fprintf(out, "\tblocked_by=%s", strings.Join(node.BlockedBy, ","))
 		}
@@ -2177,6 +2427,71 @@ func printWorkGraph(out io.Writer, graph workflow.WorkGraph) {
 	if graph.Control.Status == "approval_required" {
 		fmt.Fprintln(out)
 		printApprovalControl(out, graph.TaskID, graph.Control)
+	}
+}
+
+type compactWorkNode struct {
+	ID               string   `json:"id"`
+	Objective        string   `json:"objective"`
+	TaskID           string   `json:"task_id"`
+	Status           string   `json:"status"`
+	Ready            bool     `json:"ready"`
+	BlockedBy        []string `json:"blocked_by,omitempty"`
+	Scope            string   `json:"scope"`
+	ContextGroup     string   `json:"context_group"`
+	EstimatedMinutes int      `json:"estimated_minutes"`
+}
+
+type compactWorkGraph struct {
+	TaskID              string            `json:"task_id"`
+	Phase               string            `json:"phase"`
+	Complexity          string            `json:"complexity,omitempty"`
+	Waves               [][]string        `json:"waves"`
+	Ready               []string          `json:"ready"`
+	CriticalPath        []string          `json:"critical_path,omitempty"`
+	CriticalPathMinutes int               `json:"critical_path_minutes,omitempty"`
+	Nodes               []compactWorkNode `json:"nodes"`
+	Control             workflow.Control  `json:"control"`
+}
+
+func compactGraph(graph workflow.WorkGraph) compactWorkGraph {
+	result := compactWorkGraph{TaskID: graph.TaskID, Phase: graph.Phase, Complexity: graph.Complexity, Waves: graph.Waves, Ready: graph.Ready, CriticalPath: graph.CriticalPath, CriticalPathMinutes: graph.CriticalPathMinutes, Control: graph.Control, Nodes: make([]compactWorkNode, 0, len(graph.Nodes))}
+	for _, node := range graph.Nodes {
+		result.Nodes = append(result.Nodes, compactWorkNode{ID: node.ID, Objective: node.Objective, TaskID: node.TaskID, Status: node.Status, Ready: node.Ready, BlockedBy: node.BlockedBy, Scope: node.Scope, ContextGroup: node.ContextGroup, EstimatedMinutes: node.EstimatedMinutes})
+	}
+	return result
+}
+
+func printWorkflowEvents(out io.Writer, events []task.WorkflowEvent) {
+	for _, event := range events {
+		fmt.Fprintf(out, "event: %s", event.Message)
+		if event.Round > 0 {
+			fmt.Fprintf(out, " (round %d)", event.Round)
+		}
+		fmt.Fprintln(out)
+		for _, finding := range event.Findings {
+			location := finding.Path
+			if finding.Line > 0 {
+				location += ":" + strconv.Itoa(finding.Line)
+			}
+			if location != "" {
+				fmt.Fprintf(out, "  - [%s] %s: %s\n", finding.Severity, location, finding.Message)
+			} else {
+				fmt.Fprintf(out, "  - [%s] %s\n", finding.Severity, finding.Message)
+			}
+		}
+	}
+}
+
+func printBudgets(out io.Writer, budgets map[string]task.RoleBudget) {
+	roles := make([]string, 0, len(budgets))
+	for role := range budgets {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	for _, role := range roles {
+		budget := budgets[role]
+		fmt.Fprintf(out, "%s\tturns=%d\ttools/turn=%d\ttimeout=%ds\toutput=%d bytes\n", role, budget.MaxTurns, budget.MaxToolCalls, budget.TimeoutSeconds, budget.MaxOutputBytes)
 	}
 }
 
@@ -2193,8 +2508,8 @@ func printUsage(out io.Writer, summary usageSummary) {
 		if role.Speed != "" {
 			profile += " [" + role.Speed + "]"
 		}
-		fmt.Fprintf(out, "%s [%s]: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d unreported=%d incomplete=%d",
-			role.Role, profile, role.Requests, role.InputTokens, role.CachedInputTokens,
+		fmt.Fprintf(out, "%s [%s]: provider_invocations=%d agent_turns=%d tool_calls=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d unreported=%d incomplete=%d",
+			role.Role, profile, role.Requests, role.AgentTurns, role.ToolCalls, role.InputTokens, role.CachedInputTokens,
 			role.UncachedInputTokens, role.OutputTokens, role.ReasoningTokens,
 			role.TotalTokens, role.PromptBytes, role.UnreportedRequests, role.IncompleteRequests)
 		if label := usageLabel(role.TokenUsage); label != "" {
@@ -2203,8 +2518,8 @@ func printUsage(out io.Writer, summary usageSummary) {
 		fmt.Fprintln(out)
 	}
 	t := summary.Totals
-	fmt.Fprintf(out, "total: requests=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d unreported=%d incomplete=%d",
-		t.Requests, t.InputTokens, t.CachedInputTokens, t.UncachedInputTokens,
+	fmt.Fprintf(out, "total: provider_invocations=%d agent_turns=%d tool_calls=%d input=%d cached=%d uncached=%d output=%d reasoning=%d total=%d prompt_bytes=%d unreported=%d incomplete=%d",
+		t.Requests, t.AgentTurns, t.ToolCalls, t.InputTokens, t.CachedInputTokens, t.UncachedInputTokens,
 		t.OutputTokens, t.ReasoningTokens, t.TotalTokens, t.PromptBytes, t.UnreportedRequests, t.IncompleteRequests)
 	if label := usageLabel(t.TokenUsage); label != "" {
 		fmt.Fprintf(out, " (%s)", label)

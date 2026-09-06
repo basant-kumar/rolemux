@@ -19,6 +19,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	providerid "github.com/basant-kumar/rolemux/internal/provider"
+	"github.com/basant-kumar/rolemux/internal/task"
 )
 
 var (
@@ -148,6 +149,7 @@ type Config struct {
 	CatalogTTLSeconds          int                               `toml:"catalog_ttl_seconds,omitempty" json:"catalog_ttl_seconds,omitempty"`
 	ProviderTurnTimeoutSeconds int                               `toml:"provider_turn_timeout_seconds,omitempty" json:"provider_turn_timeout_seconds,omitempty"`
 	ReviewMaxRounds            *int                              `toml:"review_max_rounds,omitempty" json:"review_max_rounds,omitempty"`
+	Budgets                    map[string]task.RoleBudget        `toml:"budgets,omitempty" json:"budgets,omitempty"`
 	Raw                        map[string]any                    `toml:"-" json:"-"`
 }
 
@@ -162,7 +164,29 @@ func Default() Config {
 		Providers: map[string]Provider{}, Models: map[string]map[string]CustomModel{},
 		CatalogTTLSeconds: 86400, ProviderTurnTimeoutSeconds: 900,
 		ReviewMaxRounds: &reviewMaxRounds,
+		Budgets: map[string]task.RoleBudget{
+			RolePlanner:     {MaxTurns: 20, MaxToolCalls: 20, TimeoutSeconds: 300, MaxOutputBytes: 8 << 20},
+			RoleImplementer: {MaxTurns: 20, MaxToolCalls: 12, TimeoutSeconds: 300, MaxOutputBytes: 8 << 20},
+			RoleReviewer:    {MaxTurns: 20, MaxToolCalls: 3, TimeoutSeconds: 180, MaxOutputBytes: 4 << 20},
+		},
 	}
+}
+
+// EffectiveBudgets expands the shared reviewer budget exactly like profiles.
+func (c Config) EffectiveBudgets() map[string]task.RoleBudget {
+	result := map[string]task.RoleBudget{}
+	for _, role := range []string{RolePlanner, RoleImplementer} {
+		result[role] = c.Budgets[role]
+	}
+	reviewer := c.Budgets[RoleReviewer]
+	result[RolePlanReviewer], result[RoleCodeReviewer] = reviewer, reviewer
+	if budget, ok := c.Budgets[RolePlanReviewer]; ok {
+		result[RolePlanReviewer] = budget
+	}
+	if budget, ok := c.Budgets[RoleCodeReviewer]; ok {
+		result[RoleCodeReviewer] = budget
+	}
+	return result
 }
 
 func (c Config) EffectiveReviewMaxRounds() int {
@@ -420,6 +444,25 @@ func merge(dst *Config, src Config) {
 		reviewMaxRounds := *src.ReviewMaxRounds
 		dst.ReviewMaxRounds = &reviewMaxRounds
 	}
+	if dst.Budgets == nil {
+		dst.Budgets = map[string]task.RoleBudget{}
+	}
+	for role, budget := range src.Budgets {
+		current := dst.Budgets[role]
+		if budget.MaxTurns != 0 {
+			current.MaxTurns = budget.MaxTurns
+		}
+		if budget.MaxToolCalls != 0 {
+			current.MaxToolCalls = budget.MaxToolCalls
+		}
+		if budget.TimeoutSeconds != 0 {
+			current.TimeoutSeconds = budget.TimeoutSeconds
+		}
+		if budget.MaxOutputBytes != 0 {
+			current.MaxOutputBytes = budget.MaxOutputBytes
+		}
+		dst.Budgets[role] = current
+	}
 }
 
 func mergeProvider(dst *Provider, src Provider) {
@@ -594,6 +637,21 @@ func Validate(c Config) error {
 	}
 	if c.ReviewMaxRounds != nil && *c.ReviewMaxRounds < 0 {
 		return errors.New("review_max_rounds must not be negative")
+	}
+	for role, budget := range c.Budgets {
+		canonical, err := CanonicalRole(role)
+		if err != nil || canonical == RoleReviewer && role != RoleReviewer {
+			return fmt.Errorf("invalid budget role %q", role)
+		}
+		if budget.MaxTurns < 0 || budget.MaxToolCalls < 0 || budget.MaxOutputBytes < 0 {
+			return fmt.Errorf("budget %s limits must not be negative", role)
+		}
+		if budget.TimeoutSeconds != 0 && (budget.TimeoutSeconds < 30 || budget.TimeoutSeconds > 7200) {
+			return fmt.Errorf("budget %s timeout_seconds must be between 30 and 7200", role)
+		}
+		if budget.MaxOutputBytes != 0 && budget.MaxOutputBytes < 64<<10 {
+			return fmt.Errorf("budget %s max_output_bytes must be at least 65536", role)
+		}
 	}
 	for name, p := range c.Providers {
 		if !providerNamePattern.MatchString(name) {
@@ -1059,6 +1117,9 @@ func ImportConfigAtomic(name string, data []byte, beforeHash string) error {
 	if _, ok := source["review_max_rounds"]; ok && fragment.ReviewMaxRounds != nil {
 		destination["review_max_rounds"] = *fragment.ReviewMaxRounds
 	}
+	if _, ok := source["budgets"]; ok {
+		destination["budgets"] = budgetsRaw(fragment.Budgets)
+	}
 	return WriteRawAtomic(name, destination, beforeHash)
 }
 
@@ -1104,6 +1165,9 @@ func WriteConfigAtomic(name string, cfg Config, beforeHash string) error {
 	}
 	if cfg.ReviewMaxRounds != nil {
 		raw["review_max_rounds"] = *cfg.ReviewMaxRounds
+	}
+	if len(cfg.Budgets) > 0 {
+		raw["budgets"] = budgetsRaw(cfg.Budgets)
 	}
 	return WriteRawAtomic(name, raw, beforeHash)
 }
@@ -1267,6 +1331,27 @@ func profilesRaw(profiles map[string]Profile) map[string]any {
 			m["speed"] = p.Speed
 		}
 		out[k] = m
+	}
+	return out
+}
+
+func budgetsRaw(budgets map[string]task.RoleBudget) map[string]any {
+	out := map[string]any{}
+	for role, budget := range budgets {
+		entry := map[string]any{}
+		if budget.MaxTurns != 0 {
+			entry["max_turns"] = budget.MaxTurns
+		}
+		if budget.MaxToolCalls != 0 {
+			entry["max_tool_calls"] = budget.MaxToolCalls
+		}
+		if budget.TimeoutSeconds != 0 {
+			entry["timeout_seconds"] = budget.TimeoutSeconds
+		}
+		if budget.MaxOutputBytes != 0 {
+			entry["max_output_bytes"] = budget.MaxOutputBytes
+		}
+		out[role] = entry
 	}
 	return out
 }

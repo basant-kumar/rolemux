@@ -107,7 +107,7 @@ func TestApprovalDiscussIsReadOnlyAndHumanOutputIsActionable(t *testing.T) {
 		t.Fatalf("human show code=%d stderr=%q output=%s", code, stderr, output)
 	}
 	text := string(output)
-	for _, required := range []string{"review verdict: Approved", "next step: Human code approval", "review artifact:", "Approve (approve)", "Request changes (request_changes)", "Discuss (discuss)", "--gate gate-code-1", "--decision request_changes --feedback"} {
+	for _, required := range []string{"review verdict: Approved", "next step: Human code approval", "review artifact:", "review locally (status):", "review locally (tracked diff):", "review on GitHub: rolemux approval publish", "Approve (approve)", "Request changes (request_changes)", "Discuss (discuss)", "--gate gate-code-1", "--decision request_changes --feedback"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("human output missing %q: %s", required, text)
 		}
@@ -128,6 +128,41 @@ func TestApprovalDiscussIsReadOnlyAndHumanOutputIsActionable(t *testing.T) {
 		beforeJSON, _ := json.Marshal(before)
 		afterJSON, _ := json.Marshal(after)
 		t.Fatalf("discuss mutated state\nbefore=%s\nafter=%s", beforeJSON, afterJSON)
+	}
+}
+
+func TestApprovalShowExposesAttachedGitHubDraftAndStaleness(t *testing.T) {
+	root := cliRepo(t)
+	state := pendingCodeApproval(t, root, "approval-github")
+	state.Approval.ExternalReview = &task.ExternalReview{
+		Provider:                      "github",
+		URL:                           "https://github.com/example/project/pull/7",
+		Number:                        7,
+		Repository:                    "example/project",
+		PublishedCandidateFingerprint: "older-candidate",
+	}
+	if err := task.NewStore(root).Create(state); err != nil {
+		t.Fatal(err)
+	}
+
+	code, output, stderr := runTestApp(t, root, "", "approval", "show", state.ID, "--json")
+	if code != workflow.ExitNeedsInput || stderr != "" {
+		t.Fatalf("show code=%d stderr=%q output=%s", code, stderr, output)
+	}
+	result := decodeSingleObject(t, output)["result"].(map[string]any)
+	review := result["external_review"].(map[string]any)
+	if review["url"] != state.Approval.ExternalReview.URL || result["review_outdated"] != true {
+		t.Fatalf("control=%#v", result)
+	}
+
+	code, output, stderr = runTestApp(t, root, "", "approval", "show", state.ID)
+	if code != workflow.ExitNeedsInput || stderr != "" {
+		t.Fatalf("human show code=%d stderr=%q output=%s", code, stderr, output)
+	}
+	for _, want := range []string{state.Approval.ExternalReview.URL, "update GitHub draft:", "import PR comments as requested changes:"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("human output missing %q: %s", want, output)
+		}
 	}
 }
 
@@ -219,7 +254,7 @@ func TestHelpListsApprovalCommands(t *testing.T) {
 	if code != workflow.ExitOK || stderr != "" {
 		t.Fatalf("help code=%d stderr=%q", code, stderr)
 	}
-	for _, line := range []string{"rolemux approval show TASK-ID", "rolemux approval respond TASK-ID --gate GATE-ID", "--decision approve|request_changes|discuss"} {
+	for _, line := range []string{"rolemux approval show TASK-ID", "rolemux approval publish TASK-ID", "rolemux approval sync TASK-ID", "rolemux approval respond TASK-ID --gate GATE-ID", "--decision approve|request_changes|discuss"} {
 		if !bytes.Contains(output, []byte(line)) {
 			t.Fatalf("help missing %q: %s", line, output)
 		}

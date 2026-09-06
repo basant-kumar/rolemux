@@ -25,6 +25,10 @@ type WorkUnit struct {
 	Objective          string   `json:"objective"`
 	Scope              string   `json:"scope"`
 	DependsOn          []string `json:"depends_on"`
+	ContextGroup       string   `json:"context_group"`
+	ContextFiles       []string `json:"context_files"`
+	AffectedSymbols    []string `json:"affected_symbols"`
+	EstimatedMinutes   int      `json:"estimated_minutes"`
 	ExecutionPacket    string   `json:"execution_packet"`
 	AcceptanceCriteria []string `json:"acceptance_criteria"`
 	ValidationCommands []string `json:"validation_commands"`
@@ -47,6 +51,18 @@ func NormalizeWorkUnits(units []WorkUnit, plan string) ([]WorkUnit, error) {
 		result[i].ID = strings.TrimSpace(unit.ID)
 		result[i].Objective = strings.TrimSpace(unit.Objective)
 		result[i].ExecutionPacket = strings.TrimSpace(unit.ExecutionPacket)
+		result[i].ContextGroup = strings.TrimSpace(unit.ContextGroup)
+		if result[i].ContextGroup == "" {
+			result[i].ContextGroup = result[i].ID
+		}
+		result[i].ContextFiles = cleanStrings(unit.ContextFiles)
+		if len(result[i].ContextFiles) == 0 {
+			result[i].ContextFiles = ScopePatterns(unit.Scope)
+		}
+		result[i].AffectedSymbols = cleanStrings(unit.AffectedSymbols)
+		if result[i].EstimatedMinutes == 0 {
+			result[i].EstimatedMinutes = 5
+		}
 		result[i].DependsOn = cleanStrings(unit.DependsOn)
 		result[i].AcceptanceCriteria = cleanStrings(unit.AcceptanceCriteria)
 		result[i].ValidationCommands = cleanStrings(unit.ValidationCommands)
@@ -138,6 +154,23 @@ func ValidateWorkUnits(units []WorkUnit) error {
 		if unit.Objective == "" || unit.ExecutionPacket == "" || unit.Scope == "" {
 			return fmt.Errorf("work unit %s lacks objective, scope, or execution packet", unit.ID)
 		}
+		if !validWorkUnitID(unit.ContextGroup) {
+			return fmt.Errorf("work unit %s has invalid context group %q", unit.ID, unit.ContextGroup)
+		}
+		if unit.EstimatedMinutes < 1 || unit.EstimatedMinutes > 240 {
+			return fmt.Errorf("work unit %s estimated minutes must be between 1 and 240", unit.ID)
+		}
+		if len(unit.ContextFiles) == 0 {
+			return fmt.Errorf("work unit %s lacks authoritative context files", unit.ID)
+		}
+		for _, path := range unit.ContextFiles {
+			if err := validatePlannerScope(path); err != nil {
+				return fmt.Errorf("work unit %s context file: %w", unit.ID, err)
+			}
+			if _, err := CanonicalScope(path); err != nil {
+				return fmt.Errorf("work unit %s context file: %w", unit.ID, err)
+			}
+		}
 		if len(unit.AcceptanceCriteria) == 0 || len(unit.ValidationCommands) == 0 {
 			return fmt.Errorf("work unit %s lacks acceptance criteria or validation commands", unit.ID)
 		}
@@ -169,6 +202,9 @@ func ValidateWorkUnits(units []WorkUnit) error {
 	for left := 0; left < len(units); left++ {
 		for right := left + 1; right < len(units); right++ {
 			a, b := units[left], units[right]
+			if a.ContextGroup == b.ContextGroup && !workUnitDependsTransitively(byID, a.ID, b.ID) && !workUnitDependsTransitively(byID, b.ID, a.ID) {
+				return fmt.Errorf("context-sharing work units %s and %s must be dependency-ordered", a.ID, b.ID)
+			}
 			if !ScopesOverlap(a.Scope, b.Scope) {
 				continue
 			}
@@ -217,6 +253,57 @@ func WorkUnitWaves(units []WorkUnit) ([][]string, error) {
 		}
 	}
 	return waves, nil
+}
+
+// WorkUnitCriticalPath returns the deterministic longest dependency path by
+// planner-supplied focused minutes. It is scheduling guidance, not a promise.
+func WorkUnitCriticalPath(units []WorkUnit) ([]string, int, error) {
+	if _, err := WorkUnitWaves(units); err != nil {
+		return nil, 0, err
+	}
+	byID := make(map[string]WorkUnit, len(units))
+	for _, unit := range units {
+		byID[unit.ID] = unit
+	}
+	type pathCost struct {
+		path []string
+		cost int
+	}
+	memo := map[string]pathCost{}
+	var visit func(string) pathCost
+	visit = func(id string) pathCost {
+		if value, ok := memo[id]; ok {
+			return value
+		}
+		unit := byID[id]
+		best := pathCost{}
+		for _, dependency := range unit.DependsOn {
+			candidate := visit(dependency)
+			if candidate.cost > best.cost || candidate.cost == best.cost && strings.Join(candidate.path, "\x00") < strings.Join(best.path, "\x00") {
+				best = candidate
+			}
+		}
+		minutes := unit.EstimatedMinutes
+		if minutes <= 0 {
+			minutes = 5
+		}
+		result := pathCost{path: append(append([]string(nil), best.path...), id), cost: best.cost + minutes}
+		memo[id] = result
+		return result
+	}
+	best := pathCost{}
+	ids := make([]string, 0, len(units))
+	for _, unit := range units {
+		ids = append(ids, unit.ID)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		candidate := visit(id)
+		if candidate.cost > best.cost || candidate.cost == best.cost && strings.Join(candidate.path, "\x00") < strings.Join(best.path, "\x00") {
+			best = candidate
+		}
+	}
+	return best.path, best.cost, nil
 }
 
 func WorkTaskID(parentID, unitID string) string {

@@ -102,15 +102,28 @@ func (c *Codex) Run(ctx context.Context, req Request, callbacks Callbacks) (Resp
 		Path: path, Args: args, Dir: req.RepoRoot, Env: env, Stdin: req.Prompt, MaxOutputBytes: req.MaxOutputBytes,
 		StdoutLine: func(line []byte) error {
 			id, err := codexSessionFromLine(line)
-			if err != nil || id == "" {
+			if err != nil {
 				return err
 			}
-			return notifySession(id)
+			if id != "" {
+				if err := notifySession(id); err != nil {
+					return err
+				}
+			}
+			if callbacks.Event != nil {
+				for _, event := range EventsFromLine("codex", line) {
+					if err := callbacks.Event(event); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
 		},
 	}
 	result, processErr := c.runCodexTask(ctx, req, providerSpec, callbacks, schemaName)
 	parseCallbacks := callbacks
 	parseCallbacks.SessionStarted = notifySession
+	parseCallbacks.Event = nil
 	threadID, text, reportedModel, reportedEffort, parseErr := parseCodexOutput(result.Stdout, req.Role, parseCallbacks)
 	usage, usageReported, terminalUsage := codexUsageFromJSONLines(result.Stdout)
 	response := Response{SessionID: threadID, Text: text, ReportedModel: reportedModel, ReportedEffort: reportedEffort, Usage: usage, UsageStatus: usageStatus(usageReported, terminalUsage)}

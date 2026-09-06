@@ -27,7 +27,14 @@ persists the exact provider session used by that role.
    all choices (Approve, Request changes, and Discuss), then wait for an
    explicit human decision. Use `rolemux approval respond` with the exact task
    and gate IDs, one of `approve`, `request_changes`, or `discuss`, and feedback
-   when requesting changes. Never approve automatically. For
+   when requesting changes. Never approve automatically. At a final code gate,
+   also show the path-limited local Git review commands emitted by `approval
+   show`. Offer `rolemux approval publish <task-id>` as an opt-in GitHub draft
+   review when the user wants it; never publish implicitly. After the user adds
+   PR comments, run `rolemux approval sync <task-id>` to import them as requested
+   changes into the same implementer/fixer session. Re-publish after the next
+   model approval to update the same draft. The draft is review-only and must
+   not be merged; RoleMux's explicit approval remains authoritative. For
    `needs_input`, present the question and resume with `rolemux plan answer
    <task-id> --answer "<answer>" --json` or `rolemux implement answer <task-id>
    --answer "<answer>" --json`, according to `pending_question_source`.
@@ -40,10 +47,12 @@ persists the exact provider session used by that role.
    `implement answer`, and
    `retry` also return after their completed operation without automatically
    starting another review.
-6. Read `rolemux plan graph <task-id> --json`. The graph exposes semantic
-   `complexity`: trivial plans have one unit, small at most two, and medium at
-   most six. RoleMux rejects prose-like scope entries and graphs that exceed
-   their declared class. For every ID in `ready`, run
+6. Read the compact `rolemux plan graph <task-id> --json`; use `--full` only
+   when packet internals are genuinely needed. The graph exposes semantic
+   `complexity`, dependency waves, context groups, estimates, and critical path:
+   trivial plans have one unit, small at most two, and medium at most six.
+   RoleMux rejects prose-like scope entries and graphs that exceed their
+   declared class. For every ID in `ready`, run
    `rolemux work start <task-id> <unit-id> --json`, then use the returned work
    task ID with `rolemux implement <work-task-id> --json` and one
    `rolemux code review <work-task-id> --json` command at a time. A code review
@@ -73,7 +82,8 @@ persists the exact provider session used by that role.
 
 The orchestrator may run graph nodes listed as ready concurrently in the same
 checkout. The planner graph supplies exact scopes and RoleMux rejects unsafe
-parallel overlap; dependency edges serialize overlapping work.
+parallel overlap. Dependency-ordered units sharing a `context_group` resume the
+same implementer session; parallel units use separate context groups.
 
 Delegate task source edits and review-fix edits to the RoleMux implementer; do
 not bypass the configured implementation role by patching those scoped files as
@@ -84,6 +94,10 @@ Keep orchestration token-conscious: pass task IDs instead of replaying earlier
 provider output, rely on RoleMux's resumed sessions, and avoid calling `status`
 or refreshing `models` unless the workflow or recovery actually requires it.
 Never omit new user constraints or evidence needed for correctness.
+
+Provider progress is already streamed to stderr and persisted in compact
+`status` as model-turn/tool-call counters. Relay the concise lifecycle and
+review events to the human; never paste raw provider streams back into a model.
 
 The implementer receives an explicit pre-edit discovery budget: at most three
 batched read/search calls over named files and symbols, with no repository-wide
@@ -111,10 +125,15 @@ does not enable passes through unchanged. A missing/incompatible helper or an
 API-key/unknown Codex route falls back to the original direct command. When the
 helper is missing, RoleMux suggests its install command once on the first turn
 of each new eligible provider session and does not repeat it on resumes.
+The post-turn diagnostic is authoritative for transport: `mode=image` confirms
+image transport and `mode=text` means pass-through. Never infer eligibility
+from a model family name; the installed pxpipe and its configuration decide it.
 
 Use `rolemux usage <task-id> --json` for a compact per-role token comparison.
 `rolemux status <task-id> --json` is compact by default; use `--full` only for
 deep diagnostics and never feed full state back into a model unnecessarily.
+Usage distinguishes provider invocations (`requests` in compatibility JSON),
+model turns, tool calls, prompt bytes, and provider-reported token counters.
 
 ## Review limits and host continuation
 
@@ -157,6 +176,7 @@ Use the result as the host decision:
 | `revised` / `fixed` | Issue the matching explicit review; keep dependencies locked. |
 | `needs_input` | Ask `question`, then use `source` with the matching `plan answer` or `implement answer` command. |
 | `review_needed` | Run `rolemux retry` using the exact task ID. |
+| `budget_exhausted` | Inspect partial work, run `rolemux budget show`, explicitly extend only the exhausted role/limit, then `retry` the saved session. |
 | `no_progress` | Inspect the saved candidate and return a deliberate host decision; do not repeat automatically. |
 | `failed` / `in_flight` | Follow recovery metadata: retry a durable failure or wait/inspect an in-flight owner. |
 | `exhausted` | Stop; the configured review ceiling has been reached. |
@@ -176,6 +196,14 @@ or integration review limit was exhausted. Never infer approval from prose or
 continue past a failed review gate.
 RoleMux workers do not commit, push, stash, reset, rebase, or merge. Perform
 repository and build commands separately, within the user's authorization.
+The host-only `approval publish` command is the narrow exception: invoke it
+only after explicit human opt-in to create/update the temporary review PR.
+
+If the orchestrator deliberately completes a narrow fallback after an
+implementer interruption, use `rolemux work adopt <task-id> --note "<audit
+reason>" --json`. This is allowed only with an established scope/baseline and
+moves the captured delta to normal code review; never use it to replace
+approved or approval-pending code.
 
 Use `rolemux models --json` for agent-friendly discovery or `rolemux configure`
 in a terminal for the searchable model picker. The picker reads its

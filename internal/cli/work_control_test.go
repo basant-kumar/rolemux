@@ -283,6 +283,9 @@ func assertCompactStatusResultShape(t *testing.T, result map[string]any) {
 		"pending_question_source": {}, "findings": {}, "profiles": {}, "usage": {},
 		"in_flight": {}, "retry": {}, "updated_at": {}, "parent_task_id": {},
 		"work_unit_id": {}, "integration_review": {}, "work_graph": {},
+		"approval_id": {}, "approval_task_id": {}, "approval_kind": {},
+		"choices": {}, "artifact_path": {}, "changed_files": {}, "events": {},
+		"budget_issue": {}, "progress": {},
 	}
 	for key := range result {
 		if _, ok := allowed[key]; !ok {
@@ -318,7 +321,7 @@ func assertNoInternalPayload(t *testing.T, data []byte, sentinels ...string) {
 		"change_manifest", "review_checkpoint_manifest", "review_checkpoint_manifest_hash",
 		"review_checkpoint_findings", "profiles_snapshot", "runtime_snapshot", "review_policy",
 		"review_progress", "pending_answer", "prompt_inputs", "return_phase", "interrupted_loop",
-		"provider_usage_cumulative", "diagnostics", "retry", "in_flight",
+		"provider_usage_cumulative", "diagnostics", "budgets_snapshot", "retry", "in_flight",
 	} {
 		if strings.Contains(text, `"`+key+`":`) {
 			t.Fatalf("compact payload leaked internal key %q: %s", key, data)

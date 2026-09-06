@@ -42,6 +42,7 @@ type Request struct {
 	Resume           bool
 	Sandbox          string
 	Runtime          task.RuntimeSnapshot
+	Budget           task.RoleBudget
 
 	// MaxOutputBytes is a hard process-output bound. Zero uses a safe default.
 	MaxOutputBytes int64
@@ -71,6 +72,9 @@ type Event struct {
 	SessionID string          `json:"session_id,omitempty"`
 	Model     string          `json:"model,omitempty"`
 	Effort    string          `json:"effort,omitempty"`
+	AgentTurn bool            `json:"agent_turn,omitempty"`
+	ToolCall  bool            `json:"tool_call,omitempty"`
+	ToolName  string          `json:"tool_name,omitempty"`
 	Raw       json.RawMessage `json:"raw,omitempty"`
 }
 
@@ -111,6 +115,20 @@ type Response struct {
 	// conversation rather than only this invocation.
 	UsageCumulative bool `json:"usage_cumulative,omitempty"`
 }
+
+var ErrBudgetExceeded = errors.New("role execution budget exceeded")
+
+type BudgetError struct {
+	Kind     string
+	Limit    int64
+	Observed int64
+}
+
+func (e *BudgetError) Error() string {
+	return fmt.Sprintf("%s: %s budget limit %d exceeded (observed %d)", ErrBudgetExceeded, e.Kind, e.Limit, e.Observed)
+}
+
+func (e *BudgetError) Unwrap() error { return ErrBudgetExceeded }
 
 // UsageFromMap normalizes snake_case and camelCase usage payloads. For OpenAI
 // and Copilot, cached tokens are a subset of input tokens; Anthropic reports

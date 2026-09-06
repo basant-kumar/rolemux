@@ -6,12 +6,49 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/basant-kumar/rolemux/internal/reviewhost"
 	"github.com/basant-kumar/rolemux/internal/runner"
 	"github.com/basant-kumar/rolemux/internal/task"
 )
+
+type fakeExternalReviewHost struct {
+	publishes int
+	feedback  reviewhost.Feedback
+}
+
+func (f *fakeExternalReviewHost) Publish(_ context.Context, st task.State, record task.ApprovalRecord) (task.ExternalReview, error) {
+	f.publishes++
+	review := task.ExternalReview{
+		Provider:                      "github",
+		URL:                           "https://github.com/example/project/pull/7",
+		Number:                        7,
+		Repository:                    "example/project",
+		Remote:                        "origin",
+		BaseBranch:                    "rolemux-review/example-base",
+		HeadBranch:                    "rolemux-review/example-candidate",
+		BaseCommit:                    "base",
+		HeadCommit:                    fmt.Sprintf("candidate-%d", f.publishes),
+		PublishedCandidateFingerprint: record.SubjectFingerprint,
+	}
+	if record.ExternalReview != nil {
+		review = *record.ExternalReview
+		review.HeadCommit = fmt.Sprintf("candidate-%d", f.publishes)
+		review.PublishedCandidateFingerprint = record.SubjectFingerprint
+	}
+	return review, nil
+}
+
+func (f *fakeExternalReviewHost) FetchFeedback(_ context.Context, review task.ExternalReview) (reviewhost.Feedback, error) {
+	result := f.feedback
+	if result.Review.Provider == "" {
+		result.Review = review
+	}
+	return result, nil
+}
 
 func TestHumanPlanAndCodeBoundaries(t *testing.T) {
 	root := workflowRepo(t)
@@ -58,6 +95,92 @@ func TestHumanPlanAndCodeBoundaries(t *testing.T) {
 	completed, err := service.RespondApproval(context.Background(), started.State.ID, codeControl.ApprovalID, task.ApprovalDecisionApprove, "")
 	if err != nil || completed.State.Phase != task.PhaseApproved || completed.State.Approval == nil || completed.State.Approval.Status != task.ApprovalDecisionApprove {
 		t.Fatalf("completed=%#v err=%v", completed, err)
+	}
+}
+
+func TestGitHubReviewFeedbackResumesImplementerAndReusesDraft(t *testing.T) {
+	root := workflowRepo(t)
+	fake := &scriptedAdapter{
+		sessions: map[runner.Role]string{runner.RoleImplementer: "session-implementer"},
+		responses: map[runner.Role][]runner.Envelope{
+			runner.RoleImplementer: {
+				{Role: string(runner.RoleImplementer), Status: "ready"},
+			},
+			runner.RoleCodeReviewer: {
+				{Role: string(runner.RoleCodeReviewer), Verdict: "approved", Findings: []task.Finding{}},
+				{Role: string(runner.RoleCodeReviewer), Verdict: "approved", Findings: []task.Finding{}},
+			},
+		},
+	}
+	fake.hook = func(req runner.Request) {
+		if req.Role == runner.RoleImplementer {
+			if err := os.WriteFile(filepath.Join(root, "app.go"), []byte("package app\n\nconst githubFeedbackFixed = true\n"), 0o600); err != nil {
+				t.Errorf("write feedback candidate: %v", err)
+			}
+		}
+	}
+	host := &fakeExternalReviewHost{}
+	service := New(root, workflowConfig(), map[string]runner.Adapter{"codex": fake})
+	service.ReviewHost = host
+	state := readyCodeState(t, service, "github-human-review", MaxRounds, false)
+	if _, err := service.Store.Update(state.ID, func(current *task.State) error {
+		current.ImplementerSessionID = "session-implementer"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	gate, err := service.ReviewCode(context.Background(), state.ID)
+	if ExitCode(err) != ExitNeedsInput || gate.State.Approval == nil {
+		t.Fatalf("review gate=%#v err=%v", gate, err)
+	}
+	published, review, err := service.PublishApprovalReview(context.Background(), state.ID)
+	if err != nil || review == nil || host.publishes != 1 {
+		t.Fatalf("publish=%#v review=%#v err=%v", published, review, err)
+	}
+	control := ControlFor(published.State)
+	if control.ExternalReview == nil || control.ExternalReview.URL != review.URL || control.ReviewOutdated {
+		t.Fatalf("published control=%#v", control)
+	}
+
+	host.feedback = reviewhost.Feedback{
+		Text: "[inline comment by @reviewer on app.go:3]\nUse the compatible value.",
+		Review: func() task.ExternalReview {
+			updated := *review
+			updated.LastReviewCommentID = 42
+			return updated
+		}(),
+	}
+	fixed, err := service.SyncApprovalReview(context.Background(), state.ID)
+	if err != nil || fixed.Status != "fixed" || fixed.State.Phase != task.PhaseImplementationReady {
+		t.Fatalf("sync=%#v err=%v", fixed, err)
+	}
+	if len(fixed.State.ApprovalHistory) != 1 || fixed.State.ApprovalHistory[0].HumanFeedback != host.feedback.Text || fixed.State.ApprovalHistory[0].ExternalReview == nil || fixed.State.ApprovalHistory[0].ExternalReview.LastReviewCommentID != 42 {
+		t.Fatalf("feedback history=%#v", fixed.State.ApprovalHistory)
+	}
+	fake.mu.Lock()
+	var implementation runner.Request
+	for _, request := range fake.requests {
+		if request.Role == runner.RoleImplementer {
+			implementation = request
+		}
+	}
+	fake.mu.Unlock()
+	if !implementation.Resume || implementation.SessionID != "session-implementer" || !strings.Contains(implementation.Prompt, "Use the compatible value") {
+		t.Fatalf("implementation request=%#v", implementation)
+	}
+
+	secondGate, err := service.ReviewCode(context.Background(), state.ID)
+	if ExitCode(err) != ExitNeedsInput || secondGate.State.Approval == nil || secondGate.State.Approval.ExternalReview == nil {
+		t.Fatalf("second gate=%#v err=%v", secondGate, err)
+	}
+	secondControl := ControlFor(secondGate.State)
+	if !secondControl.ReviewOutdated || secondControl.ExternalReview.URL != review.URL {
+		t.Fatalf("stale draft control=%#v", secondControl)
+	}
+	republished, secondReview, err := service.PublishApprovalReview(context.Background(), state.ID)
+	if err != nil || secondReview == nil || host.publishes != 2 || secondReview.URL != review.URL || secondReview.PublishedCandidateFingerprint != republished.State.Approval.SubjectFingerprint || ControlFor(republished.State).ReviewOutdated {
+		t.Fatalf("republish=%#v review=%#v err=%v", republished, secondReview, err)
 	}
 }
 
