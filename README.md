@@ -100,7 +100,8 @@ rolemux approval sync <task-id>
 Publishing is opt-in, uses the existing `gh` login, never touches the current
 branch/index/worktree, and reuses one draft PR across fix/re-review rounds. The
 PR is a review surface only—do not merge it. If GitHub or `gh` is unavailable,
-review locally and use `approval respond` for feedback or approval.
+review locally and use `approval respond --human-confirmed` only after the
+human explicitly supplies feedback or approval.
 
 The review safety limit is a top-level setting. The default is five accepted
 reviewer verdicts per review task:

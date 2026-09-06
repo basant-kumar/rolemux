@@ -9,14 +9,14 @@ import (
 
 func TestProviderActivityNormalizationCountsOnlyStarts(t *testing.T) {
 	codex := EventsFromLine("codex", []byte(`{"type":"item.started","item":{"type":"command_execution"}}`))
-	if len(codex) != 1 || !codex[0].ToolCall || !codex[0].AgentTurn {
+	if len(codex) != 1 || !codex[0].Activity || !codex[0].ToolCall || !codex[0].AgentTurn {
 		t.Fatalf("codex events=%#v", codex)
 	}
-	if duplicate := EventsFromLine("codex", []byte(`{"type":"item.completed","item":{"type":"command_execution"}}`)); len(duplicate) != 0 {
-		t.Fatalf("completed tool double-counted: %#v", duplicate)
+	if completed := EventsFromLine("codex", []byte(`{"type":"item.completed","item":{"type":"reasoning"}}`)); len(completed) != 1 || !completed[0].Activity || completed[0].AgentTurn || completed[0].ToolCall {
+		t.Fatalf("completed reasoning was not heartbeat-only: %#v", completed)
 	}
 	claude := EventsFromLine("claude", []byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"Grep"}]}}`))
-	if len(claude) != 3 || !claude[0].AgentTurn || claude[1].ToolName != "Read" || claude[2].ToolName != "Grep" {
+	if len(claude) != 3 || !claude[0].Activity || !claude[0].AgentTurn || claude[1].ToolName != "Read" || claude[2].ToolName != "Grep" {
 		t.Fatalf("claude events=%#v", claude)
 	}
 }

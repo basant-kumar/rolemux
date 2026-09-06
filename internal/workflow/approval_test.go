@@ -72,7 +72,7 @@ func TestHumanPlanAndCodeBoundaries(t *testing.T) {
 		t.Fatalf("plan gate=%#v err=%v", planGate, err)
 	}
 	control, err := service.Approval(started.State.ID)
-	if err != nil || control.Status != "approval_required" || control.NextAction != "approval_respond" || control.ApprovalKind != "plan" || len(control.Choices) != 3 || control.Choices[0].Label != "Approve" || control.Choices[1].Value != "request_changes" || control.Choices[2].Label != "Discuss" || control.ArtifactPath == "" {
+	if err != nil || control.Status != "approval_required" || control.NextAction != "approval_respond" || control.ApprovalKind != "plan" || !control.RequiresExplicitHumanConfirmation || len(control.Choices) != 3 || control.Choices[0].Label != "Approve" || control.Choices[1].Value != "request_changes" || control.Choices[2].Label != "Discuss" || control.ArtifactPath == "" {
 		t.Fatalf("plan control=%#v err=%v", control, err)
 	}
 	approvedPlan, err := service.RespondApproval(context.Background(), started.State.ID, control.ApprovalID, "approve", "")

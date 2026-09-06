@@ -58,7 +58,7 @@ Usage:
   rolemux approval sync TASK-ID [--json]
   rolemux approval respond TASK-ID --gate GATE-ID
                            --decision approve|request_changes|discuss
-                           [--feedback TEXT] [--json]
+                           --human-confirmed [--feedback TEXT] [--json]
   rolemux budget show TASK-ID [--json]
   rolemux budget extend TASK-ID --role ROLE
                         [--turns N] [--tool-calls N] [--timeout-seconds N]
@@ -1371,7 +1371,7 @@ func (a *app) runApproval(args []string) int {
 		}
 		fmt.Fprintf(a.out, "draft PR: %s\n", review.URL)
 		fmt.Fprintf(a.out, "comment on GitHub, then import requested changes: rolemux approval sync %s\n", id)
-		fmt.Fprintf(a.out, "approve after review: rolemux approval respond %s --gate %s --decision approve\n", id, result.State.Approval.GateID)
+		fmt.Fprintf(a.out, "after the human explicitly approves: rolemux approval respond %s --gate %s --decision approve --human-confirmed\n", id, result.State.Approval.GateID)
 		return workflow.ExitOK
 	case "sync":
 		opts, err := parse(args[1:], map[string]bool{"--json": false})
@@ -1404,7 +1404,7 @@ func (a *app) runApproval(args []string) int {
 		}
 		return a.workflowResult("approval-sync", result, nil, opts.json())
 	case "respond":
-		opts, err := parse(args[1:], map[string]bool{"--json": false, "--gate": true, "--decision": true, "--feedback": true})
+		opts, err := parse(args[1:], map[string]bool{"--json": false, "--gate": true, "--decision": true, "--feedback": true, "--human-confirmed": false})
 		if err != nil || len(opts.positionals) != 1 || !opts.present("--gate") || !opts.present("--decision") {
 			if err == nil {
 				err = usage("approval respond requires TASK-ID, --gate, and --decision")
@@ -1427,6 +1427,21 @@ func (a *app) runApproval(args []string) int {
 			return a.fail("approval-respond", usage("--feedback is valid only with --decision request_changes"), opts.json(), workflow.Result{})
 		}
 		id := opts.positionals[0]
+		if !opts.present("--human-confirmed") {
+			inspection, inspectErr := a.providerFreeWorkflowServiceForTask(id)
+			if inspectErr != nil {
+				return a.fail("approval-respond", inspectErr, opts.json(), workflow.Result{})
+			}
+			state, stateErr := inspection.Status(id)
+			if stateErr != nil {
+				return a.fail("approval-respond", stateErr, opts.json(), workflow.Result{})
+			}
+			control := workflow.ControlFor(state)
+			if control.Status == "approval_required" {
+				return a.pendingApproval("approval-respond", state, control, opts.json())
+			}
+			return a.fail("approval-respond", usage("--human-confirmed is required only for a pending human approval"), opts.json(), workflow.Result{State: state})
+		}
 		var service *workflow.Service
 		if decision == string(task.ApprovalDecisionRequestChanges) {
 			service, err = a.workflowServiceForTask(id)
@@ -2391,9 +2406,10 @@ func printApprovalControl(out io.Writer, requestedID string, control workflow.Co
 		}
 	}
 	fmt.Fprintf(out, "gate: %s\n", control.ApprovalID)
-	fmt.Fprintf(out, "approve: rolemux approval respond %s --gate %s --decision approve\n", ownerID, control.ApprovalID)
-	fmt.Fprintf(out, "request changes: rolemux approval respond %s --gate %s --decision request_changes --feedback \"...\"\n", ownerID, control.ApprovalID)
-	fmt.Fprintf(out, "discuss: rolemux approval respond %s --gate %s --decision discuss\n", ownerID, control.ApprovalID)
+	fmt.Fprintln(out, "hard stop: do not run a response command until the human explicitly replies in the host conversation")
+	fmt.Fprintf(out, "after human approval: rolemux approval respond %s --gate %s --decision approve --human-confirmed\n", ownerID, control.ApprovalID)
+	fmt.Fprintf(out, "after human feedback: rolemux approval respond %s --gate %s --decision request_changes --feedback \"...\" --human-confirmed\n", ownerID, control.ApprovalID)
+	fmt.Fprintf(out, "after human asks to discuss: rolemux approval respond %s --gate %s --decision discuss --human-confirmed\n", ownerID, control.ApprovalID)
 }
 
 func shellQuote(value string) string {

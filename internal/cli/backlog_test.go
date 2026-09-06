@@ -48,7 +48,7 @@ func TestBudgetShowAndExtendCommandsAreProviderFree(t *testing.T) {
 	if code != 0 || stderr != "" || !strings.Contains(string(output), `"max_turns":1`) {
 		t.Fatalf("show code=%d stderr=%q output=%s", code, stderr, output)
 	}
-	code, output, stderr = runTestApp(t, root, "", "budget", "extend", state.ID, "--role", "planner", "--turns", "2", "--output-bytes", "1048576", "--json")
+	code, output, stderr = runTestApp(t, root, "", "budget", "extend", state.ID, "--role", "planner", "--turns", "1", "--json")
 	if code != 0 || stderr != "" || !strings.Contains(string(output), `"status":"budget_extended"`) || !strings.Contains(string(output), `"next_action":"retry"`) {
 		t.Fatalf("extend code=%d stderr=%q output=%s", code, stderr, output)
 	}

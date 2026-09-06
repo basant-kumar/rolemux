@@ -25,8 +25,9 @@ persists the exact provider session used by that role.
 4. When a command exits `3`, inspect `status`. For `approval_required`, show the
    exact question, immutable artifact path, scope/changed files, gate ID, and
    all choices (Approve, Request changes, and Discuss), then wait for an
-   explicit human decision. Use `rolemux approval respond` with the exact task
-   and gate IDs, one of `approve`, `request_changes`, or `discuss`, and feedback
+   explicit human decision. Only after a new human reply in the current host
+   conversation, use `rolemux approval respond` with the exact task and gate
+   IDs, `--human-confirmed`, one of `approve`, `request_changes`, or `discuss`, and feedback
    when requesting changes. Never approve automatically. At a final code gate,
    also show the path-limited local Git review commands emitted by `approval
    show`. Offer `rolemux approval publish <task-id>` as an opt-in GitHub draft
@@ -98,6 +99,11 @@ Never omit new user constraints or evidence needed for correctness.
 Provider progress is already streamed to stderr and persisted in compact
 `status` as model-turn/tool-call counters. Relay the concise lifecycle and
 review events to the human; never paste raw provider streams back into a model.
+Keep stderr attached while RoleMux runs. Do not combine stdout and stderr with
+`2>&1`, and do not pipe a live RoleMux command through `tail`, `grep`, or another
+buffer: doing so hides progress and the pxpipe dashboard. If JSON must be saved,
+redirect stdout alone to a result file and read that file after the command
+finishes.
 
 The implementer receives an explicit pre-edit discovery budget: at most three
 batched read/search calls over named files and symbols, with no repository-wide
@@ -176,7 +182,7 @@ Use the result as the host decision:
 | `revised` / `fixed` | Issue the matching explicit review; keep dependencies locked. |
 | `needs_input` | Ask `question`, then use `source` with the matching `plan answer` or `implement answer` command. |
 | `review_needed` | Run `rolemux retry` using the exact task ID. |
-| `budget_exhausted` | Inspect partial work, run `rolemux budget show`, explicitly extend only the exhausted role/limit, then `retry` the saved session. |
+| `budget_exhausted` | Inspect partial work, run `rolemux budget show`, extend only the exhausted role/limit by the smallest practical increment, then `retry` the saved session. Never inflate unrelated limits. |
 | `no_progress` | Inspect the saved candidate and return a deliberate host decision; do not repeat automatically. |
 | `failed` / `in_flight` | Follow recovery metadata: retry a durable failure or wait/inspect an in-flight owner. |
 | `exhausted` | Stop; the configured review ceiling has been reached. |

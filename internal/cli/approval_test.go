@@ -71,6 +71,16 @@ func TestApprovalShowAndApproveAreProviderFree(t *testing.T) {
 	}
 
 	code, output, stderr = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "approve", "--json")
+	if code != workflow.ExitNeedsInput || stderr != "" {
+		t.Fatalf("unconfirmed approval code=%d stderr=%q output=%s", code, stderr, output)
+	}
+	unconfirmed := decodeSingleObject(t, output)
+	unconfirmedResult := unconfirmed["result"].(map[string]any)
+	if unconfirmed["ok"] != false || unconfirmedResult["status"] != "approval_required" || unconfirmedResult["requires_explicit_human_confirmation"] != true {
+		t.Fatalf("unconfirmed payload=%#v", unconfirmed)
+	}
+
+	code, output, stderr = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "approve", "--human-confirmed", "--json")
 	if code != workflow.ExitOK || stderr != "" {
 		t.Fatalf("approve code=%d stderr=%q output=%s", code, stderr, output)
 	}
@@ -85,11 +95,11 @@ func TestApprovalShowAndApproveAreProviderFree(t *testing.T) {
 	}
 
 	// An identical delayed response is idempotent; a conflicting response is not.
-	code, _, _ = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "approve", "--json")
+	code, _, _ = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "approve", "--human-confirmed", "--json")
 	if code != workflow.ExitOK {
 		t.Fatalf("duplicate approve code=%d", code)
 	}
-	code, output, _ = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "discuss", "--json")
+	code, output, _ = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "discuss", "--human-confirmed", "--json")
 	if code != workflow.ExitAction || decodeSingleObject(t, output)["error"].(map[string]any)["code"] != workflow.ApprovalConflictCode {
 		t.Fatalf("conflicting response code=%d output=%s", code, output)
 	}
@@ -107,7 +117,7 @@ func TestApprovalDiscussIsReadOnlyAndHumanOutputIsActionable(t *testing.T) {
 		t.Fatalf("human show code=%d stderr=%q output=%s", code, stderr, output)
 	}
 	text := string(output)
-	for _, required := range []string{"review verdict: Approved", "next step: Human code approval", "review artifact:", "review locally (status):", "review locally (tracked diff):", "review on GitHub: rolemux approval publish", "Approve (approve)", "Request changes (request_changes)", "Discuss (discuss)", "--gate gate-code-1", "--decision request_changes --feedback"} {
+	for _, required := range []string{"review verdict: Approved", "next step: Human code approval", "review artifact:", "review locally (status):", "review locally (tracked diff):", "review on GitHub: rolemux approval publish", "Approve (approve)", "Request changes (request_changes)", "Discuss (discuss)", "hard stop:", "--gate gate-code-1", "--decision request_changes --feedback", "--human-confirmed"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("human output missing %q: %s", required, text)
 		}
@@ -116,7 +126,7 @@ func TestApprovalDiscussIsReadOnlyAndHumanOutputIsActionable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, output, _ = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "discuss", "--json")
+	code, output, _ = runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-code-1", "--decision", "discuss", "--human-confirmed", "--json")
 	if code != workflow.ExitNeedsInput {
 		t.Fatalf("discuss code=%d output=%s", code, output)
 	}
@@ -192,9 +202,9 @@ func TestApprovalParentResolvesIntegrationGateAndValidatesUsage(t *testing.T) {
 	}
 
 	for _, args := range [][]string{
-		{"approval", "respond", parent.ID, "--gate", "gate-code-1", "--decision", "request_changes", "--json"},
-		{"approval", "respond", parent.ID, "--gate", "gate-code-1", "--decision", "approve", "--feedback", "unused", "--json"},
-		{"approval", "respond", parent.ID, "--gate", "gate-code-1", "--decision", "invalid", "--json"},
+		{"approval", "respond", parent.ID, "--gate", "gate-code-1", "--decision", "request_changes", "--human-confirmed", "--json"},
+		{"approval", "respond", parent.ID, "--gate", "gate-code-1", "--decision", "approve", "--feedback", "unused", "--human-confirmed", "--json"},
+		{"approval", "respond", parent.ID, "--gate", "gate-code-1", "--decision", "invalid", "--human-confirmed", "--json"},
 	} {
 		code, output, _ = runTestApp(t, root, "", args...)
 		if code != workflow.ExitUsage || decodeSingleObject(t, output)["error"].(map[string]any)["code"] != "USAGE" {
@@ -234,7 +244,7 @@ func TestPlanApprovalUnlocksExecutionWithoutProviderSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, output, stderr := runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-plan-1", "--decision", "approve", "--json")
+	code, output, stderr := runTestApp(t, root, "", "approval", "respond", state.ID, "--gate", "gate-plan-1", "--decision", "approve", "--human-confirmed", "--json")
 	if code != workflow.ExitOK || stderr != "" {
 		t.Fatalf("plan approve code=%d stderr=%q output=%s", code, stderr, output)
 	}
@@ -254,7 +264,7 @@ func TestHelpListsApprovalCommands(t *testing.T) {
 	if code != workflow.ExitOK || stderr != "" {
 		t.Fatalf("help code=%d stderr=%q", code, stderr)
 	}
-	for _, line := range []string{"rolemux approval show TASK-ID", "rolemux approval publish TASK-ID", "rolemux approval sync TASK-ID", "rolemux approval respond TASK-ID --gate GATE-ID", "--decision approve|request_changes|discuss"} {
+	for _, line := range []string{"rolemux approval show TASK-ID", "rolemux approval publish TASK-ID", "rolemux approval sync TASK-ID", "rolemux approval respond TASK-ID --gate GATE-ID", "--decision approve|request_changes|discuss", "--human-confirmed"} {
 		if !bytes.Contains(output, []byte(line)) {
 			t.Fatalf("help missing %q: %s", line, output)
 		}

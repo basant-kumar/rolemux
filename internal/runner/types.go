@@ -68,10 +68,13 @@ type Callbacks struct {
 }
 
 type Event struct {
-	Type      string          `json:"type"`
-	SessionID string          `json:"session_id,omitempty"`
-	Model     string          `json:"model,omitempty"`
-	Effort    string          `json:"effort,omitempty"`
+	Type      string `json:"type"`
+	SessionID string `json:"session_id,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Effort    string `json:"effort,omitempty"`
+	// Activity is a heartbeat that advances last_activity without changing
+	// model-turn or tool-call accounting.
+	Activity  bool            `json:"activity,omitempty"`
 	AgentTurn bool            `json:"agent_turn,omitempty"`
 	ToolCall  bool            `json:"tool_call,omitempty"`
 	ToolName  string          `json:"tool_name,omitempty"`

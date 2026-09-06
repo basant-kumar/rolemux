@@ -29,6 +29,39 @@ type scriptedAdapter struct {
 	listCalls int
 }
 
+type heartbeatAdapter struct {
+	afterHeartbeat func() error
+}
+
+func (h *heartbeatAdapter) Run(_ context.Context, req runner.Request, callbacks runner.Callbacks) (runner.Response, error) {
+	const session = "heartbeat-session"
+	if callbacks.SessionStarted != nil {
+		if err := callbacks.SessionStarted(session); err != nil {
+			return runner.Response{}, err
+		}
+	}
+	if callbacks.Event != nil {
+		if err := callbacks.Event(runner.Event{Type: "reasoning.completed", Activity: true}); err != nil {
+			return runner.Response{}, err
+		}
+	}
+	if h.afterHeartbeat != nil {
+		if err := h.afterHeartbeat(); err != nil {
+			return runner.Response{}, err
+		}
+	}
+	envelope := runner.Envelope{Role: string(req.Role), Status: "ready", Plan: "heartbeat plan", Complexity: task.ComplexityTrivial, WorkUnits: []task.WorkUnit{{ID: "T1", Objective: "change app", Scope: "app.go", ContextGroup: "T1", ContextFiles: []string{"app.go"}, AffectedSymbols: []string{"app"}, EstimatedMinutes: 2, ExecutionPacket: "change app", AcceptanceCriteria: []string{"works"}, ValidationCommands: []string{"test app"}}}}
+	return runner.Response{SessionID: session, Envelope: &envelope}, nil
+}
+
+func (h *heartbeatAdapter) ListModels(context.Context, runner.ModelListRequest) (runner.ModelPage, error) {
+	return workflowTestModels(), nil
+}
+func (h *heartbeatAdapter) Version(context.Context) (string, error) { return "test", nil }
+func (h *heartbeatAdapter) Auth(context.Context) (runner.AuthStatus, error) {
+	return runner.AuthStatus{Authenticated: true}, nil
+}
+
 func (f *scriptedAdapter) Run(_ context.Context, req runner.Request, callbacks runner.Callbacks) (runner.Response, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -104,6 +137,32 @@ func workflowConfig() config.Config {
 		config.RoleReviewer:    {Provider: "codex", Model: "reviewer-model", Effort: "xhigh"},
 	}
 	return cfg
+}
+
+func TestHeartbeatActivityAdvancesProgressWithoutInflatingCounters(t *testing.T) {
+	root := workflowRepo(t)
+	var service *Service
+	adapter := &heartbeatAdapter{}
+	service = New(root, workflowConfig(), map[string]runner.Adapter{"codex": adapter})
+	adapter.afterHeartbeat = func() error {
+		state, err := service.Store.Load("heartbeat-progress")
+		if err != nil {
+			return err
+		}
+		if state.InFlight == nil || state.Progress == nil || !state.Progress.Active {
+			return fmt.Errorf("heartbeat did not preserve active progress: %#v", state.Progress)
+		}
+		if state.Progress.AgentTurns != 0 || state.Progress.ToolCalls != 0 {
+			return fmt.Errorf("heartbeat inflated counters: %#v", state.Progress)
+		}
+		if !state.Progress.LastActivity.After(state.InFlight.StartedAt) {
+			return fmt.Errorf("heartbeat did not advance last activity: progress=%s started=%s", state.Progress.LastActivity, state.InFlight.StartedAt)
+		}
+		return nil
+	}
+	if _, err := service.StartPlan(context.Background(), "heartbeat", "heartbeat-progress"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func workflowTestModels() runner.ModelPage {
@@ -618,7 +677,7 @@ func TestRetryRecoversAbandonedOwnerInSameSession(t *testing.T) {
 		t.Fatalf("result=%#v requests=%#v err=%v", result, fake.requests, err)
 	}
 	request := fake.requests[0]
-	if !request.Resume || request.SessionID != "durable-session" || request.Prompt != "continue the interrupted plan" {
+	if !request.Resume || request.SessionID != "durable-session" || !strings.Contains(request.Prompt, "Resume the interrupted plan_start") || strings.Contains(request.Prompt, "continue the interrupted plan") {
 		t.Fatalf("abandoned retry changed provider continuity: %#v", request)
 	}
 }
@@ -894,7 +953,7 @@ func TestKnownSessionProviderFailureRetriesExactTurn(t *testing.T) {
 	if err != nil || result.State.Plan != "recovered plan" || len(fake.requests) != 2 {
 		t.Fatalf("result=%#v requests=%#v err=%v", result, fake.requests, err)
 	}
-	if !fake.requests[1].Resume || fake.requests[1].SessionID != "durable-planner" || fake.requests[1].Prompt != fake.requests[0].Prompt {
+	if !fake.requests[1].Resume || fake.requests[1].SessionID != "durable-planner" || fake.requests[1].Prompt == fake.requests[0].Prompt || !strings.Contains(fake.requests[1].Prompt, "Resume the interrupted plan_start") || strings.Contains(fake.requests[1].Prompt, "Task:\nrecover") {
 		t.Fatalf("retry changed the provider turn: %#v", fake.requests)
 	}
 }

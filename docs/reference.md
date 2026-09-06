@@ -168,7 +168,7 @@ Start, review, and inspect a plan:
 rolemux plan start --task "Add resumable uploads" --json
 rolemux plan review <task-id> --json
 rolemux approval show <task-id>
-rolemux approval respond <task-id> --gate <gate-id> --decision approve
+rolemux approval respond <task-id> --gate <gate-id> --decision approve --human-confirmed
 rolemux plan graph <task-id> --json
 ```
 
@@ -219,10 +219,10 @@ exact gate ID:
 
 ```bash
 rolemux approval show <task-id> [--json]
-rolemux approval respond <task-id> --gate <gate-id> --decision approve [--json]
+rolemux approval respond <task-id> --gate <gate-id> --decision approve --human-confirmed [--json]
 rolemux approval respond <task-id> --gate <gate-id> \
-  --decision request_changes --feedback "Keep the existing API" [--json]
-rolemux approval respond <task-id> --gate <gate-id> --decision discuss [--json]
+  --decision request_changes --feedback "Keep the existing API" --human-confirmed [--json]
+rolemux approval respond <task-id> --gate <gate-id> --decision discuss --human-confirmed [--json]
 ```
 
 Approve and Discuss are provider-free. Discuss leaves the gate pending.
@@ -310,7 +310,7 @@ The host decision table is:
 | `revised` / `fixed` | Issue the matching explicit review; keep dependencies locked. |
 | `needs_input` | Ask `question`, then use `source` to choose the matching answer command. |
 | `review_needed` | Run `rolemux retry <task-id> --json`. |
-| `budget_exhausted` | Inspect partial work, explicitly extend the named limit, then retry the saved session. |
+| `budget_exhausted` | Inspect partial work, extend only the named limit by the smallest practical increment, then retry the saved session. |
 | `no_progress` | Inspect the saved candidate and decide deliberately; do not repeat automatically. |
 | `failed` / `in_flight` | Follow recovery metadata: retry a durable failure or wait/inspect an in-flight owner. |
 | `exhausted` | Stop; the review ceiling has been reached. |
@@ -350,6 +350,11 @@ rolemux budget extend <task-id> --role implementer --output-bytes 1048576 --json
 rolemux work adopt <task-id> --note "Host completed the scoped fallback" --json
 rolemux list --json
 ```
+
+An exhausted task cannot be retried until its named budget dimension is
+extended. Recovery extensions cannot inflate unrelated dimensions, and one
+extension cannot exceed that dimension's current limit; inspect the resumed
+result before extending again.
 
 `status` is compact unless `--full` is supplied. Ctrl+C, SIGTERM, and provider
 timeouts save a resumable retry when a durable session exists. RoleMux fails

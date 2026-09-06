@@ -59,6 +59,9 @@ type Control struct {
 	Progress       *task.Progress             `json:"progress,omitempty"`
 	ExternalReview *task.ExternalReview       `json:"external_review,omitempty"`
 	ReviewOutdated bool                       `json:"review_outdated,omitempty"`
+	// RequiresExplicitHumanConfirmation tells host agents that an approval
+	// response must be grounded in a new, explicit human reply.
+	RequiresExplicitHumanConfirmation bool `json:"requires_explicit_human_confirmation,omitempty"`
 }
 
 type ApprovalChoice struct {
@@ -173,6 +176,7 @@ func ControlFor(st task.State) Control {
 			control.Question = planApprovalQuestion
 			control.Choices = defaultApprovalChoices()
 			control.ApprovalTaskID = st.ID
+			control.RequiresExplicitHumanConfirmation = true
 		} else {
 			control.Status = "review_needed"
 			control.NextAction = "plan_review"
@@ -193,6 +197,7 @@ func ControlFor(st task.State) Control {
 			control.Question = codeApprovalQuestion
 			control.Choices = defaultApprovalChoices()
 			control.ApprovalTaskID = st.ID
+			control.RequiresExplicitHumanConfirmation = true
 		} else {
 			control.Status = "review_needed"
 			control.NextAction = "code_review"
@@ -204,6 +209,7 @@ func ControlFor(st task.State) Control {
 		control.ApprovalKind = kind
 		control.ApprovalTaskID = st.ID
 		control.Choices = defaultApprovalChoices()
+		control.RequiresExplicitHumanConfirmation = true
 		if kind == "plan" {
 			control.Question = planApprovalQuestion
 		} else {
@@ -255,6 +261,7 @@ func approvalControl(control Control, st task.State, record *task.ApprovalRecord
 		}
 	}
 	control.Choices = defaultApprovalChoices()
+	control.RequiresExplicitHumanConfirmation = true
 	if record.Scope != "" {
 		control.Scope = record.Scope
 	} else if st.Scope != "" {
@@ -1596,6 +1603,9 @@ func (s *Service) Retry(ctx context.Context, id string) (Result, error) {
 			return Result{State: current, Status: ControlFor(current).Status}, err
 		}
 	}
+	if current.BudgetIssue != nil {
+		return existingWorkflowResult(current)
+	}
 	if current.Retry == nil || (current.Phase != task.PhaseFailed && current.Phase != task.PhaseReviewNeeded) {
 		if current.Phase == task.PhaseFailed {
 			return existingWorkflowResult(current)
@@ -1655,6 +1665,8 @@ func (s *Service) Retry(ctx context.Context, id string) (Result, error) {
 			if reviewCandidateChanged || candidateChanged {
 				retry.Prompt = "The scoped candidate changed while your previous review was running. Discard that verdict and review this current candidate.\n" + retry.Prompt
 			}
+		} else if retry.KnownSession {
+			retry.Prompt = sameSessionRetryPrompt(retry)
 		}
 		st.Phase = retryPhase(retry)
 		if retry.Role == string(runner.RolePlanReviewer) || retry.Role == string(runner.RoleCodeReviewer) || retry.Loop == "plan_review" || retry.Loop == "code_review" {
@@ -1734,24 +1746,40 @@ func (s *Service) ExtendBudget(id string, role string, turns, toolCalls, timeout
 			matches := canonical == issue.Role
 			switch issue.Kind {
 			case "model_turns":
-				matches = matches && turns > 0
+				matches = matches && turns > 0 && toolCalls == 0 && timeoutSeconds == 0 && outputBytes == 0
 			case "tool_calls":
-				matches = matches && toolCalls > 0
+				matches = matches && toolCalls > 0 && turns == 0 && timeoutSeconds == 0 && outputBytes == 0
 			case "timeout_seconds":
-				matches = matches && timeoutSeconds > 0
+				matches = matches && timeoutSeconds > 0 && turns == 0 && toolCalls == 0 && outputBytes == 0
 			case "output_bytes":
-				matches = matches && outputBytes > 0
+				matches = matches && outputBytes > 0 && turns == 0 && toolCalls == 0 && timeoutSeconds == 0
 			default:
 				matches = false
 			}
 			if !matches {
-				return problem("BUDGET_EXTENSION_MISMATCH", "extend the exhausted "+issue.Role+" "+issue.Kind+" limit before retrying", targetID, ExitUsage, false, nil)
+				return problem("BUDGET_EXTENSION_MISMATCH", "extend only the exhausted "+issue.Role+" "+issue.Kind+" limit before retrying", targetID, ExitUsage, false, nil)
 			}
 		}
 		if st.BudgetsSnapshot == nil {
 			st.BudgetsSnapshot = cloneBudgets(s.Config.EffectiveBudgets())
 		}
 		budget := st.BudgetsSnapshot[canonical]
+		if issue := st.BudgetIssue; issue != nil {
+			var increment, current int64
+			switch issue.Kind {
+			case "model_turns":
+				increment, current = int64(turns), int64(budget.MaxTurns)
+			case "tool_calls":
+				increment, current = int64(toolCalls), int64(budget.MaxToolCalls)
+			case "timeout_seconds":
+				increment, current = int64(timeoutSeconds), int64(budget.TimeoutSeconds)
+			case "output_bytes":
+				increment, current = outputBytes, budget.MaxOutputBytes
+			}
+			if current > 0 && increment > current {
+				return problem("BUDGET_EXTENSION_TOO_LARGE", fmt.Sprintf("extend %s in increments no larger than its current limit %d; inspect after each retry", issue.Kind, current), targetID, ExitUsage, false, nil)
+			}
+		}
 		budget.MaxTurns += turns
 		budget.MaxToolCalls += toolCalls
 		budget.TimeoutSeconds += timeoutSeconds
@@ -2770,7 +2798,7 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 				s.Diagnostic(fmt.Sprintf("%s progress: tool %d/%d %s", role, toolCalls, budget.MaxToolCalls, label))
 			}
 		}
-		if event.AgentTurn || event.ToolCall {
+		if event.Activity || event.AgentTurn || event.ToolCall {
 			if _, updateErr := s.Store.UpdateOwned(id, token, func(current *task.State) error {
 				if current.Progress == nil {
 					current.Progress = &task.Progress{Role: string(role), Operation: current.InFlight.Operation, Active: true}
@@ -3407,6 +3435,9 @@ func existingWorkflowResult(st task.State) (Result, error) {
 	if st.Phase == task.PhaseNeedsInput {
 		return needsInputResult(st)
 	}
+	if st.BudgetIssue != nil {
+		return result, problem("BUDGET_EXHAUSTED", "extend the exhausted "+st.BudgetIssue.Role+" "+st.BudgetIssue.Kind+" budget before retrying", st.ID, ExitAction, true, nil)
+	}
 	switch st.Phase {
 	case task.PhaseReviewNeeded:
 		return result, problem("REVIEW_NEEDED", "review must be retried before another review can start", st.ID, ExitReviewNeeded, true, task.ErrScopeChanged)
@@ -3688,6 +3719,18 @@ func codeReviewPrompt(st task.State, resumed bool) string {
 
 func codeReviewContinuePrompt(st task.State) string {
 	return reviewerRoleDiscipline + "\nContinue the interrupted task review in this same session and return a bounded verdict now. The candidate is unchanged (manifest " + st.CandidateManifestHash + "); do not reread files or repeat repository/external research already completed. Stay inside the original task delta and direct blast radius. Return only the code_reviewer JSON envelope."
+}
+
+func sameSessionRetryPrompt(retry task.RetryState) string {
+	role := strings.TrimSpace(retry.Role)
+	if role == "" {
+		role = "role"
+	}
+	operation := strings.TrimSpace(retry.Operation)
+	if operation == "" {
+		operation = "operation"
+	}
+	return "Resume the interrupted " + operation + " in this same " + role + " session from its last completed step. Reuse the original task, supplied evidence, and completed tool results already in context; do not repeat discovery or reread unchanged files. Continue toward the required " + role + " JSON envelope."
 }
 
 type reviewDeltaEntry struct {

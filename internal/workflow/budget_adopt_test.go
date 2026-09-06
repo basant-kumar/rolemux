@@ -92,10 +92,20 @@ func TestToolBudgetExhaustionIsDurableExtendableAndResumable(t *testing.T) {
 	if control := ControlFor(result.State); control.NextAction != "budget_extend" {
 		t.Fatalf("control=%#v", control)
 	}
+	blocked, blockedErr := service.Retry(context.Background(), "budgeted")
+	if ExitCode(blockedErr) != ExitAction || blocked.Status != "budget_exhausted" || adapter.calls != 1 {
+		t.Fatalf("retry bypassed required budget extension: result=%#v err=%v calls=%d", blocked, blockedErr, adapter.calls)
+	}
 	if _, mismatchErr := service.ExtendBudget("budgeted", config.RolePlanner, 1, 0, 0, 0); mismatchErr == nil {
 		t.Fatal("wrong exhausted limit extension was accepted")
 	}
-	result, err = service.ExtendBudget("budgeted", config.RolePlanner, 0, 2, 0, 0)
+	if _, oversizedErr := service.ExtendBudget("budgeted", config.RolePlanner, 0, 3, 0, 0); oversizedErr == nil {
+		t.Fatal("oversized exhausted limit extension was accepted")
+	}
+	if _, unrelatedErr := service.ExtendBudget("budgeted", config.RolePlanner, 1, 1, 0, 0); unrelatedErr == nil {
+		t.Fatal("unrelated budget extension was accepted")
+	}
+	result, err = service.ExtendBudget("budgeted", config.RolePlanner, 0, 1, 0, 0)
 	if err != nil || result.Status != "budget_extended" || result.State.BudgetIssue != nil {
 		t.Fatalf("extend=%#v err=%v", result, err)
 	}
