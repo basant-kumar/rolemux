@@ -31,6 +31,7 @@ type scriptedAdapter struct {
 
 type heartbeatAdapter struct {
 	afterHeartbeat func() error
+	wait           time.Duration
 }
 
 func (h *heartbeatAdapter) Run(_ context.Context, req runner.Request, callbacks runner.Callbacks) (runner.Response, error) {
@@ -44,6 +45,9 @@ func (h *heartbeatAdapter) Run(_ context.Context, req runner.Request, callbacks 
 		if err := callbacks.Event(runner.Event{Type: "reasoning.completed", Activity: true}); err != nil {
 			return runner.Response{}, err
 		}
+	}
+	if h.wait > 0 {
+		time.Sleep(h.wait)
 	}
 	if h.afterHeartbeat != nil {
 		if err := h.afterHeartbeat(); err != nil {
@@ -144,6 +148,8 @@ func TestHeartbeatActivityAdvancesProgressWithoutInflatingCounters(t *testing.T)
 	var service *Service
 	adapter := &heartbeatAdapter{}
 	service = New(root, workflowConfig(), map[string]runner.Adapter{"codex": adapter})
+	service.ProgressHeartbeatInterval = 5 * time.Millisecond
+	adapter.wait = 25 * time.Millisecond
 	adapter.afterHeartbeat = func() error {
 		state, err := service.Store.Load("heartbeat-progress")
 		if err != nil {
@@ -157,6 +163,9 @@ func TestHeartbeatActivityAdvancesProgressWithoutInflatingCounters(t *testing.T)
 		}
 		if !state.Progress.LastActivity.After(state.InFlight.StartedAt) {
 			return fmt.Errorf("heartbeat did not advance last activity: progress=%s started=%s", state.Progress.LastActivity, state.InFlight.StartedAt)
+		}
+		if !state.Progress.LastHeartbeat.After(state.Progress.LastActivity) {
+			return fmt.Errorf("process heartbeat did not advance independently: heartbeat=%s activity=%s", state.Progress.LastHeartbeat, state.Progress.LastActivity)
 		}
 		return nil
 	}

@@ -192,6 +192,9 @@ type Progress struct {
 	LastTool     string    `json:"last_tool,omitempty"`
 	Active       bool      `json:"active"`
 	LastActivity time.Time `json:"last_activity"`
+	// LastHeartbeat proves the owning RoleMux process is still supervising the
+	// provider even when that provider does not stream reasoning activity.
+	LastHeartbeat time.Time `json:"last_heartbeat,omitempty"`
 }
 
 type ProfileSnapshot struct {

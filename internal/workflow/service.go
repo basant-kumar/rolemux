@@ -30,6 +30,8 @@ const MaxRounds = config.DefaultReviewMaxRounds
 
 const abandonedOperationGrace = 5 * time.Second
 
+const defaultProgressHeartbeatInterval = 15 * time.Second
+
 type Result struct {
 	State  task.State
 	Status string
@@ -503,7 +505,10 @@ type Service struct {
 	Token          func() string
 	ProcessID      func() int
 	ProcessAlive   func(int) bool
-	ReviewHost     ExternalReviewHost
+	// ProgressHeartbeatInterval is configurable for deterministic tests. Zero
+	// uses the production interval.
+	ProgressHeartbeatInterval time.Duration
+	ReviewHost                ExternalReviewHost
 }
 
 type ExternalReviewHost interface {
@@ -2737,7 +2742,8 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 		return runner.Response{}, s.fail(id, token, budgetErr)
 	}
 	if _, updateErr := s.Store.UpdateOwned(id, token, func(current *task.State) error {
-		current.Progress = &task.Progress{Role: string(role), Operation: current.InFlight.Operation, Active: true, LastActivity: s.now()}
+		now := s.now()
+		current.Progress = &task.Progress{Role: string(role), Operation: current.InFlight.Operation, Active: true, LastActivity: now, LastHeartbeat: now}
 		return nil
 	}); updateErr != nil {
 		return runner.Response{}, classify(id, updateErr)
@@ -2769,6 +2775,29 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 	if s.Diagnostic != nil {
 		s.Diagnostic(fmt.Sprintf("%s progress: %s started", role, st.InFlight.Operation))
 	}
+	heartbeatInterval := s.ProgressHeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = defaultProgressHeartbeatInterval
+	}
+	heartbeatStop, heartbeatStopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(heartbeatStopped)
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_, _ = s.Store.UpdateOwned(id, token, func(current *task.State) error {
+					if current.Progress != nil && current.Progress.Active {
+						current.Progress.LastHeartbeat = s.now()
+					}
+					return nil
+				})
+			case <-heartbeatStop:
+				return
+			}
+		}
+	}()
 	resp, callErr := adapter.Run(callContext, request, runner.Callbacks{SessionStarted: func(session string) error {
 		if strings.TrimSpace(session) == "" {
 			return runner.ErrMissingSession
@@ -2808,7 +2837,9 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 				if event.ToolName != "" {
 					current.Progress.LastTool = event.ToolName
 				}
-				current.Progress.LastActivity = s.now()
+				now := s.now()
+				current.Progress.LastActivity = now
+				current.Progress.LastHeartbeat = now
 				return nil
 			}); updateErr != nil {
 				return updateErr
@@ -2822,6 +2853,8 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 		}
 		return nil
 	}, Diagnostic: s.Diagnostic})
+	close(heartbeatStop)
+	<-heartbeatStopped
 	activityMu.Lock()
 	observedAgentTurns, observedToolCalls := agentTurns, toolCalls
 	activityMu.Unlock()
@@ -2881,7 +2914,9 @@ func (s *Service) call(ctx context.Context, id, token string, role runner.Role) 
 			st.Progress.AgentTurns = turnUsage.AgentTurns
 			st.Progress.ToolCalls = turnUsage.ToolCalls
 			st.Progress.Active = false
-			st.Progress.LastActivity = s.now()
+			now := s.now()
+			st.Progress.LastActivity = now
+			st.Progress.LastHeartbeat = now
 		}
 		return nil
 	}); updateErr != nil {

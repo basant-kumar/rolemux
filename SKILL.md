@@ -97,7 +97,9 @@ or refreshing `models` unless the workflow or recovery actually requires it.
 Never omit new user constraints or evidence needed for correctness.
 
 Provider progress is already streamed to stderr and persisted in compact
-`status` as model-turn/tool-call counters. Relay the concise lifecycle and
+`status` as model-turn/tool-call counters. `last_activity` is provider evidence;
+`last_heartbeat` means the owning RoleMux process is still supervising the turn.
+Relay the concise lifecycle and
 review events to the human; never paste raw provider streams back into a model.
 Keep stderr attached while RoleMux runs. Do not combine stdout and stderr with
 `2>&1`, and do not pipe a live RoleMux command through `tail`, `grep`, or another
