@@ -33,7 +33,8 @@ Usage:
   rolemux help
   rolemux -h
   rolemux --help
-  rolemux version [--json]
+  rolemux --version [--json]
+  rolemux version [--json]  (backward-compatible alias)
   rolemux models [--refresh] [--runner PROVIDER] [--json]
   rolemux configure [--global|--project] [--from PATH|-]
                     [--role planner|implementer|reviewer|plan-reviewer|code-reviewer]
@@ -89,7 +90,7 @@ func (a *app) run(args []string) int {
 	if len(args) == 0 {
 		return a.fail("", usage("a command is required"), jsonMode, workflow.Result{})
 	}
-	if args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+	if args[0] == "help" || containsHelpFlag(args) {
 		if jsonMode {
 			return a.success("help", map[string]any{"usage": usageText}, nil, nil, true)
 		}
@@ -97,7 +98,7 @@ func (a *app) run(args []string) int {
 		return workflow.ExitOK
 	}
 	switch args[0] {
-	case "version":
+	case "--version", "version":
 		return a.runVersion(args[1:])
 	case "models":
 		return a.runModels(args[1:])
@@ -2093,6 +2094,15 @@ func (a *app) readConfigSource(name string) ([]byte, error) {
 func containsFlag(args []string, name string) bool {
 	for _, arg := range args {
 		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func containsHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
 			return true
 		}
 	}

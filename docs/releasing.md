@@ -79,5 +79,5 @@ Finally update the tap and exercise the public installation path:
 ```bash
 brew update
 brew upgrade --cask rolemux
-rolemux version
+rolemux --version
 ```

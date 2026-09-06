@@ -99,3 +99,40 @@ func TestUsageHumanOutputNamesAllUnreportedTokens(t *testing.T) {
 		t.Fatalf("code=%d stderr=%q output=%s", code, stderr, output)
 	}
 }
+
+func TestVersionFlagAndAlias(t *testing.T) {
+	root := cliRepo(t)
+	for _, args := range [][]string{{"--version"}, {"version"}} {
+		code, output, stderr := runTestApp(t, root, "", args...)
+		if code != 0 || stderr != "" || string(output) != "vtest\n" {
+			t.Fatalf("args=%v code=%d stderr=%q output=%q", args, code, stderr, output)
+		}
+	}
+
+	code, output, stderr := runTestApp(t, root, "", "--version", "--json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("JSON version code=%d stderr=%q output=%s", code, stderr, output)
+	}
+	payload := decodeSingleObject(t, output)
+	if payload["ok"] != true || payload["command"] != "version" {
+		t.Fatalf("JSON version payload=%#v", payload)
+	}
+}
+
+func TestNestedHelpFlagsReturnUsageWithoutRunningCommands(t *testing.T) {
+	root := cliRepo(t)
+	for _, args := range [][]string{
+		{"plan", "start", "--help"},
+		{"plan", "start", "-h"},
+		{"quick", "start", "--help"},
+		{"quick", "start", "-h"},
+	} {
+		code, output, stderr := runTestApp(t, root, "", args...)
+		if code != 0 || stderr != "" {
+			t.Fatalf("args=%v code=%d stderr=%q output=%s", args, code, stderr, output)
+		}
+		if !strings.Contains(string(output), "rolemux --version") {
+			t.Fatalf("args=%v did not return usage: %s", args, output)
+		}
+	}
+}

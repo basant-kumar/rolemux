@@ -35,16 +35,24 @@ The distributed binaries are Developer ID signed and Apple-notarized. To build
 from source instead, use Go 1.24 or newer:
 
 ```bash
+mkdir -p $HOME/.local/bin
+go env -w GOBIN=$HOME/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
 go install github.com/basant-kumar/rolemux/cmd/rolemux@latest
 ```
 
 ## Set up
 
-Install the RoleMux skill into supported host agents, check provider logins, and
-choose models:
+The host-agent installation step is mandatory; without it, host agents may not
+discover or correctly orchestrate RoleMux:
 
 ```bash
 rolemux install --global --hosts all
+```
+
+Then check provider logins and choose models:
+
+```bash
 rolemux doctor --json
 rolemux configure --global
 ```
