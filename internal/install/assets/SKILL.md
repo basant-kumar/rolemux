@@ -105,11 +105,11 @@ buffer: doing so hides progress and the pxpipe dashboard. If JSON must be saved,
 redirect stdout alone to a result file and read that file after the command
 finishes.
 
-The implementer receives an explicit pre-edit discovery budget: at most three
-batched read/search calls over named files and symbols, with no repository-wide
-search or Git history/status/diff before editing. If the execution packet is not
-sufficient inside that budget, return `needs_input` instead of researching
-outward.
+The implementer receives an explicit pre-edit discovery budget: at most six
+underlying read/search operations across two provider turns and 16 KiB aggregate
+output; nested calls count separately. It should consolidate related edits and
+run only focused unit validation. If the execution packet is insufficient
+inside that budget, return `needs_input` instead of researching outward.
 
 RoleMux gives each fresh delegated role a bounded inventory of provider-native
 skills, provider tools, installed helpers, and skills that may exist only in a

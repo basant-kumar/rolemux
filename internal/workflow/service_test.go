@@ -1036,7 +1036,7 @@ func TestPlannerAndImplementerPromptsAssignResearchToPlanner(t *testing.T) {
 			t.Fatalf("planner prompt omitted %q", required)
 		}
 	}
-	for _, required := range []string{"authoritative", "at most three", "repository-wide searches", "needs_input"} {
+	for _, required := range []string{"authoritative", "at most six", "nested calls", "16 KiB", "repository-wide searches", "needs_input"} {
 		if !strings.Contains(implementation, required) {
 			t.Fatalf("implementer prompt omitted %q", required)
 		}
@@ -1052,7 +1052,7 @@ func TestDelegatedRolePromptsBoundAgentLatency(t *testing.T) {
 	implementation := implementPrompt("change app", "packet", "app.go", nil)
 	planReview := planReviewPrompt("change app", "plan", task.ComplexitySmall, []task.WorkUnit{{ID: "W1", Scope: "app.go"}}, false)
 	review := codeReviewPrompt(task.State{Task: "change app", Plan: "plan", Scope: "app.go"}, false)
-	for _, required := range []string{"at most three", "batched pre-edit", "git status/diff/log", "repository-wide searches", "repository-wide surveys", "post-green survey", "cohesive edits", "narrow validation", "full repository suite", "30 seconds", "one-second polling", "stop immediately", "focused validation passes"} {
+	for _, required := range []string{"at most six", "underlying read/search", "two provider tool turns", "16 KiB", "nested calls", "git status/diff/log", "repository-wide searches", "repository-wide surveys", "post-green survey", "two cohesive edit calls", "one correction batch", "focused validation", "full repository suite", "host-only evidence", "30 seconds", "one-second polling", "stop immediately", "focused validation passes"} {
 		if !strings.Contains(implementation, required) {
 			t.Fatalf("implementer prompt omitted %q: %s", required, implementation)
 		}
@@ -1062,7 +1062,7 @@ func TestDelegatedRolePromptsBoundAgentLatency(t *testing.T) {
 			t.Fatalf("review prompt omitted %q: %s", required, review)
 		}
 	}
-	for _, required := range []string{"supplied task, plan, and work graph", "without redoing repository research"} {
+	for _, required := range []string{"supplied task, plan, and work graph", "without redoing repository research", "reserve full-repository", "integration stage"} {
 		if !strings.Contains(planReview, required) {
 			t.Fatalf("plan-review prompt omitted %q: %s", required, planReview)
 		}

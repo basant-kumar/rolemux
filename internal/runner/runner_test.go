@@ -43,9 +43,9 @@ func TestCodexRoleDeveloperInstructionsAreDeterministic(t *testing.T) {
 		role     Role
 		required []string
 	}{
-		{RoleImplementer, []string{"at most three batched pre-edit", "git status/diff/log", "repository-wide surveys", "post-green survey", "narrow validation", "full repository suite", "30 seconds", "one-second polling", "stop immediately"}},
+		{RoleImplementer, []string{"at most six underlying", "two provider tool turns", "16 KiB", "nested calls count separately", "git status/diff/log", "repository-wide surveys", "post-green survey", "two cohesive edit calls", "focused validation", "full repository suite", "host-only evidence", "30 seconds", "one-second polling", "stop immediately"}},
 		{RoleCodeReviewer, []string{"supplied delta and evidence", "changed files", "direct blast radius", "no git commands", "full repository suite", "validated verdict promptly"}},
-		{RolePlanReviewer, []string{"supplied task, plan, and work graph", "without redoing repository research", "validated verdict promptly"}},
+		{RolePlanReviewer, []string{"supplied task, plan, and work graph", "without redoing repository research", "combined browser validation", "integration", "validated verdict promptly"}},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.role), func(t *testing.T) {
